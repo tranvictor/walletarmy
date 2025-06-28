@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/stretchr/testify/assert"
@@ -14,6 +15,11 @@ import (
 // MockHook for testing hooks
 func mockHook(tx *types.Transaction, err error) error {
 	return nil
+}
+
+// MockGasEstimationFailedHook for testing gas estimation failed hooks
+func mockGasEstimationFailedHook(tx *types.Transaction, revertMsgError, gasEstimationError error) (gasLimit *big.Int, err error) {
+	return big.NewInt(21000), nil
 }
 
 func TestWalletManager_R(t *testing.T) {
@@ -39,6 +45,8 @@ func TestWalletManager_R(t *testing.T) {
 	assert.Equal(t, networks.EthereumMainnet, req.network)
 	assert.Nil(t, req.beforeSignAndBroadcastHook)
 	assert.Nil(t, req.afterSignAndBroadcastHook)
+	assert.Nil(t, req.abis)
+	assert.Nil(t, req.gasEstimationFailedHook)
 }
 
 func TestTxRequest_SetNumRetries(t *testing.T) {
@@ -217,6 +225,154 @@ func TestTxRequest_SetAfterSignAndBroadcastHook(t *testing.T) {
 	assert.NotNil(t, req.afterSignAndBroadcastHook)
 }
 
+func TestTxRequest_SetAbis(t *testing.T) {
+	wm := &WalletManager{}
+	req := wm.R()
+
+	t.Run("with single ABI", func(t *testing.T) {
+		// Create a simple mock ABI
+		mockABI := abi.ABI{}
+		result := req.SetAbis(mockABI)
+
+		assert.Equal(t, req, result) // Should return self for chaining
+		assert.Equal(t, 1, len(req.abis))
+		assert.Equal(t, mockABI, req.abis[0])
+	})
+
+	t.Run("with multiple ABIs", func(t *testing.T) {
+		req := wm.R() // Fresh request
+		mockABI1 := abi.ABI{}
+		mockABI2 := abi.ABI{}
+		mockABI3 := abi.ABI{}
+
+		result := req.SetAbis(mockABI1, mockABI2, mockABI3)
+
+		assert.Equal(t, req, result) // Should return self for chaining
+		assert.Equal(t, 3, len(req.abis))
+		assert.Equal(t, mockABI1, req.abis[0])
+		assert.Equal(t, mockABI2, req.abis[1])
+		assert.Equal(t, mockABI3, req.abis[2])
+	})
+
+	t.Run("with no ABIs", func(t *testing.T) {
+		req := wm.R() // Fresh request
+		result := req.SetAbis()
+
+		assert.Equal(t, req, result) // Should return self for chaining
+		assert.Equal(t, 0, len(req.abis))
+	})
+
+	t.Run("overwriting previous ABIs", func(t *testing.T) {
+		req := wm.R() // Fresh request
+		mockABI1 := abi.ABI{}
+		mockABI2 := abi.ABI{}
+
+		// Set initial ABIs
+		req.SetAbis(mockABI1)
+		assert.Equal(t, 1, len(req.abis))
+
+		// Overwrite with new ABIs
+		result := req.SetAbis(mockABI2)
+
+		assert.Equal(t, req, result) // Should return self for chaining
+		assert.Equal(t, 1, len(req.abis))
+		assert.Equal(t, mockABI2, req.abis[0])
+	})
+}
+
+func TestTxRequest_SetGasEstimationFailedHook(t *testing.T) {
+	wm := &WalletManager{}
+	req := wm.R()
+
+	t.Run("with valid hook", func(t *testing.T) {
+		result := req.SetGasEstimationFailedHook(mockGasEstimationFailedHook)
+
+		assert.Equal(t, req, result) // Should return self for chaining
+		assert.NotNil(t, req.gasEstimationFailedHook)
+	})
+
+	t.Run("with nil hook", func(t *testing.T) {
+		req := wm.R() // Fresh request
+		result := req.SetGasEstimationFailedHook(nil)
+
+		assert.Equal(t, req, result) // Should return self for chaining
+		assert.Nil(t, req.gasEstimationFailedHook)
+	})
+
+	t.Run("overwriting previous hook", func(t *testing.T) {
+		req := wm.R() // Fresh request
+
+		// Create two different hook functions
+		hook1 := func(tx *types.Transaction, revertMsgError, gasEstimationError error) (gasLimit *big.Int, err error) {
+			return big.NewInt(25000), nil
+		}
+		hook2 := func(tx *types.Transaction, revertMsgError, gasEstimationError error) (gasLimit *big.Int, err error) {
+			return big.NewInt(30000), nil
+		}
+
+		// Set initial hook
+		req.SetGasEstimationFailedHook(hook1)
+		assert.NotNil(t, req.gasEstimationFailedHook)
+
+		// Overwrite with new hook
+		result := req.SetGasEstimationFailedHook(hook2)
+
+		assert.Equal(t, req, result) // Should return self for chaining
+		assert.NotNil(t, req.gasEstimationFailedHook)
+	})
+}
+
+func TestGasEstimationFailedHook_Functionality(t *testing.T) {
+	t.Run("hook returns gas limit and no error", func(t *testing.T) {
+		hook := func(tx *types.Transaction, revertMsgError, gasEstimationError error) (gasLimit *big.Int, err error) {
+			return big.NewInt(50000), nil
+		}
+
+		// Create a dummy transaction
+		tx := types.NewTransaction(0, common.Address{}, big.NewInt(0), 21000, big.NewInt(1000000000), nil)
+
+		gasLimit, err := hook(tx, nil, nil)
+
+		assert.NoError(t, err)
+		assert.Equal(t, big.NewInt(50000), gasLimit)
+	})
+
+	t.Run("hook returns error to stop execution", func(t *testing.T) {
+		expectedErr := assert.AnError
+		hook := func(tx *types.Transaction, revertMsgError, gasEstimationError error) (gasLimit *big.Int, err error) {
+			return nil, expectedErr
+		}
+
+		// Create a dummy transaction
+		tx := types.NewTransaction(0, common.Address{}, big.NewInt(0), 21000, big.NewInt(1000000000), nil)
+
+		gasLimit, err := hook(tx, nil, nil)
+
+		assert.Error(t, err)
+		assert.Equal(t, expectedErr, err)
+		assert.Nil(t, gasLimit)
+	})
+
+	t.Run("hook handles revert message and gas estimation errors", func(t *testing.T) {
+		revertErr := assert.AnError
+		gasEstErr := assert.AnError
+
+		hook := func(tx *types.Transaction, revertMsgError, gasEstimationError error) (gasLimit *big.Int, err error) {
+			assert.Equal(t, revertErr, revertMsgError)
+			assert.Equal(t, gasEstErr, gasEstimationError)
+			return big.NewInt(40000), nil
+		}
+
+		// Create a dummy transaction
+		tx := types.NewTransaction(0, common.Address{}, big.NewInt(0), 21000, big.NewInt(1000000000), nil)
+
+		gasLimit, err := hook(tx, revertErr, gasEstErr)
+
+		assert.NoError(t, err)
+		assert.Equal(t, big.NewInt(40000), gasLimit)
+	})
+}
+
 func TestTxRequest_BuilderPatternChaining(t *testing.T) {
 	wm := &WalletManager{}
 	fromAddr := common.HexToAddress("0x1234567890123456789012345678901234567890")
@@ -225,8 +381,9 @@ func TestTxRequest_BuilderPatternChaining(t *testing.T) {
 	data := []byte{0x01, 0x02, 0x03, 0x04}
 	network := networks.EthereumMainnet
 	duration := 2 * time.Second
+	mockABI := abi.ABI{}
 
-	// Test chaining multiple methods together
+	// Test chaining multiple methods together including new methods
 	req := wm.R().
 		SetNumRetries(3).
 		SetSleepDuration(duration).
@@ -243,9 +400,11 @@ func TestTxRequest_BuilderPatternChaining(t *testing.T) {
 		SetData(data).
 		SetNetwork(network).
 		SetBeforeSignAndBroadcastHook(mockHook).
-		SetAfterSignAndBroadcastHook(mockHook)
+		SetAfterSignAndBroadcastHook(mockHook).
+		SetAbis(mockABI).
+		SetGasEstimationFailedHook(mockGasEstimationFailedHook)
 
-	// Verify all values were set correctly
+	// Verify all values were set correctly including new fields
 	assert.Equal(t, 3, req.numRetries)
 	assert.Equal(t, duration, req.sleepDuration)
 	assert.Equal(t, uint8(2), req.txType)
@@ -262,6 +421,9 @@ func TestTxRequest_BuilderPatternChaining(t *testing.T) {
 	assert.Equal(t, network, req.network)
 	assert.NotNil(t, req.beforeSignAndBroadcastHook)
 	assert.NotNil(t, req.afterSignAndBroadcastHook)
+	assert.Equal(t, 1, len(req.abis))
+	assert.Equal(t, mockABI, req.abis[0])
+	assert.NotNil(t, req.gasEstimationFailedHook)
 }
 
 func TestTxRequest_MultipleSettersOfSameType(t *testing.T) {
@@ -280,4 +442,21 @@ func TestTxRequest_MultipleSettersOfSameType(t *testing.T) {
 	value3 := big.NewInt(300)
 	req.SetValue(value1).SetValue(value2).SetValue(value3)
 	assert.Equal(t, value3, req.value)
+
+	// Test multiple ABI sets
+	mockABI1 := abi.ABI{}
+	mockABI2 := abi.ABI{}
+	req.SetAbis(mockABI1).SetAbis(mockABI2)
+	assert.Equal(t, 1, len(req.abis))
+	assert.Equal(t, mockABI2, req.abis[0])
+
+	// Test multiple gas estimation failed hook sets
+	hook1 := func(tx *types.Transaction, revertMsgError, gasEstimationError error) (gasLimit *big.Int, err error) {
+		return big.NewInt(25000), nil
+	}
+	hook2 := func(tx *types.Transaction, revertMsgError, gasEstimationError error) (gasLimit *big.Int, err error) {
+		return big.NewInt(35000), nil
+	}
+	req.SetGasEstimationFailedHook(hook1).SetGasEstimationFailedHook(hook2)
+	assert.NotNil(t, req.gasEstimationFailedHook)
 }

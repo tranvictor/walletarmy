@@ -4,6 +4,7 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/tranvictor/jarvis/networks"
@@ -32,6 +33,8 @@ type TxRequest struct {
 	// Hooks
 	beforeSignAndBroadcastHook Hook
 	afterSignAndBroadcastHook  Hook
+	gasEstimationFailedHook    GasEstimationFailedHook
+	abis                       []abi.ABI
 }
 
 // R creates a new transaction request (similar to go-resty's R() method)
@@ -129,6 +132,12 @@ func (r *TxRequest) SetNetwork(network networks.Network) *TxRequest {
 	return r
 }
 
+// SetAbis sets the abis
+func (r *TxRequest) SetAbis(abis ...abi.ABI) *TxRequest {
+	r.abis = abis
+	return r
+}
+
 // SetBeforeSignAndBroadcastHook sets the hook to be called before signing and broadcasting
 func (r *TxRequest) SetBeforeSignAndBroadcastHook(hook Hook) *TxRequest {
 	r.beforeSignAndBroadcastHook = hook
@@ -138,6 +147,12 @@ func (r *TxRequest) SetBeforeSignAndBroadcastHook(hook Hook) *TxRequest {
 // SetAfterSignAndBroadcastHook sets the hook to be called after signing and broadcasting
 func (r *TxRequest) SetAfterSignAndBroadcastHook(hook Hook) *TxRequest {
 	r.afterSignAndBroadcastHook = hook
+	return r
+}
+
+// SetGasEstimationFailedHook sets the hook to be called when gas estimation fails
+func (r *TxRequest) SetGasEstimationFailedHook(hook GasEstimationFailedHook) *TxRequest {
+	r.gasEstimationFailedHook = hook
 	return r
 }
 
@@ -157,5 +172,7 @@ func (r *TxRequest) Execute() (*types.Transaction, error) {
 		r.network,
 		r.beforeSignAndBroadcastHook,
 		r.afterSignAndBroadcastHook,
+		r.abis,
+		r.gasEstimationFailedHook,
 	)
 }
