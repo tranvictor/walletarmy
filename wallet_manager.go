@@ -504,6 +504,16 @@ func (wm *WalletManager) BroadcastTx(
 	return hash, broadcasted, NewBroadcastError(allErrors)
 }
 
+func (wm *WalletManager) BroadcastTxSync(
+	tx *types.Transaction,
+) (receipt *types.Receipt, err error) {
+	network, err := networks.GetNetworkByID(tx.ChainId().Uint64())
+	if err != nil {
+		return nil, fmt.Errorf("tx is encoded with unsupported ChainID: %w", err)
+	}
+	return wm.Broadcaster(network).BroadcastTxSync(tx)
+}
+
 // createErrorDecoder creates an error decoder from ABIs if available
 func (wm *WalletManager) createErrorDecoder(abis []abi.ABI) *ErrorDecoder {
 	if len(abis) == 0 {
@@ -648,6 +658,7 @@ func (wm *WalletManager) EnsureTxWithHooks(
 
 		// Execute transaction attempt
 		result := wm.executeTransactionAttempt(ctx, errDecoder)
+
 		if result.ShouldReturn {
 			return result.Transaction, result.Receipt, result.Error
 		}
@@ -656,7 +667,8 @@ func (wm *WalletManager) EnsureTxWithHooks(
 		}
 
 		// Monitor and handle the transaction (only if we have a transaction to monitor)
-		if result.Transaction != nil {
+		// in this case, result.Receipt can be filled already because of this rpc https://www.quicknode.com/docs/arbitrum/eth_sendRawTransactionSync
+		if result.Transaction != nil && result.Receipt == nil {
 			statusChan := wm.MonitorTx(result.Transaction, ctx.network, ctx.txCheckInterval)
 
 			status := <-statusChan
@@ -849,8 +861,19 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, ctx 
 		}
 	}
 
+	var receipt *types.Receipt
+	var broadcastErr BroadcastError
+	var successful bool
+
 	// Broadcast transaction
-	_, successful, broadcastErr := wm.BroadcastTx(signedTx)
+	if ctx.network.IsSyncTxSupported() {
+		receipt, broadcastErr = wm.BroadcastTxSync(signedTx)
+		if receipt != nil {
+			successful = true
+		}
+	} else {
+		_, successful, broadcastErr = wm.BroadcastTx(signedTx)
+	}
 
 	if signedTx != nil {
 		ctx.oldTxs[signedTx.Hash().Hex()] = signedTx
@@ -865,13 +888,17 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, ctx 
 				"gas_price":       signedTx.GasPrice().String(),
 				"tip_cap":         signedTx.GasTipCap().String(),
 				"max_fee_per_gas": signedTx.GasFeeCap().String(),
+				"used_sync_tx":    ctx.network.IsSyncTxSupported(),
+				"receipt":         receipt,
 				"error":           broadcastErr,
 			}).Debug("Unsuccessful signing and broadcasting transaction")
 		} else {
 			logger.WithFields(logger.Fields{
-				"nonce":     tx.Nonce(),
-				"gas_price": tx.GasPrice().String(),
-				"error":     broadcastErr,
+				"nonce":        tx.Nonce(),
+				"gas_price":    tx.GasPrice().String(),
+				"used_sync_tx": ctx.network.IsSyncTxSupported(),
+				"receipt":      receipt,
+				"error":        broadcastErr,
 			}).Debug("Unsuccessful signing and broadcasting transaction (no signed tx)")
 		}
 
@@ -885,6 +912,8 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, ctx 
 		"gas_price":       signedTx.GasPrice().String(),
 		"tip_cap":         signedTx.GasTipCap().String(),
 		"max_fee_per_gas": signedTx.GasFeeCap().String(),
+		"used_sync_tx":    ctx.network.IsSyncTxSupported(),
+		"receipt":         receipt,
 	}).Info("Signed and broadcasted transaction")
 
 	// Execute after hook - convert BroadcastError to error for hook
@@ -897,6 +926,7 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, ctx 
 		if hookError := ctx.afterSignAndBroadcastHook(signedTx, hookErr); hookError != nil {
 			return &TxExecutionResult{
 				Transaction:  signedTx,
+				Receipt:      receipt,
 				ShouldRetry:  false,
 				ShouldReturn: true,
 				Error:        fmt.Errorf("after signing and broadcasting hook error: %w", hookError),
@@ -904,10 +934,22 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, ctx 
 		}
 	}
 
+	// in case receipt is not nil, it means the tx is broadcasted and mined using eth_sendRawTransactionSync
+	if receipt != nil {
+		return &TxExecutionResult{
+			Transaction:  signedTx,
+			Receipt:      receipt,
+			ShouldRetry:  false,
+			ShouldReturn: true,
+			Error:        nil,
+		}
+	}
+
 	return &TxExecutionResult{
 		Transaction:  signedTx,
 		ShouldRetry:  false,
 		ShouldReturn: false,
+		Receipt:      receipt,
 		Error:        nil,
 	}
 }
