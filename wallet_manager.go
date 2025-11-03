@@ -451,16 +451,6 @@ func (wm *WalletManager) BuildTx(
 		tipCapGwei = gasInfo.MaxPriorityPrice
 	}
 
-	// simulate the tx at pending state to see if it will be reverted
-	_, err = wm.Reader(network).EthCall(from.Hex(), to.Hex(), data, nil)
-	if err != nil {
-		revertData, isRevert := ethclient.RevertErrorData(err)
-		if isRevert {
-			return nil, errors.Join(ErrSimulatedTxReverted, fmt.Errorf("tx will be reverted: %s. Detail: %w", string(revertData), err))
-		}
-		return nil, errors.Join(ErrSimulatedTxFailed, fmt.Errorf("couldn't simulate tx at pending state. Detail: %w", err))
-	}
-
 	return jarviscommon.BuildExactTx(
 		txType,
 		nonce.Uint64(),
@@ -740,6 +730,52 @@ func (wm *WalletManager) executeTransactionAttempt(ctx *TxExecutionContext, errD
 			ShouldRetry:  true,
 			ShouldReturn: false,
 			Error:        nil,
+		}
+	}
+
+	// simulate the tx at pending state to see if it will be reverted
+	_, err = wm.Reader(ctx.network).EthCall(ctx.from.Hex(), ctx.to.Hex(), ctx.data, nil)
+	if err != nil {
+		revertData, isRevert := ethclient.RevertErrorData(err)
+		if isRevert {
+			err = errors.Join(ErrSimulatedTxReverted, fmt.Errorf("tx will be reverted: %s. Detail: %w", string(revertData), err))
+			logger.WithFields(logger.Fields{
+				"tx_hash":         builtTx.Hash().Hex(),
+				"nonce":           builtTx.Nonce(),
+				"gas_price":       builtTx.GasPrice().String(),
+				"tip_cap":         builtTx.GasTipCap().String(),
+				"max_fee_per_gas": builtTx.GasFeeCap().String(),
+				"used_sync_tx":    ctx.network.IsSyncTxSupported(),
+				"error":           err,
+				"revert_data":     revertData,
+			}).Debug("Tx simulation showed a revert error")
+			// we need to persist a few calculated values here before retrying with the txs
+			ctx.retryNonce = big.NewInt(int64(builtTx.Nonce()))
+			ctx.gasLimit = builtTx.Gas()
+			// we could persist the error here but then later we need to set it to nil, setting this to the error if the user is supposed to handle such error
+			return &TxExecutionResult{
+				Transaction:  nil,
+				ShouldRetry:  true,
+				ShouldReturn: false,
+				Error:        nil,
+			}
+		} else {
+			err = errors.Join(ErrSimulatedTxFailed, fmt.Errorf("couldn't simulate tx at pending state. Detail: %w", err))
+			logger.WithFields(logger.Fields{
+				"tx_hash":         builtTx.Hash().Hex(),
+				"nonce":           builtTx.Nonce(),
+				"gas_price":       builtTx.GasPrice().String(),
+				"tip_cap":         builtTx.GasTipCap().String(),
+				"max_fee_per_gas": builtTx.GasFeeCap().String(),
+				"used_sync_tx":    ctx.network.IsSyncTxSupported(),
+				"error":           err,
+			}).Debug("Tx simulation failed but not a revert error")
+			return &TxExecutionResult{
+				Transaction:  nil,
+				ShouldRetry:  false,
+				ShouldReturn: true,
+				Error:        err,
+			}
 		}
 	}
 
