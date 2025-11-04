@@ -305,11 +305,13 @@ func (wm *WalletManager) nonce(wallet common.Address, network networks.Network) 
 
 	reader := wm.Reader(network)
 	minedNonce, err := reader.GetMinedNonce(wallet.Hex())
+
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get mined nonce in context manager: %s", err)
 	}
 
 	remotePendingNonce, err := reader.GetPendingNonce(wallet.Hex())
+
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get remote pending nonce in context manager: %s", err)
 	}
@@ -520,11 +522,11 @@ func (wm *WalletManager) BroadcastTxSync(
 	}
 	receipt, err = wm.Broadcaster(network).BroadcastTxSync(tx)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't broadcast sync tx: %w", err)
+		return nil, NewBroadcastError(fmt.Errorf("couldn't broadcast sync tx: %w", err))
 	}
 	err = wm.registerBroadcastedTx(tx, network)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't register broadcasted tx in context manager: %w", err)
+		return nil, NewBroadcastError(fmt.Errorf("couldn't register broadcasted tx in context manager: %w", err))
 	}
 	return receipt, nil
 }
@@ -1063,7 +1065,9 @@ func (wm *WalletManager) handleBroadcastError(broadcastErr BroadcastError, tx *t
 
 // handleNonceIsLowError specifically handles the nonce is low error case
 func (wm *WalletManager) handleNonceIsLowError(tx *types.Transaction, ctx *TxExecutionContext) *TxExecutionResult {
+
 	statuses, err := wm.getTxStatuses(ctx.oldTxs, ctx.network)
+
 	if err != nil {
 		logger.WithFields(logger.Fields{
 			"error": err,
@@ -1099,6 +1103,7 @@ func (wm *WalletManager) handleNonceIsLowError(tx *types.Transaction, ctx *TxExe
 	if result := ctx.incrementRetryCountAndCheck("nonce is low and no pending transactions"); result != nil {
 		return result
 	}
+
 	ctx.retryNonce = nil
 
 	return &TxExecutionResult{
