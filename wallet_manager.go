@@ -760,6 +760,18 @@ func (wm *WalletManager) executeTransactionAttempt(ctx *TxExecutionContext, errD
 			// we need to persist a few calculated values here before retrying with the txs
 			ctx.retryNonce = big.NewInt(int64(builtTx.Nonce()))
 			ctx.gasLimit = builtTx.Gas()
+
+			// Increment retry count for simulation revert
+			ctx.actualRetryCount++
+			if ctx.actualRetryCount > ctx.numRetries {
+				return &TxExecutionResult{
+					Transaction:  nil,
+					ShouldRetry:  false,
+					ShouldReturn: true,
+					Error:        errors.Join(ErrEnsureTxOutOfRetries, fmt.Errorf("tx simulation reverted after %d retries: %w", ctx.numRetries, err)),
+				}
+			}
+
 			// we could persist the error here but then later we need to set it to nil, setting this to the error if the user is supposed to handle such error
 			return &TxExecutionResult{
 				Transaction:  nil,
