@@ -29,12 +29,12 @@ go get github.com/tranvictor/walletarmy
 package main
 
 import (
-    "context"
+    "fmt"
     "math/big"
-    "time"
 
     "github.com/ethereum/go-ethereum/common"
     "github.com/tranvictor/jarvis/networks"
+    "github.com/tranvictor/jarvis/util/account"
     "github.com/tranvictor/walletarmy"
 )
 
@@ -45,12 +45,19 @@ func main() {
         walletarmy.WithDefaultNetwork(networks.EthereumMainnet),
     )
 
-    // Unlock a wallet (assumes wallet is configured in jarvis)
-    wallet := common.HexToAddress("0xYourWalletAddress")
-    _, err := wm.UnlockAccount(wallet)
+    // Create account from private key (without 0x prefix)
+    privateKey := "your_private_key_hex_without_0x_prefix"
+    acc, err := account.NewPrivateKeyAccount(privateKey)
     if err != nil {
         panic(err)
     }
+
+    // Register the account with the wallet manager
+    wm.SetAccount(acc)
+
+    // Get the wallet address
+    wallet := acc.Address()
+    fmt.Printf("Wallet address: %s\n", wallet.Hex())
 
     // Execute a transaction using the builder pattern
     tx, receipt, err := wm.R().
@@ -96,6 +103,199 @@ tx, receipt, err := wm.R().
     SetNetwork(networks.EthereumMainnet).
     SetAbis(contractABI). // For better error decoding
     Execute()
+```
+
+## Managing Wallets and Networks
+
+### Adding Wallets at Runtime
+
+WalletArmy supports adding wallets dynamically. You can add as many wallets as needed:
+
+```go
+wm := walletarmy.NewWalletManager()
+
+// Method 1: From private key string
+privateKey1 := "abc123..." // hex string without 0x prefix
+acc1, err := account.NewPrivateKeyAccount(privateKey1)
+if err != nil {
+    panic(err)
+}
+wm.SetAccount(acc1)
+
+// Method 2: Add multiple wallets
+privateKeys := []string{
+    "privatekey1...",
+    "privatekey2...",
+    "privatekey3...",
+}
+
+for _, pk := range privateKeys {
+    acc, err := account.NewPrivateKeyAccount(pk)
+    if err != nil {
+        panic(err)
+    }
+    wm.SetAccount(acc)
+}
+
+// Method 3: Using jarvis wallet store (if configured)
+walletAddress := common.HexToAddress("0x...")
+acc, err := wm.UnlockAccount(walletAddress)
+if err != nil {
+    panic(err)
+}
+// Account is automatically registered
+
+// Access a registered account later
+acc = wm.Account(walletAddress)
+if acc == nil {
+    fmt.Println("Account not found")
+}
+```
+
+### Working with Networks
+
+WalletArmy uses the jarvis networks package which supports many EVM networks out of the box:
+
+```go
+import "github.com/tranvictor/jarvis/networks"
+
+// Built-in networks
+networks.EthereumMainnet
+networks.Goerli
+networks.Sepolia
+networks.BSCMainnet
+networks.Polygon
+networks.Arbitrum
+networks.Optimism
+networks.Avalanche
+networks.Fantom
+// ... and many more
+
+// Get network by name
+network, err := networks.GetNetwork("mainnet")
+
+// Get network by chain ID
+network, err := networks.GetNetworkByID(1)
+
+// Use in transactions
+tx, receipt, err := wm.R().
+    SetFrom(wallet).
+    SetTo(recipient).
+    SetValue(amount).
+    SetNetwork(networks.Polygon). // Use Polygon network
+    Execute()
+```
+
+### Parallel Multi-Wallet Transactions
+
+Execute transactions from multiple wallets concurrently:
+
+```go
+import "sync"
+
+func executeParallelTransfers(wm *walletarmy.WalletManager, wallets []common.Address, recipient common.Address, network networks.Network) error {
+    var wg sync.WaitGroup
+    errChan := make(chan error, len(wallets))
+
+    for _, wallet := range wallets {
+        wg.Add(1)
+        go func(from common.Address) {
+            defer wg.Done()
+            
+            _, _, err := wm.R().
+                SetFrom(from).
+                SetTo(recipient).
+                SetValue(big.NewInt(1e17)). // 0.1 ETH
+                SetNetwork(network).
+                Execute()
+            
+            if err != nil {
+                errChan <- fmt.Errorf("transfer from %s failed: %w", from.Hex(), err)
+            }
+        }(wallet)
+    }
+
+    wg.Wait()
+    close(errChan)
+
+    // Collect errors
+    var errors []error
+    for err := range errChan {
+        errors = append(errors, err)
+    }
+
+    if len(errors) > 0 {
+        return fmt.Errorf("%d transfers failed", len(errors))
+    }
+    return nil
+}
+```
+
+### Cross-Network Operations
+
+Work with multiple networks simultaneously:
+
+```go
+wm := walletarmy.NewWalletManager()
+
+// Register the same wallet for use on multiple networks
+acc, _ := account.NewPrivateKeyAccount(privateKey)
+wm.SetAccount(acc)
+wallet := acc.Address()
+
+// Send on Ethereum mainnet
+wm.R().
+    SetFrom(wallet).
+    SetTo(recipient).
+    SetValue(amount).
+    SetNetwork(networks.EthereumMainnet).
+    Execute()
+
+// Send on Polygon
+wm.R().
+    SetFrom(wallet).
+    SetTo(recipient).
+    SetValue(amount).
+    SetNetwork(networks.Polygon).
+    Execute()
+
+// Send on Arbitrum
+wm.R().
+    SetFrom(wallet).
+    SetTo(recipient).
+    SetValue(amount).
+    SetNetwork(networks.Arbitrum).
+    Execute()
+
+// Each network maintains its own:
+// - Nonce tracking
+// - Gas price cache
+// - RPC connections
+// - Circuit breaker state
+```
+
+### Network Infrastructure Access
+
+Access lower-level network components when needed:
+
+```go
+// Get the EthReader for a network (for read operations)
+reader, err := wm.Reader(networks.EthereumMainnet)
+if err != nil {
+    panic(err)
+}
+balance, err := reader.GetBalance(wallet.Hex())
+
+// Get the Broadcaster (for custom broadcast logic)
+broadcaster, err := wm.Broadcaster(networks.EthereumMainnet)
+
+// Get the TxAnalyzer (for transaction analysis)
+analyzer, err := wm.Analyzer(networks.EthereumMainnet)
+
+// Get current gas settings
+gasInfo, err := wm.GasSetting(networks.EthereumMainnet)
+fmt.Printf("Gas Price: %.2f gwei\n", gasInfo.GasPrice)
+fmt.Printf("Tip Cap: %.2f gwei\n", gasInfo.MaxPriorityPrice)
 ```
 
 ## Configuration
