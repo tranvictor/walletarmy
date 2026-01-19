@@ -10,21 +10,21 @@ import (
 	"github.com/tranvictor/jarvis/networks"
 )
 
-func TestTxExecutionContext_adjustGasPricesForSlowTx(t *testing.T) {
+func TestTxExecutionContext_AdjustGasPricesForSlowTx(t *testing.T) {
 	ctx := &TxExecutionContext{
-		extraGasPrice:   10.0,
-		extraTipCapGwei: 5.0,
-		maxGasPrice:     0, // No limit
-		maxTipCap:       0, // No limit
+		ExtraGasPrice:   10.0,
+		ExtraTipCapGwei: 5.0,
+		MaxGasPrice:     0, // No limit
+		MaxTipCap:       0, // No limit
 	}
 
 	// Test with nil transaction
-	result := ctx.adjustGasPricesForSlowTx(nil)
+	result := ctx.AdjustGasPricesForSlowTx(nil)
 	if result != false {
-		t.Error("adjustGasPricesForSlowTx should return false for nil transaction")
+		t.Error("AdjustGasPricesForSlowTx should return false for nil transaction")
 	}
-	if ctx.retryGasPrice != 0 || ctx.retryTipCap != 0 {
-		t.Error("adjustGasPricesForSlowTx should not modify values when tx is nil")
+	if ctx.RetryGasPrice != 0 || ctx.RetryTipCap != 0 {
+		t.Error("AdjustGasPricesForSlowTx should not modify values when tx is nil")
 	}
 
 	// Test with valid transaction
@@ -36,49 +36,49 @@ func TestTxExecutionContext_adjustGasPricesForSlowTx(t *testing.T) {
 		Nonce:     5,
 	})
 
-	result = ctx.adjustGasPricesForSlowTx(tx)
+	result = ctx.AdjustGasPricesForSlowTx(tx)
 	if result != true {
-		t.Error("adjustGasPricesForSlowTx should return true for successful adjustment")
+		t.Error("AdjustGasPricesForSlowTx should return true for successful adjustment")
 	}
 
 	expectedGasPrice := 100.0 * GasPriceIncreasePercent // (100 * 1.2) = 120
 	expectedTipCap := 50.0 * TipCapIncreasePercent      // (50 * 1.1) = 55
 
 	const epsilon = 0.0001
-	if diff := ctx.retryGasPrice - expectedGasPrice; diff < -epsilon || diff > epsilon {
-		t.Errorf("Expected retry gas price %f, got %f", expectedGasPrice, ctx.retryGasPrice)
+	if diff := ctx.RetryGasPrice - expectedGasPrice; diff < -epsilon || diff > epsilon {
+		t.Errorf("Expected retry gas price %f, got %f", expectedGasPrice, ctx.RetryGasPrice)
 	}
 
-	if diff := ctx.retryTipCap - expectedTipCap; diff < -epsilon || diff > epsilon {
-		t.Errorf("Expected retry tip cap %f, got %f", expectedTipCap, ctx.retryTipCap)
+	if diff := ctx.RetryTipCap - expectedTipCap; diff < -epsilon || diff > epsilon {
+		t.Errorf("Expected retry tip cap %f, got %f", expectedTipCap, ctx.RetryTipCap)
 	}
 
-	if ctx.retryNonce.Cmp(big.NewInt(5)) != 0 {
-		t.Errorf("Expected retry nonce 5, got %s", ctx.retryNonce.String())
+	if ctx.RetryNonce.Cmp(big.NewInt(5)) != 0 {
+		t.Errorf("Expected retry nonce 5, got %s", ctx.RetryNonce.String())
 	}
 
 	// Test with gas price limit that allows adjustment
 	ctxWithLimit := &TxExecutionContext{
-		extraGasPrice:   10.0,
-		extraTipCapGwei: 5.0,
-		maxGasPrice:     130.0, // Set a limit higher than adjusted price (120)
-		maxTipCap:       0,     // No tip cap limit
+		ExtraGasPrice:   10.0,
+		ExtraTipCapGwei: 5.0,
+		MaxGasPrice:     130.0, // Set a limit higher than adjusted price (120)
+		MaxTipCap:       0,     // No tip cap limit
 	}
 
-	result = ctxWithLimit.adjustGasPricesForSlowTx(tx)
+	result = ctxWithLimit.AdjustGasPricesForSlowTx(tx)
 	if result != true {
 		t.Error("Expected adjustment to succeed when below gas price limit")
 	}
 
 	// This should fail due to gas price limit reached
 	ctxWithLowLimit := &TxExecutionContext{
-		extraGasPrice:   10.0,
-		extraTipCapGwei: 5.0,
-		maxGasPrice:     115.0, // Lower than 120 (100 * 1.2)
-		maxTipCap:       0,     // No tip cap limit
+		ExtraGasPrice:   10.0,
+		ExtraTipCapGwei: 5.0,
+		MaxGasPrice:     115.0, // Lower than 120 (100 * 1.2)
+		MaxTipCap:       0,     // No tip cap limit
 	}
 
-	result = ctxWithLowLimit.adjustGasPricesForSlowTx(tx)
+	result = ctxWithLowLimit.AdjustGasPricesForSlowTx(tx)
 	if result != false {
 		t.Error("Expected adjustment to fail when gas price limit reached")
 	}
@@ -107,19 +107,19 @@ func TestNewTxExecutionContext_Validation(t *testing.T) {
 		t.Fatalf("Expected no error, got %v", err)
 	}
 
-	if ctx.numRetries != 0 {
-		t.Errorf("Expected retries to be 0 when negative value passed, got %d", ctx.numRetries)
+	if ctx.NumRetries != 0 {
+		t.Errorf("Expected retries to be 0 when negative value passed, got %d", ctx.NumRetries)
 	}
 
-	if ctx.sleepDuration != DefaultSleepDuration {
-		t.Errorf("Expected default sleep duration %v, got %v", DefaultSleepDuration, ctx.sleepDuration)
+	if ctx.SleepDuration != DefaultSleepDuration {
+		t.Errorf("Expected default sleep duration %v, got %v", DefaultSleepDuration, ctx.SleepDuration)
 	}
 
-	if ctx.txCheckInterval != DefaultTxCheckInterval {
-		t.Errorf("Expected default tx check interval %v, got %v", DefaultTxCheckInterval, ctx.txCheckInterval)
+	if ctx.TxCheckInterval != DefaultTxCheckInterval {
+		t.Errorf("Expected default tx check interval %v, got %v", DefaultTxCheckInterval, ctx.TxCheckInterval)
 	}
 
-	if ctx.value == nil {
+	if ctx.Value == nil {
 		t.Error("Value should be initialized to zero when nil")
 	}
 

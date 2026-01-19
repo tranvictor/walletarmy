@@ -11,8 +11,6 @@ import (
 	"github.com/tranvictor/jarvis/networks"
 	"github.com/tranvictor/jarvis/txanalyzer"
 	"github.com/tranvictor/jarvis/util/account"
-	"github.com/tranvictor/jarvis/util/broadcaster"
-	"github.com/tranvictor/jarvis/util/reader"
 	"github.com/tranvictor/walletarmy/idempotency"
 	"github.com/tranvictor/walletarmy/internal/circuitbreaker"
 )
@@ -26,8 +24,8 @@ type Manager interface {
 	Account(wallet common.Address) *account.Account
 
 	// Network Infrastructure
-	Reader(network networks.Network) (*reader.EthReader, error)
-	Broadcaster(network networks.Network) (*broadcaster.Broadcaster, error)
+	Reader(network networks.Network) (EthReader, error)
+	Broadcaster(network networks.Network) (EthBroadcaster, error)
 	Analyzer(network networks.Network) (*txanalyzer.TxAnalyzer, error)
 
 	// Gas Settings

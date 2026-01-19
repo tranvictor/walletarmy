@@ -13,46 +13,47 @@ import (
 	"github.com/tranvictor/jarvis/networks"
 )
 
-// TxExecutionContext holds the state and parameters for transaction execution
+// TxExecutionContext holds the state and parameters for transaction execution.
+// All fields are public to allow for testing and advanced customization.
 type TxExecutionContext struct {
 	// Retry tracking
-	actualRetryCount int
+	ActualRetryCount int
 
 	// Configuration
-	numRetries      int
-	sleepDuration   time.Duration
-	txCheckInterval time.Duration
+	NumRetries      int
+	SleepDuration   time.Duration
+	TxCheckInterval time.Duration
 
 	// Transaction parameters
-	txType        uint8
-	from, to      common.Address
-	value         *big.Int
-	gasLimit      uint64
-	extraGasLimit uint64
-	data          []byte
-	network       networks.Network
+	TxType        uint8
+	From, To      common.Address
+	Value         *big.Int
+	GasLimit      uint64
+	ExtraGasLimit uint64
+	Data          []byte
+	Network       networks.Network
 
 	// Gas pricing (mutable during retries)
-	retryGasPrice   float64
-	extraGasPrice   float64
-	retryTipCap     float64
-	extraTipCapGwei float64
+	RetryGasPrice   float64
+	ExtraGasPrice   float64
+	RetryTipCap     float64
+	ExtraTipCapGwei float64
 
 	// Gas price protection limits (caller-defined)
-	maxGasPrice float64
-	maxTipCap   float64
+	MaxGasPrice float64
+	MaxTipCap   float64
 
 	// Transaction state
-	oldTxs     map[string]*types.Transaction
-	retryNonce *big.Int
+	OldTxs     map[string]*types.Transaction
+	RetryNonce *big.Int
 
 	// Hooks
-	beforeSignAndBroadcastHook Hook
-	afterSignAndBroadcastHook  Hook
-	gasEstimationFailedHook    GasEstimationFailedHook
-	simulationFailedHook       SimulationFailedHook
-	txMinedHook                TxMinedHook
-	abis                       []abi.ABI
+	BeforeSignAndBroadcastHook Hook
+	AfterSignAndBroadcastHook  Hook
+	GasEstimationFailedHook    GasEstimationFailedHook
+	SimulationFailedHook       SimulationFailedHook
+	TxMinedHook                TxMinedHook
+	ABIs                       []abi.ABI
 }
 
 // NewTxExecutionContext creates a new transaction execution context
@@ -111,38 +112,38 @@ func NewTxExecutionContext(
 	}
 
 	return &TxExecutionContext{
-		actualRetryCount:           0,
-		numRetries:                 numRetries,
-		sleepDuration:              sleepDuration,
-		txCheckInterval:            txCheckInterval,
-		txType:                     txType,
-		from:                       from,
-		to:                         to,
-		value:                      value,
-		gasLimit:                   gasLimit,
-		extraGasLimit:              extraGasLimit,
-		retryGasPrice:              gasPrice,
-		extraGasPrice:              extraGasPrice,
-		retryTipCap:                tipCapGwei,
-		extraTipCapGwei:            extraTipCapGwei,
-		maxGasPrice:                maxGasPrice,
-		maxTipCap:                  maxTipCap,
-		data:                       data,
-		network:                    network,
-		oldTxs:                     make(map[string]*types.Transaction),
-		retryNonce:                 nil,
-		beforeSignAndBroadcastHook: beforeSignAndBroadcastHook,
-		afterSignAndBroadcastHook:  afterSignAndBroadcastHook,
-		abis:                       abis,
-		gasEstimationFailedHook:    gasEstimationFailedHook,
-		simulationFailedHook:       simulationFailedHook,
-		txMinedHook:                txMinedHook,
+		ActualRetryCount:           0,
+		NumRetries:                 numRetries,
+		SleepDuration:              sleepDuration,
+		TxCheckInterval:            txCheckInterval,
+		TxType:                     txType,
+		From:                       from,
+		To:                         to,
+		Value:                      value,
+		GasLimit:                   gasLimit,
+		ExtraGasLimit:              extraGasLimit,
+		RetryGasPrice:              gasPrice,
+		ExtraGasPrice:              extraGasPrice,
+		RetryTipCap:                tipCapGwei,
+		ExtraTipCapGwei:            extraTipCapGwei,
+		MaxGasPrice:                maxGasPrice,
+		MaxTipCap:                  maxTipCap,
+		Data:                       data,
+		Network:                    network,
+		OldTxs:                     make(map[string]*types.Transaction),
+		RetryNonce:                 nil,
+		BeforeSignAndBroadcastHook: beforeSignAndBroadcastHook,
+		AfterSignAndBroadcastHook:  afterSignAndBroadcastHook,
+		ABIs:                       abis,
+		GasEstimationFailedHook:    gasEstimationFailedHook,
+		SimulationFailedHook:       simulationFailedHook,
+		TxMinedHook:                txMinedHook,
 	}, nil
 }
 
-// adjustGasPricesForSlowTx adjusts gas prices when a transaction is slow
-// Returns true if adjustment was applied, false if limits were reached
-func (ctx *TxExecutionContext) adjustGasPricesForSlowTx(tx *types.Transaction) bool {
+// AdjustGasPricesForSlowTx adjusts gas prices when a transaction is slow.
+// Returns true if adjustment was applied, false if limits were reached.
+func (ctx *TxExecutionContext) AdjustGasPricesForSlowTx(tx *types.Transaction) bool {
 	if tx == nil {
 		return false
 	}
@@ -152,40 +153,40 @@ func (ctx *TxExecutionContext) adjustGasPricesForSlowTx(tx *types.Transaction) b
 	newGasPrice := currentGasPrice * GasPriceIncreasePercent
 
 	// Check if new gas price would exceed the caller-defined maximum
-	if ctx.maxGasPrice > 0 && newGasPrice > ctx.maxGasPrice {
+	if ctx.MaxGasPrice > 0 && newGasPrice > ctx.MaxGasPrice {
 		// Gas price would exceed limit - stop trying
 		return false
 	}
 
-	ctx.retryGasPrice = newGasPrice
+	ctx.RetryGasPrice = newGasPrice
 
 	// Increase tip cap by configured percentage
 	currentTipCap := jarviscommon.BigToFloat(tx.GasTipCap(), 9)
 	newTipCap := currentTipCap * TipCapIncreasePercent
 
 	// Check if new tip cap would exceed the caller-defined maximum
-	if ctx.maxTipCap > 0 && newTipCap > ctx.maxTipCap {
+	if ctx.MaxTipCap > 0 && newTipCap > ctx.MaxTipCap {
 		// Tip cap would exceed limit - stop trying
 		return false
 	}
 
-	ctx.retryTipCap = newTipCap
+	ctx.RetryTipCap = newTipCap
 
 	// Keep the same nonce
-	ctx.retryNonce = big.NewInt(int64(tx.Nonce()))
+	ctx.RetryNonce = big.NewInt(int64(tx.Nonce()))
 
 	return true
 }
 
-// incrementRetryCountAndCheck increments retry count and checks if we've exceeded retries
-func (ctx *TxExecutionContext) incrementRetryCountAndCheck(errorMsg string) *TxExecutionResult {
-	ctx.actualRetryCount++
-	if ctx.actualRetryCount > ctx.numRetries {
+// IncrementRetryCountAndCheck increments retry count and checks if we've exceeded retries.
+func (ctx *TxExecutionContext) IncrementRetryCountAndCheck(errorMsg string) *TxExecutionResult {
+	ctx.ActualRetryCount++
+	if ctx.ActualRetryCount > ctx.NumRetries {
 		return &TxExecutionResult{
 			Transaction:  nil,
 			ShouldRetry:  false,
 			ShouldReturn: true,
-			Error:        errors.Join(ErrEnsureTxOutOfRetries, fmt.Errorf("%s after %d retries", errorMsg, ctx.numRetries)),
+			Error:        errors.Join(ErrEnsureTxOutOfRetries, fmt.Errorf("%s after %d retries", errorMsg, ctx.NumRetries)),
 		}
 	}
 	return nil

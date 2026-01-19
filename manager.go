@@ -6,12 +6,25 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/tranvictor/jarvis/accounts"
+	"github.com/tranvictor/jarvis/networks"
 	"github.com/tranvictor/jarvis/util/account"
 
 	"github.com/tranvictor/walletarmy/idempotency"
 	"github.com/tranvictor/walletarmy/internal/circuitbreaker"
 	"github.com/tranvictor/walletarmy/internal/nonce"
 )
+
+// NetworkReaderFactory creates an EthReader for a given network.
+// This allows injecting mock readers for testing.
+type NetworkReaderFactory func(network networks.Network) (EthReader, error)
+
+// NetworkBroadcasterFactory creates an EthBroadcaster for a given network.
+// This allows injecting mock broadcasters for testing.
+type NetworkBroadcasterFactory func(network networks.Network) (EthBroadcaster, error)
+
+// NetworkTxMonitorFactory creates a TxMonitor for a given reader.
+// This allows injecting mock monitors for testing.
+type NetworkTxMonitorFactory func(reader EthReader) TxMonitor
 
 // WalletManager manages
 //  1. multiple wallets and their informations in its
@@ -40,10 +53,10 @@ type WalletManager struct {
 
 	// readers stores all reader instances for all networks that ever interacts
 	// with accounts manager. ChainID of the network is used as the key.
-	readers      sync.Map // map[uint64]*reader.EthReader
-	broadcasters sync.Map // map[uint64]*broadcaster.Broadcaster
+	readers      sync.Map // map[uint64]EthReader
+	broadcasters sync.Map // map[uint64]EthBroadcaster
 	analyzers    sync.Map // map[uint64]*txanalyzer.TxAnalyzer
-	txMonitors   sync.Map // map[uint64]*monitor.TxMonitor
+	txMonitors   sync.Map // map[uint64]TxMonitor
 
 	// Circuit breakers for each network (keyed by chainID)
 	circuitBreakers sync.Map // map[uint64]*circuitbreaker.CircuitBreaker
@@ -64,6 +77,11 @@ type WalletManager struct {
 
 	// Idempotency store for preventing duplicate transactions
 	idempotencyStore idempotency.Store
+
+	// Factories for creating network components (injectable for testing)
+	readerFactory      NetworkReaderFactory
+	broadcasterFactory NetworkBroadcasterFactory
+	txMonitorFactory   NetworkTxMonitorFactory
 }
 
 // NewWalletManager creates a new WalletManager with optional configuration
@@ -74,6 +92,17 @@ func NewWalletManager(opts ...WalletManagerOption) *WalletManager {
 
 	for _, opt := range opts {
 		opt(wm)
+	}
+
+	// Set default factories if not provided
+	if wm.readerFactory == nil {
+		wm.readerFactory = DefaultReaderFactory
+	}
+	if wm.broadcasterFactory == nil {
+		wm.broadcasterFactory = DefaultBroadcasterFactory
+	}
+	if wm.txMonitorFactory == nil {
+		wm.txMonitorFactory = DefaultTxMonitorFactory
 	}
 
 	return wm

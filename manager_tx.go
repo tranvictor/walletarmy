@@ -243,8 +243,8 @@ func (wm *WalletManager) MonitorTxContext(ctx context.Context, tx *types.Transac
 	return statusChan
 }
 
-func (wm *WalletManager) getTxStatuses(oldTxs map[string]*types.Transaction, network networks.Network) (statuses map[string]jarviscommon.TxInfo, err error) {
-	result := map[string]jarviscommon.TxInfo{}
+func (wm *WalletManager) getTxStatuses(oldTxs map[string]*types.Transaction, network networks.Network) (statuses map[string]TxInfo, err error) {
+	result := map[string]TxInfo{}
 
 	r, readerErr := wm.Reader(network)
 	if readerErr != nil {
@@ -372,14 +372,14 @@ func (wm *WalletManager) EnsureTxWithHooksContext(
 
 	// Cleanup function to release nonce if we exit with an error and no tx was broadcast
 	defer func() {
-		if err != nil && len(execCtx.oldTxs) == 0 && execCtx.retryNonce != nil {
+		if err != nil && len(execCtx.OldTxs) == 0 && execCtx.RetryNonce != nil {
 			// We have a reserved nonce but no tx was ever broadcast - release it
-			wm.ReleaseNonce(from, network, execCtx.retryNonce.Uint64())
+			wm.ReleaseNonce(from, network, execCtx.RetryNonce.Uint64())
 		}
 	}()
 
 	// Create error decoder
-	errDecoder := wm.createErrorDecoder(abis)
+	errDecoder := wm.createErrorDecoder(execCtx.ABIs)
 
 	// Main execution loop
 	for {
@@ -392,9 +392,9 @@ func (wm *WalletManager) EnsureTxWithHooksContext(
 		}
 
 		// Only sleep after actual retry attempts, not slow monitoring
-		if execCtx.actualRetryCount > 0 {
+		if execCtx.ActualRetryCount > 0 {
 			// Use a timer so we can also check for context cancellation during sleep
-			sleepTimer := time.NewTimer(execCtx.sleepDuration)
+			sleepTimer := time.NewTimer(execCtx.SleepDuration)
 			select {
 			case <-ctx.Done():
 				sleepTimer.Stop()
@@ -418,7 +418,7 @@ func (wm *WalletManager) EnsureTxWithHooksContext(
 		// Monitor and handle the transaction (only if we have a transaction to monitor)
 		// in this case, result.Receipt can be filled already because of this rpc https://www.quicknode.com/docs/arbitrum/eth_sendRawTransactionSync
 		if result.Transaction != nil && result.Receipt == nil {
-			statusChan := wm.MonitorTxContext(ctx, result.Transaction, execCtx.network, execCtx.txCheckInterval)
+			statusChan := wm.MonitorTxContext(ctx, result.Transaction, execCtx.Network, execCtx.TxCheckInterval)
 
 			// Wait for status from the context-aware monitor
 			status := <-statusChan
@@ -442,19 +442,19 @@ func (wm *WalletManager) EnsureTxWithHooksContext(
 func (wm *WalletManager) executeTransactionAttempt(ctx context.Context, execCtx *TxExecutionContext, errDecoder *ErrorDecoder) *TxExecutionResult {
 	// Build transaction
 	builtTx, err := wm.BuildTx(
-		execCtx.txType,
-		execCtx.from,
-		execCtx.to,
-		execCtx.retryNonce,
-		execCtx.value,
-		execCtx.gasLimit,
-		execCtx.extraGasLimit,
-		execCtx.retryGasPrice,
-		execCtx.extraGasPrice,
-		execCtx.retryTipCap,
-		execCtx.extraTipCapGwei,
-		execCtx.data,
-		execCtx.network,
+		execCtx.TxType,
+		execCtx.From,
+		execCtx.To,
+		execCtx.RetryNonce,
+		execCtx.Value,
+		execCtx.GasLimit,
+		execCtx.ExtraGasLimit,
+		execCtx.RetryGasPrice,
+		execCtx.ExtraGasPrice,
+		execCtx.RetryTipCap,
+		execCtx.ExtraTipCapGwei,
+		execCtx.Data,
+		execCtx.Network,
 	)
 
 	// Handle gas estimation failure
@@ -473,7 +473,7 @@ func (wm *WalletManager) executeTransactionAttempt(ctx context.Context, execCtx 
 	}
 
 	// simulate the tx at pending state to see if it will be reverted
-	r, readerErr := wm.Reader(execCtx.network)
+	r, readerErr := wm.Reader(execCtx.Network)
 	if readerErr != nil {
 		return &TxExecutionResult{
 			Transaction:  nil,
@@ -482,7 +482,7 @@ func (wm *WalletManager) executeTransactionAttempt(ctx context.Context, execCtx 
 			Error:        errors.Join(ErrSimulatedTxFailed, fmt.Errorf("couldn't get reader for simulation: %w", readerErr)),
 		}
 	}
-	_, err = r.EthCall(execCtx.from.Hex(), execCtx.to.Hex(), execCtx.data, nil)
+	_, err = r.EthCall(execCtx.From.Hex(), execCtx.To.Hex(), execCtx.Data, nil) // nil overrides = use current state
 	if err != nil {
 		revertData, isRevert := ethclient.RevertErrorData(err)
 		if isRevert {
@@ -495,7 +495,7 @@ func (wm *WalletManager) executeTransactionAttempt(ctx context.Context, execCtx 
 				"gas_price":       builtTx.GasPrice().String(),
 				"tip_cap":         builtTx.GasTipCap().String(),
 				"max_fee_per_gas": builtTx.GasFeeCap().String(),
-				"used_sync_tx":    execCtx.network.IsSyncTxSupported(),
+				"used_sync_tx":    execCtx.Network.IsSyncTxSupported(),
 				"error":           err,
 			}).Debug("Tx simulation failed but not a revert error")
 			return &TxExecutionResult{
@@ -535,17 +535,17 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 		"gas_price":       builtTx.GasPrice().String(),
 		"tip_cap":         builtTx.GasTipCap().String(),
 		"max_fee_per_gas": builtTx.GasFeeCap().String(),
-		"used_sync_tx":    execCtx.network.IsSyncTxSupported(),
+		"used_sync_tx":    execCtx.Network.IsSyncTxSupported(),
 		"error":           err,
 		"revert_data":     revertData,
 	}).Debug("Tx simulation showed a revert error")
 
 	// Call simulation failed hook if set
-	if execCtx.simulationFailedHook != nil {
-		shouldRetry, hookErr := execCtx.simulationFailedHook(builtTx, revertData, abiError, revertParams, err)
+	if execCtx.SimulationFailedHook != nil {
+		shouldRetry, hookErr := execCtx.SimulationFailedHook(builtTx, revertData, abiError, revertParams, err)
 		if hookErr != nil {
 			// Release nonce since we're giving up and tx was never broadcast
-			wm.ReleaseNonce(execCtx.from, execCtx.network, builtTx.Nonce())
+			wm.ReleaseNonce(execCtx.From, execCtx.Network, builtTx.Nonce())
 			return &TxExecutionResult{
 				Transaction:  nil,
 				ShouldRetry:  false,
@@ -555,7 +555,7 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 		}
 		if !shouldRetry {
 			// Release nonce since we're giving up and tx was never broadcast
-			wm.ReleaseNonce(execCtx.from, execCtx.network, builtTx.Nonce())
+			wm.ReleaseNonce(execCtx.From, execCtx.Network, builtTx.Nonce())
 			return &TxExecutionResult{
 				Transaction:  nil,
 				ShouldRetry:  false,
@@ -566,8 +566,8 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 	}
 
 	// we need to persist a few calculated values here before retrying with the txs
-	execCtx.retryNonce = big.NewInt(int64(builtTx.Nonce()))
-	execCtx.gasLimit = builtTx.Gas()
+	execCtx.RetryNonce = big.NewInt(int64(builtTx.Nonce()))
+	execCtx.GasLimit = builtTx.Gas()
 	// we could persist the error here but then later we need to set it to nil, setting this to the error if the user is supposed to handle such error
 	return &TxExecutionResult{
 		Transaction:  nil,
@@ -580,9 +580,9 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 // handleGasEstimationFailure processes gas estimation failures and pending transaction checks
 func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext, errDecoder *ErrorDecoder, err error) *TxExecutionResult {
 	// Only check old transactions if we have any
-	if len(execCtx.oldTxs) > 0 {
+	if len(execCtx.OldTxs) > 0 {
 		// Check if previous transactions might have been successful
-		statuses, statusErr := wm.getTxStatuses(execCtx.oldTxs, execCtx.network)
+		statuses, statusErr := wm.getTxStatuses(execCtx.OldTxs, execCtx.Network)
 		if statusErr != nil {
 			logger.WithFields(logger.Fields{
 				"error": statusErr,
@@ -592,7 +592,7 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 			// Check for completed transactions
 			for txhash, status := range statuses {
 				if status.Status == "done" || status.Status == "reverted" {
-					if tx, exists := execCtx.oldTxs[txhash]; exists && tx != nil {
+					if tx, exists := execCtx.OldTxs[txhash]; exists && tx != nil {
 						return &TxExecutionResult{
 							Transaction:  tx,
 							ShouldRetry:  false,
@@ -608,7 +608,7 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 			var bestTx *types.Transaction
 			for txhash, status := range statuses {
 				if status.Status == "pending" {
-					if tx, exists := execCtx.oldTxs[txhash]; exists && tx != nil {
+					if tx, exists := execCtx.OldTxs[txhash]; exists && tx != nil {
 						if tx.GasPrice().Cmp(highestGasPrice) > 0 {
 							highestGasPrice = tx.GasPrice()
 							bestTx = tx
@@ -635,9 +635,9 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 	}
 
 	// Handle gas estimation failed hook
-	if errDecoder != nil && execCtx.gasEstimationFailedHook != nil {
+	if errDecoder != nil && execCtx.GasEstimationFailedHook != nil {
 		abiError, revertParams, revertMsgErr := errDecoder.Decode(err)
-		hookGasLimit, hookErr := execCtx.gasEstimationFailedHook(nil, abiError, revertParams, revertMsgErr, err)
+		hookGasLimit, hookErr := execCtx.GasEstimationFailedHook(nil, abiError, revertParams, revertMsgErr, err)
 		if hookErr != nil {
 			return &TxExecutionResult{
 				Transaction:  nil,
@@ -647,18 +647,18 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 			}
 		}
 		if hookGasLimit != nil {
-			execCtx.gasLimit = hookGasLimit.Uint64()
+			execCtx.GasLimit = hookGasLimit.Uint64()
 		}
 	}
 
 	// Increment retry count for gas estimation failure
-	execCtx.actualRetryCount++
-	if execCtx.actualRetryCount > execCtx.numRetries {
+	execCtx.ActualRetryCount++
+	if execCtx.ActualRetryCount > execCtx.NumRetries {
 		return &TxExecutionResult{
 			Transaction:  nil,
 			ShouldRetry:  false,
 			ShouldReturn: true,
-			Error:        errors.Join(ErrEnsureTxOutOfRetries, fmt.Errorf("gas estimation failed after %d retries", execCtx.numRetries)),
+			Error:        errors.Join(ErrEnsureTxOutOfRetries, fmt.Errorf("gas estimation failed after %d retries", execCtx.NumRetries)),
 		}
 	}
 
@@ -674,15 +674,15 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, execCtx *TxExecutionContext) *TxExecutionResult {
 	// Helper to release nonce when we fail before broadcast attempt
 	releaseNonce := func() {
-		// Only release if this tx is not in oldTxs (meaning it was never broadcast)
-		if _, exists := execCtx.oldTxs[tx.Hash().Hex()]; !exists {
-			wm.ReleaseNonce(execCtx.from, execCtx.network, tx.Nonce())
+		// Only release if this tx is not in OldTxs (meaning it was never broadcast)
+		if _, exists := execCtx.OldTxs[tx.Hash().Hex()]; !exists {
+			wm.ReleaseNonce(execCtx.From, execCtx.Network, tx.Nonce())
 		}
 	}
 
 	// Execute before hook
-	if execCtx.beforeSignAndBroadcastHook != nil {
-		if hookError := execCtx.beforeSignAndBroadcastHook(tx, nil); hookError != nil {
+	if execCtx.BeforeSignAndBroadcastHook != nil {
+		if hookError := execCtx.BeforeSignAndBroadcastHook(tx, nil); hookError != nil {
 			releaseNonce()
 			return &TxExecutionResult{
 				Transaction:  nil,
@@ -694,7 +694,7 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, exec
 	}
 
 	// Sign transaction
-	signedAddr, signedTx, err := wm.SignTx(execCtx.from, tx, execCtx.network)
+	signedAddr, signedTx, err := wm.SignTx(execCtx.From, tx, execCtx.Network)
 	if err != nil {
 		releaseNonce()
 		return &TxExecutionResult{
@@ -706,7 +706,7 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, exec
 	}
 
 	// Verify signed address matches expected address
-	if signedAddr.Cmp(execCtx.from) != 0 {
+	if signedAddr.Cmp(execCtx.From) != 0 {
 		releaseNonce()
 		return &TxExecutionResult{
 			Transaction:  nil,
@@ -714,7 +714,7 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, exec
 			ShouldReturn: true,
 			Error: fmt.Errorf(
 				"signed from wrong address. You could use wrong hw or passphrase. Expected wallet: %s, signed wallet: %s",
-				execCtx.from.Hex(),
+				execCtx.From.Hex(),
 				signedAddr.Hex(),
 			),
 		}
@@ -725,7 +725,7 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, exec
 	var successful bool
 
 	// Broadcast transaction
-	if execCtx.network.IsSyncTxSupported() {
+	if execCtx.Network.IsSyncTxSupported() {
 		receipt, broadcastErr = wm.BroadcastTxSync(signedTx)
 		if receipt != nil {
 			successful = true
@@ -735,7 +735,7 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, exec
 	}
 
 	if signedTx != nil {
-		execCtx.oldTxs[signedTx.Hash().Hex()] = signedTx
+		execCtx.OldTxs[signedTx.Hash().Hex()] = signedTx
 	}
 
 	if !successful {
@@ -747,7 +747,7 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, exec
 				"gas_price":       signedTx.GasPrice().String(),
 				"tip_cap":         signedTx.GasTipCap().String(),
 				"max_fee_per_gas": signedTx.GasFeeCap().String(),
-				"used_sync_tx":    execCtx.network.IsSyncTxSupported(),
+				"used_sync_tx":    execCtx.Network.IsSyncTxSupported(),
 				"receipt":         receipt,
 				"error":           broadcastErr,
 			}).Debug("Unsuccessful signing and broadcasting transaction")
@@ -755,7 +755,7 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, exec
 			logger.WithFields(logger.Fields{
 				"nonce":        tx.Nonce(),
 				"gas_price":    tx.GasPrice().String(),
-				"used_sync_tx": execCtx.network.IsSyncTxSupported(),
+				"used_sync_tx": execCtx.Network.IsSyncTxSupported(),
 				"receipt":      receipt,
 				"error":        broadcastErr,
 			}).Debug("Unsuccessful signing and broadcasting transaction (no signed tx)")
@@ -771,7 +771,7 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, exec
 		"gas_price":       signedTx.GasPrice().String(),
 		"tip_cap":         signedTx.GasTipCap().String(),
 		"max_fee_per_gas": signedTx.GasFeeCap().String(),
-		"used_sync_tx":    execCtx.network.IsSyncTxSupported(),
+		"used_sync_tx":    execCtx.Network.IsSyncTxSupported(),
 		"receipt":         receipt,
 	}).Info("Signed and broadcasted transaction")
 
@@ -781,8 +781,8 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, exec
 		hookErr = broadcastErr
 	}
 
-	if execCtx.afterSignAndBroadcastHook != nil {
-		if hookError := execCtx.afterSignAndBroadcastHook(signedTx, hookErr); hookError != nil {
+	if execCtx.AfterSignAndBroadcastHook != nil {
+		if hookError := execCtx.AfterSignAndBroadcastHook(signedTx, hookErr); hookError != nil {
 			return &TxExecutionResult{
 				Transaction:  signedTx,
 				Receipt:      receipt,
@@ -795,9 +795,9 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, exec
 
 	// in case receipt is not nil, it means the tx is broadcasted and mined using eth_sendRawTransactionSync
 	if receipt != nil {
-		// Call txMinedHook if set
-		if execCtx.txMinedHook != nil {
-			if hookErr := execCtx.txMinedHook(signedTx, receipt); hookErr != nil {
+		// Call TxMinedHook if set
+		if execCtx.TxMinedHook != nil {
+			if hookErr := execCtx.TxMinedHook(signedTx, receipt); hookErr != nil {
 				return &TxExecutionResult{
 					Transaction:  signedTx,
 					Receipt:      receipt,
@@ -837,7 +837,7 @@ func (wm *WalletManager) handleBroadcastError(broadcastErr BroadcastError, tx *t
 	// however, it should be handled by the slow status gotten from the monitor tx
 	// so we just need to retry with the same nonce
 	if broadcastErr == ErrTxIsKnown {
-		execCtx.retryNonce = big.NewInt(int64(tx.Nonce()))
+		execCtx.RetryNonce = big.NewInt(int64(tx.Nonce()))
 		return &TxExecutionResult{
 			Transaction:  nil,
 			ShouldRetry:  true,
@@ -857,12 +857,12 @@ func (wm *WalletManager) handleBroadcastError(broadcastErr BroadcastError, tx *t
 		errorMsg = fmt.Sprintf("broadcast error: %v", broadcastErr)
 	}
 
-	if result := execCtx.incrementRetryCountAndCheck(errorMsg); result != nil {
+	if result := execCtx.IncrementRetryCountAndCheck(errorMsg); result != nil {
 		return result
 	}
 
 	// Keep the same nonce for retry
-	execCtx.retryNonce = big.NewInt(int64(tx.Nonce()))
+	execCtx.RetryNonce = big.NewInt(int64(tx.Nonce()))
 	return &TxExecutionResult{
 		Transaction:  nil,
 		ShouldRetry:  true,
@@ -874,14 +874,14 @@ func (wm *WalletManager) handleBroadcastError(broadcastErr BroadcastError, tx *t
 // handleNonceIsLowError specifically handles the nonce is low error case
 func (wm *WalletManager) handleNonceIsLowError(tx *types.Transaction, execCtx *TxExecutionContext) *TxExecutionResult {
 
-	statuses, err := wm.getTxStatuses(execCtx.oldTxs, execCtx.network)
+	statuses, err := wm.getTxStatuses(execCtx.OldTxs, execCtx.Network)
 
 	if err != nil {
 		logger.WithFields(logger.Fields{
 			"error": err,
 		}).Debug("Getting tx statuses in case where tx wasn't broadcasted because nonce is too low. Ignore and continue the retry loop")
 
-		if result := execCtx.incrementRetryCountAndCheck("nonce is low and status check failed"); result != nil {
+		if result := execCtx.IncrementRetryCountAndCheck("nonce is low and status check failed"); result != nil {
 			return result
 		}
 
@@ -896,7 +896,7 @@ func (wm *WalletManager) handleNonceIsLowError(tx *types.Transaction, execCtx *T
 	// Check if any old transaction is completed
 	for txhash, status := range statuses {
 		if status.Status == "done" || status.Status == "reverted" {
-			if tx, exists := execCtx.oldTxs[txhash]; exists && tx != nil {
+			if tx, exists := execCtx.OldTxs[txhash]; exists && tx != nil {
 				return &TxExecutionResult{
 					Transaction:  tx,
 					ShouldRetry:  false,
@@ -908,11 +908,11 @@ func (wm *WalletManager) handleNonceIsLowError(tx *types.Transaction, execCtx *T
 	}
 
 	// No completed transactions found, retry with new nonce
-	if result := execCtx.incrementRetryCountAndCheck("nonce is low and no pending transactions"); result != nil {
+	if result := execCtx.IncrementRetryCountAndCheck("nonce is low and no pending transactions"); result != nil {
 		return result
 	}
 
-	execCtx.retryNonce = nil
+	execCtx.RetryNonce = nil
 
 	return &TxExecutionResult{
 		Transaction:  nil,
@@ -926,9 +926,9 @@ func (wm *WalletManager) handleNonceIsLowError(tx *types.Transaction, execCtx *T
 func (wm *WalletManager) handleTransactionStatus(status TxStatus, signedTx *types.Transaction, execCtx *TxExecutionContext) *TxExecutionResult {
 	switch status.Status {
 	case "mined", "reverted":
-		// Call txMinedHook if set
-		if execCtx.txMinedHook != nil {
-			if hookErr := execCtx.txMinedHook(signedTx, status.Receipt); hookErr != nil {
+		// Call TxMinedHook if set
+		if execCtx.TxMinedHook != nil {
+			if hookErr := execCtx.TxMinedHook(signedTx, status.Receipt); hookErr != nil {
 				return &TxExecutionResult{
 					Transaction:  signedTx,
 					Receipt:      status.Receipt,
@@ -951,16 +951,16 @@ func (wm *WalletManager) handleTransactionStatus(status TxStatus, signedTx *type
 			"tx_hash": signedTx.Hash().Hex(),
 		}).Info("Transaction lost, retrying...")
 
-		execCtx.actualRetryCount++
-		if execCtx.actualRetryCount > execCtx.numRetries {
+		execCtx.ActualRetryCount++
+		if execCtx.ActualRetryCount > execCtx.NumRetries {
 			return &TxExecutionResult{
 				Transaction:  nil,
 				ShouldRetry:  false,
 				ShouldReturn: true,
-				Error:        errors.Join(ErrEnsureTxOutOfRetries, fmt.Errorf("transaction lost after %d retries", execCtx.numRetries)),
+				Error:        errors.Join(ErrEnsureTxOutOfRetries, fmt.Errorf("transaction lost after %d retries", execCtx.NumRetries)),
 			}
 		}
-		execCtx.retryNonce = nil
+		execCtx.RetryNonce = nil
 
 		// Sleep will be handled in main loop based on actualRetryCount
 		return &TxExecutionResult{
@@ -972,7 +972,7 @@ func (wm *WalletManager) handleTransactionStatus(status TxStatus, signedTx *type
 
 	case "slow":
 		// Try to adjust gas prices for slow transaction
-		if execCtx.adjustGasPricesForSlowTx(signedTx) {
+		if execCtx.AdjustGasPricesForSlowTx(signedTx) {
 			logger.WithFields(logger.Fields{
 				"tx_hash": signedTx.Hash().Hex(),
 			}).Info(fmt.Sprintf("Transaction slow, continuing to monitor with increased gas price by %.0f%% and tip cap by %.0f%%...",
@@ -989,15 +989,15 @@ func (wm *WalletManager) handleTransactionStatus(status TxStatus, signedTx *type
 			// Limits reached - stop retrying and return error
 			logger.WithFields(logger.Fields{
 				"tx_hash":       signedTx.Hash().Hex(),
-				"max_gas_price": execCtx.maxGasPrice,
-				"max_tip_cap":   execCtx.maxTipCap,
+				"max_gas_price": execCtx.MaxGasPrice,
+				"max_tip_cap":   execCtx.MaxTipCap,
 			}).Warn("Transaction slow but gas price protection limits reached. Stopping retry attempts.")
 
 			return &TxExecutionResult{
 				Transaction:  signedTx,
 				ShouldRetry:  false,
 				ShouldReturn: true,
-				Error:        errors.Join(ErrGasPriceLimitReached, fmt.Errorf("maxGasPrice: %f, maxTipCap: %f", execCtx.maxGasPrice, execCtx.maxTipCap)),
+				Error:        errors.Join(ErrGasPriceLimitReached, fmt.Errorf("maxGasPrice: %f, maxTipCap: %f", execCtx.MaxGasPrice, execCtx.MaxTipCap)),
 			}
 		}
 

@@ -100,3 +100,24 @@ func WithDefaults(defaults ManagerDefaults) WalletManagerOption {
 		wm.defaults = defaults
 	}
 }
+
+// WithReaderFactory sets a custom reader factory for testing or alternative implementations
+func WithReaderFactory(factory NetworkReaderFactory) WalletManagerOption {
+	return func(wm *WalletManager) {
+		wm.readerFactory = factory
+	}
+}
+
+// WithBroadcasterFactory sets a custom broadcaster factory for testing or alternative implementations
+func WithBroadcasterFactory(factory NetworkBroadcasterFactory) WalletManagerOption {
+	return func(wm *WalletManager) {
+		wm.broadcasterFactory = factory
+	}
+}
+
+// WithTxMonitorFactory sets a custom tx monitor factory for testing or alternative implementations
+func WithTxMonitorFactory(factory NetworkTxMonitorFactory) WalletManagerOption {
+	return func(wm *WalletManager) {
+		wm.txMonitorFactory = factory
+	}
+}

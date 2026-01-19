@@ -9,23 +9,20 @@ import (
 	"github.com/tranvictor/jarvis/networks"
 	"github.com/tranvictor/jarvis/txanalyzer"
 	"github.com/tranvictor/jarvis/util"
-	"github.com/tranvictor/jarvis/util/broadcaster"
-	"github.com/tranvictor/jarvis/util/monitor"
-	"github.com/tranvictor/jarvis/util/reader"
 
 	"github.com/tranvictor/walletarmy/internal/circuitbreaker"
 )
 
-func (wm *WalletManager) getBroadcaster(network networks.Network) *broadcaster.Broadcaster {
+func (wm *WalletManager) getBroadcaster(network networks.Network) EthBroadcaster {
 	if b, ok := wm.broadcasters.Load(network.GetChainID()); ok {
-		return b.(*broadcaster.Broadcaster)
+		return b.(EthBroadcaster)
 	}
 	return nil
 }
 
 // Broadcaster returns the broadcaster for the given network.
 // Returns an error if the network could not be initialized or if the circuit breaker is open.
-func (wm *WalletManager) Broadcaster(network networks.Network) (*broadcaster.Broadcaster, error) {
+func (wm *WalletManager) Broadcaster(network networks.Network) (EthBroadcaster, error) {
 	// Check circuit breaker
 	cb := wm.getCircuitBreaker(network.GetChainID())
 	if !cb.Allow() {
@@ -45,16 +42,16 @@ func (wm *WalletManager) Broadcaster(network networks.Network) (*broadcaster.Bro
 	return b, nil
 }
 
-func (wm *WalletManager) getReader(network networks.Network) *reader.EthReader {
+func (wm *WalletManager) getReader(network networks.Network) EthReader {
 	if r, ok := wm.readers.Load(network.GetChainID()); ok {
-		return r.(*reader.EthReader)
+		return r.(EthReader)
 	}
 	return nil
 }
 
 // Reader returns the reader for the given network.
 // Returns an error if the network could not be initialized or if the circuit breaker is open.
-func (wm *WalletManager) Reader(network networks.Network) (*reader.EthReader, error) {
+func (wm *WalletManager) Reader(network networks.Network) (EthReader, error) {
 	// Check circuit breaker
 	cb := wm.getCircuitBreaker(network.GetChainID())
 	if !cb.Allow() {
@@ -91,9 +88,9 @@ func (wm *WalletManager) getAnalyzer(network networks.Network) *txanalyzer.TxAna
 	return nil
 }
 
-func (wm *WalletManager) getTxMonitor(network networks.Network) *monitor.TxMonitor {
+func (wm *WalletManager) getTxMonitor(network networks.Network) TxMonitor {
 	if m, ok := wm.txMonitors.Load(network.GetChainID()); ok {
-		return m.(*monitor.TxMonitor)
+		return m.(TxMonitor)
 	}
 	return nil
 }
@@ -127,11 +124,11 @@ func (wm *WalletManager) initNetwork(network networks.Network) (err error) {
 	defer lock.Unlock()
 
 	// Check if reader exists, create if not
-	var r *reader.EthReader
+	var r EthReader
 	if existing, ok := wm.readers.Load(chainID); ok {
-		r = existing.(*reader.EthReader)
+		r = existing.(EthReader)
 	} else {
-		r, err = util.EthReader(network)
+		r, err = wm.readerFactory(network)
 		if err != nil {
 			return err
 		}
@@ -139,14 +136,26 @@ func (wm *WalletManager) initNetwork(network networks.Network) (err error) {
 	}
 
 	// Check if analyzer exists, create if not
+	// Analyzer still uses jarvis reader directly (for compatibility)
 	if _, ok := wm.analyzers.Load(chainID); !ok {
-		analyzer := txanalyzer.NewGenericAnalyzer(r, network)
-		wm.analyzers.Store(chainID, analyzer)
+		// Try to get the underlying jarvis reader for the analyzer
+		if jarvisReader := jarvisReaderFromInterface(r); jarvisReader != nil {
+			analyzer := txanalyzer.NewGenericAnalyzer(jarvisReader, network)
+			wm.analyzers.Store(chainID, analyzer)
+		} else {
+			// For custom readers, create a new jarvis reader for the analyzer
+			jarvisR, err := util.EthReader(network)
+			if err != nil {
+				return fmt.Errorf("couldn't create analyzer: %w", err)
+			}
+			analyzer := txanalyzer.NewGenericAnalyzer(jarvisR, network)
+			wm.analyzers.Store(chainID, analyzer)
+		}
 	}
 
 	// Check if broadcaster exists, create if not
 	if _, ok := wm.broadcasters.Load(chainID); !ok {
-		b, err := util.EthBroadcaster(network)
+		b, err := wm.broadcasterFactory(network)
 		if err != nil {
 			return err
 		}
@@ -155,8 +164,10 @@ func (wm *WalletManager) initNetwork(network networks.Network) (err error) {
 
 	// Check if tx monitor exists, create if not
 	if _, ok := wm.txMonitors.Load(chainID); !ok {
-		txMon := monitor.NewGenericTxMonitor(r)
-		wm.txMonitors.Store(chainID, txMon)
+		txMon := wm.txMonitorFactory(r)
+		if txMon != nil {
+			wm.txMonitors.Store(chainID, txMon)
+		}
 	}
 
 	return nil
