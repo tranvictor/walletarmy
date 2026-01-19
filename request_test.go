@@ -9,7 +9,9 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/tranvictor/jarvis/networks"
+	"github.com/tranvictor/walletarmy/idempotency"
 )
 
 // MockHook for testing hooks
@@ -459,4 +461,265 @@ func TestTxRequest_MultipleSettersOfSameType(t *testing.T) {
 	}
 	req.SetGasEstimationFailedHook(hook1).SetGasEstimationFailedHook(hook2)
 	assert.NotNil(t, req.gasEstimationFailedHook)
+}
+
+func TestTxRequest_SetMaxGasPrice(t *testing.T) {
+	wm := &WalletManager{}
+	req := wm.R()
+
+	result := req.SetMaxGasPrice(100.0)
+
+	assert.Equal(t, req, result)
+	assert.Equal(t, 100.0, req.maxGasPrice)
+}
+
+func TestTxRequest_SetMaxTipCap(t *testing.T) {
+	wm := &WalletManager{}
+	req := wm.R()
+
+	result := req.SetMaxTipCap(5.0)
+
+	assert.Equal(t, req, result)
+	assert.Equal(t, 5.0, req.maxTipCap)
+}
+
+func TestTxRequest_SetTxCheckInterval(t *testing.T) {
+	wm := &WalletManager{}
+	req := wm.R()
+	interval := 5 * time.Second
+
+	result := req.SetTxCheckInterval(interval)
+
+	assert.Equal(t, req, result)
+	assert.Equal(t, interval, req.txCheckInterval)
+}
+
+func TestTxRequest_SetIdempotencyKey(t *testing.T) {
+	wm := &WalletManager{}
+	req := wm.R()
+
+	result := req.SetIdempotencyKey("unique-key-123")
+
+	assert.Equal(t, req, result)
+	assert.Equal(t, "unique-key-123", req.idempotencyKey)
+}
+
+func TestTxRequest_SetSimulationFailedHook(t *testing.T) {
+	wm := &WalletManager{}
+	req := wm.R()
+
+	hook := func(tx *types.Transaction, revertData []byte, abiError *abi.Error, revertParams any, err error) (bool, error) {
+		return false, nil
+	}
+
+	result := req.SetSimulationFailedHook(hook)
+
+	assert.Equal(t, req, result)
+	assert.NotNil(t, req.simulationFailedHook)
+}
+
+func TestTxRequest_SetTxMinedHook(t *testing.T) {
+	wm := &WalletManager{}
+	req := wm.R()
+
+	hook := func(tx *types.Transaction, receipt *types.Receipt) error {
+		return nil
+	}
+
+	result := req.SetTxMinedHook(hook)
+
+	assert.Equal(t, req, result)
+	assert.NotNil(t, req.txMinedHook)
+}
+
+func TestTxRequest_Execute_ValidatesFromAddress(t *testing.T) {
+	wm := &WalletManager{}
+	req := wm.R().
+		SetTo(common.HexToAddress("0x1234567890123456789012345678901234567890")).
+		SetNetwork(networks.EthereumMainnet)
+	// Note: SetFrom is not called, so from address is zero
+
+	tx, receipt, err := req.Execute()
+
+	assert.Nil(t, tx)
+	assert.Nil(t, receipt)
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrFromAddressZero)
+}
+
+func TestTxRequest_Execute_ValidatesNetwork(t *testing.T) {
+	wm := &WalletManager{}
+	req := wm.R().
+		SetFrom(common.HexToAddress("0x1234567890123456789012345678901234567890"))
+	// Manually set network to nil
+	req.network = nil
+
+	tx, receipt, err := req.Execute()
+
+	assert.Nil(t, tx)
+	assert.Nil(t, receipt)
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrNetworkNil)
+}
+
+func TestTxRequest_InheritsDefaults(t *testing.T) {
+	wm := NewWalletManager(
+		WithDefaultNumRetries(5),
+		WithDefaultSleepDuration(10*time.Second),
+		WithDefaultTxCheckInterval(3*time.Second),
+		WithDefaultExtraGasLimit(10000),
+		WithDefaultExtraGasPrice(2.0),
+		WithDefaultExtraTipCap(1.0),
+		WithDefaultMaxGasPrice(500.0),
+		WithDefaultMaxTipCap(50.0),
+		WithDefaultNetwork(networks.BSCMainnet),
+	)
+
+	req := wm.R()
+
+	assert.Equal(t, 5, req.numRetries)
+	assert.Equal(t, 10*time.Second, req.sleepDuration)
+	assert.Equal(t, 3*time.Second, req.txCheckInterval)
+	assert.Equal(t, uint64(10000), req.extraGasLimit)
+	assert.Equal(t, 2.0, req.extraGasPrice)
+	assert.Equal(t, 1.0, req.extraTipCapGwei)
+	assert.Equal(t, 500.0, req.maxGasPrice)
+	assert.Equal(t, 50.0, req.maxTipCap)
+	assert.Equal(t, networks.BSCMainnet, req.network)
+}
+
+func TestTxRequest_OverridesDefaults(t *testing.T) {
+	wm := NewWalletManager(
+		WithDefaultNumRetries(5),
+		WithDefaultSleepDuration(10*time.Second),
+	)
+
+	req := wm.R().
+		SetNumRetries(10).
+		SetSleepDuration(20 * time.Second)
+
+	assert.Equal(t, 10, req.numRetries)
+	assert.Equal(t, 20*time.Second, req.sleepDuration)
+}
+
+func TestTxRequest_ExecuteWithIdempotency_ReturnsExistingConfirmed(t *testing.T) {
+	store := idempotency.NewInMemoryStore(time.Hour)
+	wm := NewWalletManager(WithIdempotencyStore(store))
+
+	// Pre-create a confirmed record
+	idempKey := "test-key-confirmed"
+	record, err := store.Create(idempKey)
+	require.NoError(t, err)
+
+	expectedTx := types.NewTransaction(1, common.Address{}, big.NewInt(100), 21000, big.NewInt(1000000000), nil)
+	expectedReceipt := &types.Receipt{Status: 1}
+
+	record.Status = idempotency.StatusConfirmed
+	record.Transaction = expectedTx
+	record.Receipt = expectedReceipt
+	err = store.Update(record)
+	require.NoError(t, err)
+
+	// Execute request with same key
+	req := wm.R().
+		SetFrom(common.HexToAddress("0x1234567890123456789012345678901234567890")).
+		SetNetwork(networks.EthereumMainnet).
+		SetIdempotencyKey(idempKey)
+
+	tx, receipt, execErr := req.Execute()
+
+	assert.NoError(t, execErr)
+	assert.Equal(t, expectedTx.Hash(), tx.Hash())
+	assert.Equal(t, expectedReceipt, receipt)
+}
+
+func TestTxRequest_ExecuteWithIdempotency_ReturnsExistingFailed(t *testing.T) {
+	store := idempotency.NewInMemoryStore(time.Hour)
+	wm := NewWalletManager(WithIdempotencyStore(store))
+
+	// Pre-create a failed record
+	idempKey := "test-key-failed"
+	record, err := store.Create(idempKey)
+	require.NoError(t, err)
+
+	expectedErr := assert.AnError
+	record.Status = idempotency.StatusFailed
+	record.Error = expectedErr
+	err = store.Update(record)
+	require.NoError(t, err)
+
+	// Execute request with same key
+	req := wm.R().
+		SetFrom(common.HexToAddress("0x1234567890123456789012345678901234567890")).
+		SetNetwork(networks.EthereumMainnet).
+		SetIdempotencyKey(idempKey)
+
+	_, _, execErr := req.Execute()
+
+	assert.Error(t, execErr)
+	assert.Equal(t, expectedErr, execErr)
+}
+
+func TestTxRequest_ExecuteWithIdempotency_ReturnsDuplicateForPending(t *testing.T) {
+	store := idempotency.NewInMemoryStore(time.Hour)
+	wm := NewWalletManager(WithIdempotencyStore(store))
+
+	// Pre-create a pending record
+	idempKey := "test-key-pending"
+	record, err := store.Create(idempKey)
+	require.NoError(t, err)
+	record.Status = idempotency.StatusPending
+	err = store.Update(record)
+	require.NoError(t, err)
+
+	// Execute request with same key
+	req := wm.R().
+		SetFrom(common.HexToAddress("0x1234567890123456789012345678901234567890")).
+		SetNetwork(networks.EthereumMainnet).
+		SetIdempotencyKey(idempKey)
+
+	_, _, execErr := req.Execute()
+
+	assert.Error(t, execErr)
+	assert.ErrorIs(t, execErr, idempotency.ErrDuplicateKey)
+}
+
+func TestTxRequest_ExecuteWithIdempotency_ReturnsDuplicateForSubmitted(t *testing.T) {
+	store := idempotency.NewInMemoryStore(time.Hour)
+	wm := NewWalletManager(WithIdempotencyStore(store))
+
+	// Pre-create a submitted record
+	idempKey := "test-key-submitted"
+	record, err := store.Create(idempKey)
+	require.NoError(t, err)
+	record.Status = idempotency.StatusSubmitted
+	err = store.Update(record)
+	require.NoError(t, err)
+
+	// Execute request with same key
+	req := wm.R().
+		SetFrom(common.HexToAddress("0x1234567890123456789012345678901234567890")).
+		SetNetwork(networks.EthereumMainnet).
+		SetIdempotencyKey(idempKey)
+
+	_, _, execErr := req.Execute()
+
+	assert.Error(t, execErr)
+	assert.ErrorIs(t, execErr, idempotency.ErrDuplicateKey)
+}
+
+func TestTxRequest_ExecuteWithoutIdempotency_WorksNormally(t *testing.T) {
+	wm := NewWalletManager() // No idempotency store
+
+	req := wm.R().
+		SetFrom(common.HexToAddress("0x1234567890123456789012345678901234567890")).
+		SetNetwork(networks.EthereumMainnet)
+	// No idempotency key set
+
+	// This will fail due to missing wallet account, but validates the path is taken
+	_, _, err := req.Execute()
+
+	// Should not be ErrDuplicateKey - it should fail with account-related error
+	assert.Error(t, err)
+	assert.NotErrorIs(t, err, idempotency.ErrDuplicateKey)
 }
