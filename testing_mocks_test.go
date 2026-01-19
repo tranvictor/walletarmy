@@ -201,13 +201,10 @@ var (
 	testAddr1 = common.HexToAddress("0x1111111111111111111111111111111111111111")
 	testAddr2 = common.HexToAddress("0x2222222222222222222222222222222222222222")
 	testAddr3 = common.HexToAddress("0x3333333333333333333333333333333333333333")
-	zeroAddr  = common.Address{}
 
 	testPrivateKey1, _ = crypto.HexToECDSA("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-	testPrivateKey2, _ = crypto.HexToECDSA("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
 
 	oneEth      = big.NewInt(1000000000000000000)
-	oneGwei     = big.NewInt(1000000000)
 	twentyGwei  = big.NewInt(20000000000)
 	twoGwei     = big.NewInt(2000000000)
 	chainIDMain = big.NewInt(1)

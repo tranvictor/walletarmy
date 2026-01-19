@@ -9,7 +9,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient/gethclient"
-	jarviscommon "github.com/tranvictor/jarvis/common"
 	"github.com/tranvictor/jarvis/networks"
 	"github.com/tranvictor/jarvis/util"
 	"github.com/tranvictor/jarvis/util/broadcaster"
@@ -137,12 +136,4 @@ func jarvisReaderFromInterface(r EthReader) *reader.EthReader {
 		return adapter.reader
 	}
 	return nil
-}
-
-// jarvisTxInfoToInternal converts jarviscommon.TxInfo to our TxInfo
-func jarvisTxInfoToInternal(info jarviscommon.TxInfo) TxInfo {
-	return TxInfo{
-		Status:  info.Status,
-		Receipt: info.Receipt,
-	}
 }
