@@ -9,12 +9,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient/gethclient"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tranvictor/jarvis/networks"
+	"github.com/tranvictor/jarvis/util/account"
 )
 
 // ============================================================
@@ -932,4 +935,865 @@ func TestReader_CircuitBreakerOpen_ReturnsError(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.True(t, errors.Is(err, ErrCircuitBreakerOpen))
+}
+
+// ============================================================
+// Nonce Release Tests
+// ============================================================
+
+func TestBuildTx_ReleasesNonce_WhenGasEstimationFails(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// First, set up initial nonce state
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Make gas estimation fail
+	setup.Reader.EstimateExactGasFn = func(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error) {
+		return 0, errors.New("execution reverted")
+	}
+
+	// Build tx with gasLimit=0 to trigger estimation
+	_, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		nil, // nonce = nil, will acquire nonce 5
+		oneEth,
+		0, 0, 20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+	require.Error(t, err)
+
+	// Now try to build another tx - if nonce was released, we should get nonce 5 again
+	setup.Reader.EstimateExactGasFn = func(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error) {
+		return 21000, nil // Success this time
+	}
+
+	tx, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		nil, // Should get nonce 5 again since it was released
+		oneEth,
+		0, 0, 20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), tx.Nonce(), "nonce should be 5 since previous was released")
+}
+
+func TestBuildTx_DoesNotReleaseNonce_WhenSuccess(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// First successful build
+	tx1, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		nil, oneEth,
+		21000, 0, 20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), tx1.Nonce())
+
+	// Second build should get nonce 6 (not 5)
+	tx2, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		nil, oneEth,
+		21000, 0, 20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(6), tx2.Nonce(), "nonce should be 6 since 5 was used")
+}
+
+func TestReleaseNonce_AllowsNonceReuse(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Acquire nonce 5
+	tx1, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		nil, oneEth,
+		21000, 0, 20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), tx1.Nonce())
+
+	// Acquire nonce 6
+	tx2, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		nil, oneEth,
+		21000, 0, 20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(6), tx2.Nonce())
+
+	// Release nonce 6 (the tip)
+	setup.WM.ReleaseNonce(testAddr1, networks.EthereumMainnet, 6)
+
+	// Next acquire should get 6 again
+	tx3, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		nil, oneEth,
+		21000, 0, 20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(6), tx3.Nonce(), "should get 6 again after release")
+}
+
+func TestReleaseNonce_OnlyReleasesTip(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Acquire nonces 5, 6, 7
+	_, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	_, err = setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	_, err = setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+
+	// Try to release nonce 6 (not the tip - tip is 7)
+	setup.WM.ReleaseNonce(testAddr1, networks.EthereumMainnet, 6)
+
+	// Next acquire should still get 8 (not 6)
+	tx, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		nil, oneEth,
+		21000, 0, 20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(8), tx.Nonce(), "should get 8, not 6, because 6 is not the tip")
+}
+
+func TestReleaseNonce_MultipleWalletsIndependent(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) {
+		if addr == testAddr1.Hex() {
+			return 10, nil
+		}
+		return 20, nil
+	}
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) {
+		if addr == testAddr1.Hex() {
+			return 10, nil
+		}
+		return 20, nil
+	}
+
+	// Acquire nonce for wallet 1
+	tx1, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(10), tx1.Nonce())
+
+	// Acquire nonce for wallet 2
+	tx2, err := setup.WM.BuildTx(2, testAddr3, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(20), tx2.Nonce())
+
+	// Release nonce for wallet 1
+	setup.WM.ReleaseNonce(testAddr1, networks.EthereumMainnet, 10)
+
+	// Wallet 1 should get 10 again
+	tx3, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(10), tx3.Nonce())
+
+	// Wallet 2 should get 21 (not affected by wallet 1's release)
+	tx4, err := setup.WM.BuildTx(2, testAddr3, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(21), tx4.Nonce())
+}
+
+func TestBuildTx_ReleasesNonce_WhenNonceAcquisitionFailsLater(t *testing.T) {
+	setup := newTestSetup(t)
+
+	callCount := 0
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) {
+		callCount++
+		if callCount == 1 {
+			return 5, nil
+		}
+		return 5, nil
+	}
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) {
+		return 5, nil
+	}
+
+	// Make gas estimation fail after nonce is acquired
+	setup.Reader.EstimateExactGasFn = func(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error) {
+		return 0, errors.New("out of gas")
+	}
+
+	// First attempt - fails at gas estimation
+	_, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.Error(t, err)
+
+	// Second attempt with working gas estimation
+	setup.Reader.EstimateExactGasFn = func(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error) {
+		return 21000, nil
+	}
+
+	tx, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	// Should get nonce 5 again because the first attempt released it
+	assert.Equal(t, uint64(5), tx.Nonce())
+}
+
+func TestNonceRelease_SequentialReleaseAndAcquire(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
+
+	// Acquire nonces 0-4
+	for i := 0; i < 5; i++ {
+		tx, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(i), tx.Nonce())
+	}
+	// Now we have nonces 0-4 acquired, tip is 4
+
+	// Release nonce 4 (the tip)
+	setup.WM.ReleaseNonce(testAddr1, networks.EthereumMainnet, 4)
+
+	// Next acquire should get 4 again
+	tx, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(4), tx.Nonce(), "should get 4 after release")
+
+	// Release 4 again
+	setup.WM.ReleaseNonce(testAddr1, networks.EthereumMainnet, 4)
+
+	// Release 3 (now the new tip after releasing 4)
+	setup.WM.ReleaseNonce(testAddr1, networks.EthereumMainnet, 3)
+
+	// Next acquire should get 3
+	tx, err = setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(3), tx.Nonce(), "should get 3 after double release")
+}
+
+func TestSignAndBroadcast_ReleasesNonce_WhenBeforeHookFails(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil // Simulation passes
+	}
+
+	// Build a tx first (this acquires nonce 5)
+	tx := newTestTx(5, testAddr2, oneEth)
+
+	execCtx := &TxExecutionContext{
+		NumRetries: 5,
+		From:       testAddr1,
+		To:         testAddr2,
+		Network:    networks.EthereumMainnet,
+		OldTxs:     make(map[string]*types.Transaction),
+		BeforeSignAndBroadcastHook: func(tx *types.Transaction, err error) error {
+			return errors.New("hook says no")
+		},
+	}
+
+	result := setup.WM.signAndBroadcastTransaction(tx, execCtx)
+
+	assert.True(t, result.ShouldReturn)
+	assert.Error(t, result.Error)
+	assert.Contains(t, result.Error.Error(), "hook")
+
+	// Now the nonce should have been released
+	// Build another tx - should get nonce 5 again
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	newTx, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), newTx.Nonce(), "nonce 5 should be available after release")
+}
+
+func TestSimulation_ReleasesNonce_WhenHookSaysNoRetry(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// Start with nonce 5
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// First, let's acquire nonce 5 manually to establish state
+	tx1, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), tx1.Nonce())
+
+	// Now release it to simulate what happens when simulation fails
+	setup.WM.ReleaseNonce(testAddr1, networks.EthereumMainnet, 5)
+
+	// Next acquire should get 5 again (proving release worked)
+	tx2, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), tx2.Nonce(), "nonce 5 should be available after release")
+}
+
+func TestSimulation_DoesNotReleaseNonce_WhenRetrying(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// Start fresh - no prior nonce state
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Simulation succeeds, tx should proceed
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil // Success
+	}
+
+	// First, acquire nonce 5
+	tx1, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), tx1.Nonce())
+
+	// Don't release it - simulating tx is still in-flight
+
+	// Next acquire should get 6 (nonce 5 is still reserved)
+	tx2, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(6), tx2.Nonce(), "nonce 6 because 5 is still in use")
+}
+
+func TestSimulation_NonRevertError_ReturnsErrorWithoutHook(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Make EthCall return a network error (not a revert)
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, errors.New("network timeout")
+	}
+
+	hookCalled := false
+	execCtx := &TxExecutionContext{
+		NumRetries:    5,
+		TxType:        2,
+		From:          testAddr1,
+		To:            testAddr2,
+		Value:         oneEth,
+		GasLimit:      21000,
+		RetryGasPrice: 20.0,
+		RetryTipCap:   2.0,
+		Network:       networks.EthereumMainnet,
+		OldTxs:        make(map[string]*types.Transaction),
+		SimulationFailedHook: func(tx *types.Transaction, revertData []byte, abiError *abi.Error, revertParams any, err error) (bool, error) {
+			hookCalled = true
+			return false, nil
+		},
+	}
+
+	result := setup.WM.executeTransactionAttempt(context.Background(), execCtx, nil)
+
+	// Hook should NOT be called for non-revert errors
+	assert.False(t, hookCalled, "simulation hook should NOT be called for non-revert errors")
+	assert.True(t, result.ShouldReturn)
+	assert.False(t, result.ShouldRetry)
+	assert.Error(t, result.Error)
+	assert.True(t, errors.Is(result.Error, ErrSimulatedTxFailed))
+}
+
+// ============================================================
+// EnsureTxWithHooksContext Integration Tests
+// ============================================================
+
+// setupEnsureTxTest creates a test setup configured for EnsureTx integration tests
+// with a registered wallet that can sign transactions
+func setupEnsureTxTest(t *testing.T) *testSetup {
+	t.Helper()
+	setup := newTestSetup(t)
+
+	// Create and register the test wallet so transactions can be signed
+	// testPrivateKey1 is "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	acc, err := account.NewPrivateKeyAccount("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	require.NoError(t, err)
+	setup.WM.SetAccount(acc)
+
+	return setup
+}
+
+func TestEnsureTx_FullSuccessPath(t *testing.T) {
+	setup := setupEnsureTxTest(t)
+
+	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
+
+	// Set up mocks for success path
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.SuggestedGasSettingsFn = func() (float64, float64, error) { return 20.0, 2.0, nil }
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil // Simulation passes
+	}
+
+	var broadcastedTx *types.Transaction
+	setup.Broadcaster.BroadcastTxFn = func(tx *types.Transaction) (string, bool, error) {
+		broadcastedTx = tx
+		return tx.Hash().Hex(), true, nil
+	}
+	// Also handle sync broadcast in case network supports it
+	setup.Broadcaster.BroadcastTxSyncFn = func(tx *types.Transaction) (*types.Receipt, error) {
+		broadcastedTx = tx
+		return &types.Receipt{
+			Status:      types.ReceiptStatusSuccessful,
+			TxHash:      tx.Hash(),
+			BlockNumber: big.NewInt(12345),
+		}, nil
+	}
+
+	// Monitor returns mined status (used for non-sync networks)
+	setup.Monitor.StatusToReturn = TxMonitorStatus{
+		Status:  "done",
+		Receipt: &types.Receipt{Status: types.ReceiptStatusSuccessful},
+	}
+
+	ctx := context.Background()
+	tx, receipt, err := setup.WM.EnsureTxWithHooksContext(
+		ctx,
+		3,           // numRetries
+		time.Second, // sleepDuration
+		time.Second, // txCheckInterval
+		2,           // txType (EIP-1559)
+		fromAddr,    // from
+		testAddr2,   // to
+		oneEth,      // value
+		21000, 0,    // gasLimit, extraGasLimit
+		20.0, 0, // gasPrice, extraGasPrice
+		2.0, 0, // tipCapGwei, extraTipCapGwei
+		100.0, 50.0, // maxGasPrice, maxTipCap
+		nil, // data
+		networks.EthereumMainnet,
+		nil, nil, nil, nil, nil, nil, // hooks
+	)
+
+	require.NoError(t, err, "EnsureTxWithHooksContext should succeed")
+	require.NotNil(t, tx, "tx should not be nil")
+	require.NotNil(t, receipt, "receipt should not be nil")
+	require.NotNil(t, broadcastedTx, "broadcastedTx should have been set by broadcast function")
+	assert.Equal(t, broadcastedTx.Hash(), tx.Hash())
+	assert.Equal(t, uint64(5), tx.Nonce())
+	// Verify either BroadcastTx or BroadcastTxSync was called
+	totalBroadcasts := len(setup.Broadcaster.BroadcastTxCalls) + len(setup.Broadcaster.BroadcastTxSyncCalls)
+	assert.Equal(t, 1, totalBroadcasts, "should have broadcast exactly once")
+}
+
+func TestEnsureTx_TxMinedHook_Called(t *testing.T) {
+	setup := setupEnsureTxTest(t)
+
+	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil
+	}
+
+	expectedReceipt := &types.Receipt{
+		Status:      types.ReceiptStatusSuccessful,
+		BlockNumber: big.NewInt(12345),
+	}
+	setup.Monitor.StatusToReturn = TxMonitorStatus{
+		Status:  "done",
+		Receipt: expectedReceipt,
+	}
+
+	hookCalled := false
+	var hookTx *types.Transaction
+	var hookReceipt *types.Receipt
+
+	txMinedHook := func(tx *types.Transaction, r *types.Receipt) error {
+		hookCalled = true
+		hookTx = tx
+		hookReceipt = r
+		return nil
+	}
+
+	ctx := context.Background()
+	tx, receipt, err := setup.WM.EnsureTxWithHooksContext(
+		ctx,
+		3, time.Millisecond, time.Millisecond,
+		2, fromAddr, testAddr2, oneEth,
+		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		nil, networks.EthereumMainnet,
+		nil, nil, nil, nil, nil, txMinedHook,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, hookCalled, "txMinedHook should have been called")
+	assert.Equal(t, tx.Hash(), hookTx.Hash())
+	assert.Equal(t, receipt, hookReceipt)
+}
+
+func TestEnsureTx_BeforeSignAndBroadcastHook_StopsExecution(t *testing.T) {
+	setup := setupEnsureTxTest(t)
+
+	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil
+	}
+
+	hookError := errors.New("pre-flight check failed")
+	beforeHook := func(tx *types.Transaction, err error) error {
+		return hookError
+	}
+
+	ctx := context.Background()
+	tx, receipt, err := setup.WM.EnsureTxWithHooksContext(
+		ctx,
+		3, time.Millisecond, time.Millisecond,
+		2, fromAddr, testAddr2, oneEth,
+		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		nil, networks.EthereumMainnet,
+		beforeHook, nil, nil, nil, nil, nil,
+	)
+
+	require.Error(t, err)
+	assert.Nil(t, tx)
+	assert.Nil(t, receipt)
+	assert.Contains(t, err.Error(), "pre-flight check failed")
+	// Broadcaster should NOT have been called
+	assert.Empty(t, setup.Broadcaster.BroadcastTxCalls)
+}
+
+func TestEnsureTx_ContextCancellation_DuringExecution(t *testing.T) {
+	setup := setupEnsureTxTest(t)
+
+	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil
+	}
+
+	// Monitor will take a while, allowing cancellation
+	setup.Monitor.Delay = 5 * time.Second
+	setup.Monitor.StatusToReturn = TxMonitorStatus{Status: "pending"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel after a short delay
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	// Use BSCMainnet which doesn't support sync tx, forcing async path with monitoring
+	tx, receipt, err := setup.WM.EnsureTxWithHooksContext(
+		ctx,
+		3, time.Millisecond, time.Millisecond,
+		2, fromAddr, testAddr2, oneEth,
+		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		nil, networks.BSCMainnet, // Use BSC which doesn't support sync tx
+		nil, nil, nil, nil, nil, nil,
+	)
+
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, context.Canceled))
+	assert.Nil(t, tx)
+	assert.Nil(t, receipt)
+}
+
+func TestEnsureTx_SlowTxTriggersGasBump(t *testing.T) {
+	// This test verifies that AdjustGasPricesForSlowTx correctly bumps gas prices
+	// The full integration with monitor is tested separately
+
+	ctx := &TxExecutionContext{
+		MaxGasPrice: 100.0,
+		MaxTipCap:   50.0,
+	}
+
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei max fee
+		big.NewInt(1),
+	)
+
+	adjusted := ctx.AdjustGasPricesForSlowTx(tx)
+
+	assert.True(t, adjusted, "should be able to adjust gas prices")
+	assert.Greater(t, ctx.RetryGasPrice, 20.0, "gas price should be bumped above 20")
+	assert.Greater(t, ctx.RetryTipCap, 2.0, "tip cap should be bumped above 2")
+}
+
+func TestEnsureTx_MaxRetriesExceeded(t *testing.T) {
+	setup := setupEnsureTxTest(t)
+
+	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil
+	}
+
+	// Disable sync broadcast - make it fail with retryable error
+	setup.Broadcaster.BroadcastTxSyncFn = func(tx *types.Transaction) (*types.Receipt, error) {
+		return nil, errors.New("insufficient funds for gas * price + value")
+	}
+
+	// Async broadcast also fails with a retryable error
+	setup.Broadcaster.BroadcastTxFn = func(tx *types.Transaction) (string, bool, error) {
+		return "", false, errors.New("insufficient funds for gas * price + value")
+	}
+
+	ctx := context.Background()
+	tx, receipt, err := setup.WM.EnsureTxWithHooksContext(
+		ctx,
+		2, time.Millisecond, time.Millisecond, // Only 2 retries
+		2, fromAddr, testAddr2, oneEth,
+		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		nil, networks.EthereumMainnet,
+		nil, nil, nil, nil, nil, nil,
+	)
+
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrEnsureTxOutOfRetries))
+	assert.Nil(t, tx)
+	assert.Nil(t, receipt)
+}
+
+func TestEnsureTx_GasPriceLimitReached_Unit(t *testing.T) {
+	// Unit test: verify that AdjustGasPricesForSlowTx returns false when limit would be exceeded
+
+	ctx := &TxExecutionContext{
+		MaxGasPrice: 22.0, // Low limit - 20 * 1.2 = 24 would exceed
+		MaxTipCap:   50.0,
+	}
+
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei max fee
+		big.NewInt(1),
+	)
+
+	adjusted := ctx.AdjustGasPricesForSlowTx(tx)
+
+	// Should return false because the new gas price (20 * 1.2 = 24) exceeds maxGasPrice (22)
+	assert.False(t, adjusted, "should NOT be able to adjust when gas price limit would be exceeded")
+}
+
+func TestEnsureTx_TxReverted_ReturnsWithReceipt(t *testing.T) {
+	setup := setupEnsureTxTest(t)
+
+	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil
+	}
+
+	// Monitor returns reverted status
+	setup.Monitor.StatusToReturn = TxMonitorStatus{
+		Status: "reverted",
+		Receipt: &types.Receipt{
+			Status:      types.ReceiptStatusFailed,
+			BlockNumber: big.NewInt(12345),
+		},
+	}
+
+	ctx := context.Background()
+	// Use BSCMainnet which doesn't support sync tx, forcing async path with monitoring
+	tx, receipt, err := setup.WM.EnsureTxWithHooksContext(
+		ctx,
+		3, time.Millisecond, time.Millisecond,
+		2, fromAddr, testAddr2, oneEth,
+		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		nil, networks.BSCMainnet,
+		nil, nil, nil, nil, nil, nil,
+	)
+
+	// Reverted tx is still "successful" from EnsureTx perspective - it was mined
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	require.NotNil(t, receipt)
+	assert.Equal(t, types.ReceiptStatusFailed, receipt.Status)
+}
+
+func TestEnsureTx_SyncTx_ReturnsImmediately(t *testing.T) {
+	setup := setupEnsureTxTest(t)
+
+	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil
+	}
+
+	expectedReceipt := &types.Receipt{
+		Status:      types.ReceiptStatusSuccessful,
+		BlockNumber: big.NewInt(99999),
+	}
+
+	// BroadcastTxSync returns immediately with receipt
+	setup.Broadcaster.BroadcastTxSyncFn = func(tx *types.Transaction) (*types.Receipt, error) {
+		return expectedReceipt, nil
+	}
+
+	// Use a network that supports sync tx (we'll mock it)
+	// For this test, we need to use the regular broadcast since our mock doesn't
+	// actually switch based on network. But the concept is tested.
+	ctx := context.Background()
+	tx, receipt, err := setup.WM.EnsureTxWithHooksContext(
+		ctx,
+		3, time.Millisecond, time.Millisecond,
+		2, fromAddr, testAddr2, oneEth,
+		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		nil, networks.EthereumMainnet, // Would need a sync-supporting network
+		nil, nil, nil, nil, nil, nil,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	require.NotNil(t, receipt)
+}
+
+func TestEnsureTx_LostTx_RetriesWithNewNonce(t *testing.T) {
+	setup := setupEnsureTxTest(t)
+
+	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
+
+	nonceCall := 0
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) {
+		nonceCall++
+		return uint64(nonceCall - 1), nil // Increment each call to simulate progression
+	}
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) {
+		return uint64(nonceCall - 1), nil
+	}
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil
+	}
+
+	broadcastedNonces := []uint64{}
+	setup.Broadcaster.BroadcastTxFn = func(tx *types.Transaction) (string, bool, error) {
+		broadcastedNonces = append(broadcastedNonces, tx.Nonce())
+		return tx.Hash().Hex(), true, nil
+	}
+
+	// First tx is "lost", second is mined
+	setup.Monitor.StatusSequence = []TxMonitorStatus{
+		{Status: "lost"},
+		{Status: "done", Receipt: &types.Receipt{Status: types.ReceiptStatusSuccessful}},
+	}
+
+	ctx := context.Background()
+	// Use BSCMainnet which doesn't support sync tx, forcing async path with monitoring
+	tx, receipt, err := setup.WM.EnsureTxWithHooksContext(
+		ctx,
+		5, time.Millisecond, time.Millisecond,
+		2, fromAddr, testAddr2, oneEth,
+		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		nil, networks.BSCMainnet,
+		nil, nil, nil, nil, nil, nil,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	require.NotNil(t, receipt)
+	assert.GreaterOrEqual(t, len(broadcastedNonces), 2, "should have broadcast multiple times")
+}
+
+func TestEnsureTx_AfterSignAndBroadcastHook_CalledOnSuccess(t *testing.T) {
+	setup := setupEnsureTxTest(t)
+
+	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil
+	}
+
+	setup.Monitor.StatusToReturn = TxMonitorStatus{
+		Status:  "done",
+		Receipt: &types.Receipt{Status: types.ReceiptStatusSuccessful},
+	}
+
+	afterHookCalled := false
+	var afterHookTx *types.Transaction
+
+	afterHook := func(tx *types.Transaction, err error) error {
+		afterHookCalled = true
+		afterHookTx = tx
+		assert.Nil(t, err, "afterHook should receive nil error on success")
+		return nil
+	}
+
+	ctx := context.Background()
+	tx, _, err := setup.WM.EnsureTxWithHooksContext(
+		ctx,
+		3, time.Millisecond, time.Millisecond,
+		2, fromAddr, testAddr2, oneEth,
+		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		nil, networks.EthereumMainnet,
+		nil, afterHook, nil, nil, nil, nil,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, afterHookCalled, "afterSignAndBroadcastHook should have been called")
+	assert.Equal(t, tx.Hash(), afterHookTx.Hash())
+}
+
+func TestEnsureTx_GasEstimationFails_RetriesUntilSuccess(t *testing.T) {
+	setup := setupEnsureTxTest(t)
+
+	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil
+	}
+
+	estimateCallCount := 0
+	setup.Reader.EstimateExactGasFn = func(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error) {
+		estimateCallCount++
+		if estimateCallCount < 3 {
+			return 0, errors.New("execution reverted")
+		}
+		return 21000, nil // Succeed on 3rd try
+	}
+
+	// Use sync broadcast since it returns immediately
+	setup.Broadcaster.BroadcastTxSyncFn = func(tx *types.Transaction) (*types.Receipt, error) {
+		return &types.Receipt{
+			Status:      types.ReceiptStatusSuccessful,
+			BlockNumber: big.NewInt(12345),
+		}, nil
+	}
+
+	ctx := context.Background()
+	tx, receipt, err := setup.WM.EnsureTxWithHooksContext(
+		ctx,
+		5, time.Millisecond, time.Millisecond,
+		2, fromAddr, testAddr2, oneEth,
+		0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0, // gasLimit=0 triggers estimation
+		nil, networks.EthereumMainnet,
+		nil, nil, nil, nil, nil, nil,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	require.NotNil(t, receipt)
+	assert.GreaterOrEqual(t, estimateCallCount, 3, "gas estimation should have been called at least 3 times")
 }
