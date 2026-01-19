@@ -818,12 +818,29 @@ cd walletarmy
 # Install dependencies
 go mod download
 
+# Set up git hooks (runs tests and linter before each push)
+make setup
+
 # Run tests
 go test ./...
 
 # Build
 go build ./...
 ```
+
+### Available Make Commands
+
+```bash
+make setup    # Configure git hooks for pre-push checks
+make test     # Run all tests with race detection
+make lint     # Run golangci-lint
+make vet      # Run go vet
+make check    # Run all checks (vet, test, lint)
+make build    # Build all packages
+make clean    # Remove generated files
+```
+
+The pre-push hook will automatically run `go vet`, `go test -race`, and `golangci-lint` before allowing pushes. This ensures code quality is maintained.
 
 ### Code Style
 
