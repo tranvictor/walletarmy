@@ -725,14 +725,14 @@ func (wm *WalletManager) signAndBroadcastTransaction(tx *types.Transaction, exec
 	var successful bool
 
 	// Broadcast transaction
-	if execCtx.Network.IsSyncTxSupported() {
-		receipt, broadcastErr = wm.BroadcastTxSync(signedTx)
-		if receipt != nil {
-			successful = true
-		}
-	} else {
-		_, successful, broadcastErr = wm.BroadcastTx(signedTx)
-	}
+	// if execCtx.Network.IsSyncTxSupported() {
+	// 	receipt, broadcastErr = wm.BroadcastTxSync(signedTx)
+	// 	if receipt != nil {
+	// 		successful = true
+	// 	}
+	// } else {
+	_, successful, broadcastErr = wm.BroadcastTx(signedTx)
+	// }
 
 	if signedTx != nil {
 		execCtx.OldTxs[signedTx.Hash().Hex()] = signedTx
