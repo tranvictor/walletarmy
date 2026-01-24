@@ -34,10 +34,30 @@ type EthReader interface {
 	TxInfoFromHash(hash string) (TxInfo, error)
 }
 
+// TxInfoStatus represents the status of a transaction in the monitoring/execution flow.
+type TxInfoStatus string
+
+const (
+	// TxStatusMined indicates the transaction was mined successfully
+	TxStatusMined TxInfoStatus = "mined"
+	// TxStatusReverted indicates the transaction was mined but execution reverted
+	TxStatusReverted TxInfoStatus = "reverted"
+	// TxStatusLost indicates the transaction was dropped from the mempool
+	TxStatusLost TxInfoStatus = "lost"
+	// TxStatusSlow indicates the transaction is taking too long to be mined
+	TxStatusSlow TxInfoStatus = "slow"
+	// TxStatusCancelled indicates the monitoring was cancelled via context
+	TxStatusCancelled TxInfoStatus = "cancelled"
+	// TxStatusPending indicates the transaction is still pending
+	TxStatusPending TxInfoStatus = "pending"
+	// TxStatusDone is the raw status from jarvis monitor indicating success
+	TxStatusDone TxInfoStatus = "done"
+)
+
 // TxInfo represents transaction information returned by the reader.
 // This mirrors the essential fields from jarviscommon.TxInfo.
 type TxInfo struct {
-	Status  string
+	Status  TxInfoStatus
 	Receipt *types.Receipt
 }
 

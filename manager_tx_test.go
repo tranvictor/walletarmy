@@ -264,7 +264,7 @@ func TestMonitorTxContext_ReturnsMined(t *testing.T) {
 	statusChan := setup.WM.MonitorTxContext(ctx, tx, networks.EthereumMainnet, time.Second)
 
 	status := <-statusChan
-	assert.Equal(t, "mined", status.Status)
+	assert.Equal(t, TxStatusMined, status.Status)
 	assert.Equal(t, receipt, status.Receipt)
 }
 
@@ -283,15 +283,16 @@ func TestMonitorTxContext_ReturnsReverted(t *testing.T) {
 	statusChan := setup.WM.MonitorTxContext(ctx, tx, networks.EthereumMainnet, time.Second)
 
 	status := <-statusChan
-	assert.Equal(t, "reverted", status.Status)
+	assert.Equal(t, TxStatusReverted, status.Status)
 	assert.Equal(t, receipt, status.Receipt)
 }
 
 func TestMonitorTxContext_ReturnsCancelledOnContextCancel(t *testing.T) {
 	setup := newTestSetup(t)
 
-	// Set a delay so we can cancel before status is returned
-	setup.Monitor.Delay = 5 * time.Second
+	// Set a shorter slow timeout and delay so test runs faster
+	setup.WM.SetDefaults(ManagerDefaults{SlowTxTimeout: 100 * time.Millisecond})
+	setup.Monitor.Delay = 200 * time.Millisecond // Longer than slow timeout to allow cancel
 
 	tx := newTestTx(0, testAddr2, oneEth)
 
@@ -303,7 +304,7 @@ func TestMonitorTxContext_ReturnsCancelledOnContextCancel(t *testing.T) {
 	cancel()
 
 	status := <-statusChan
-	assert.Equal(t, "cancelled", status.Status)
+	assert.Equal(t, TxStatusCancelled, status.Status)
 	assert.Nil(t, status.Receipt)
 }
 
@@ -326,11 +327,11 @@ func TestTxExecutionContext_AdjustGasPricesForSlowTx_Success(t *testing.T) {
 	adjusted := ctx.AdjustGasPricesForSlowTx(tx)
 
 	assert.True(t, adjusted)
-	// Gas price should be increased by GasPriceIncreasePercent (1.2)
-	expectedGasPrice := 20.0 * GasPriceIncreasePercent
+	// Gas price should be increased by DefaultGasPriceIncreasePercent (1.2)
+	expectedGasPrice := 20.0 * DefaultGasPriceIncreasePercent
 	assert.InDelta(t, expectedGasPrice, ctx.RetryGasPrice, 0.001)
-	// Tip cap should be increased by TipCapIncreasePercent (1.1)
-	expectedTipCap := 2.0 * TipCapIncreasePercent
+	// Tip cap should be increased by DefaultTipCapIncreasePercent (1.1)
+	expectedTipCap := 2.0 * DefaultTipCapIncreasePercent
 	assert.InDelta(t, expectedTipCap, ctx.RetryTipCap, 0.001)
 	// Nonce should be preserved
 	assert.Equal(t, big.NewInt(5), ctx.RetryNonce)
@@ -630,7 +631,7 @@ func TestHandleTransactionStatus_Mined(t *testing.T) {
 
 	execCtx := &TxExecutionContext{}
 
-	result := setup.WM.handleTransactionStatus(TxStatus{Status: "mined", Receipt: receipt}, tx, execCtx)
+	result := setup.WM.handleTransactionStatus(TxInfo{Status: "mined", Receipt: receipt}, tx, execCtx)
 
 	assert.True(t, result.ShouldReturn)
 	assert.False(t, result.ShouldRetry)
@@ -647,7 +648,7 @@ func TestHandleTransactionStatus_Reverted(t *testing.T) {
 
 	execCtx := &TxExecutionContext{}
 
-	result := setup.WM.handleTransactionStatus(TxStatus{Status: "reverted", Receipt: receipt}, tx, execCtx)
+	result := setup.WM.handleTransactionStatus(TxInfo{Status: "reverted", Receipt: receipt}, tx, execCtx)
 
 	assert.True(t, result.ShouldReturn)
 	assert.False(t, result.ShouldRetry)
@@ -666,7 +667,7 @@ func TestHandleTransactionStatus_Lost_Retries(t *testing.T) {
 		ActualRetryCount: 0,
 	}
 
-	result := setup.WM.handleTransactionStatus(TxStatus{Status: "lost"}, tx, execCtx)
+	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
 
 	assert.False(t, result.ShouldReturn)
 	assert.True(t, result.ShouldRetry)
@@ -688,7 +689,7 @@ func TestHandleTransactionStatus_Slow_BumpsGas(t *testing.T) {
 		MaxTipCap:   50.0,
 	}
 
-	result := setup.WM.handleTransactionStatus(TxStatus{Status: "slow"}, tx, execCtx)
+	result := setup.WM.handleTransactionStatus(TxInfo{Status: "slow"}, tx, execCtx)
 
 	assert.False(t, result.ShouldReturn)
 	assert.True(t, result.ShouldRetry)
@@ -710,7 +711,7 @@ func TestHandleTransactionStatus_Slow_HitsLimit(t *testing.T) {
 		MaxTipCap:   50.0,
 	}
 
-	result := setup.WM.handleTransactionStatus(TxStatus{Status: "slow"}, tx, execCtx)
+	result := setup.WM.handleTransactionStatus(TxInfo{Status: "slow"}, tx, execCtx)
 
 	assert.True(t, result.ShouldReturn)
 	assert.False(t, result.ShouldRetry)
@@ -916,7 +917,7 @@ func TestHandleTransactionStatus_TxMinedHook_Called(t *testing.T) {
 		},
 	}
 
-	result := setup.WM.handleTransactionStatus(TxStatus{Status: "mined", Receipt: receipt}, tx, execCtx)
+	result := setup.WM.handleTransactionStatus(TxInfo{Status: "mined", Receipt: receipt}, tx, execCtx)
 
 	assert.True(t, hookCalled)
 	assert.Equal(t, tx, receivedTx)
@@ -939,7 +940,7 @@ func TestHandleTransactionStatus_TxMinedHook_ReturnsError(t *testing.T) {
 		},
 	}
 
-	result := setup.WM.handleTransactionStatus(TxStatus{Status: "mined", Receipt: receipt}, tx, execCtx)
+	result := setup.WM.handleTransactionStatus(TxInfo{Status: "mined", Receipt: receipt}, tx, execCtx)
 
 	assert.True(t, result.ShouldReturn)
 	assert.Error(t, result.Error)
@@ -1772,7 +1773,11 @@ func TestEnsureTx_ContextCancellation_DuringExecution(t *testing.T) {
 	}
 
 	// Monitor will take a while, allowing cancellation
-	setup.Monitor.Delay = 5 * time.Second
+	// Use shorter slow timeout for faster test
+	defaults := setup.WM.Defaults()
+	defaults.SlowTxTimeout = 100 * time.Millisecond
+	setup.WM.SetDefaults(defaults)
+	setup.Monitor.Delay = 200 * time.Millisecond
 	setup.Monitor.StatusToReturn = TxMonitorStatus{Status: "pending"}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2735,7 +2740,7 @@ func TestSyncBroadcast_Timeout_TriggersMonitorFlow(t *testing.T) {
 	status := <-statusChan
 
 	// Monitor should return "mined" (since mock returns "done" which gets converted to "mined")
-	assert.Equal(t, "mined", status.Status, "Monitor should return mined status")
+	assert.Equal(t, TxStatusMined, status.Status, "Monitor should return mined status")
 
 	// Verify that:
 	// 1. The sync broadcast was called

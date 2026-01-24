@@ -77,9 +77,9 @@ type Manager interface {
 
 	// Transaction Monitoring
 	// MonitorTx is deprecated, use MonitorTxContext instead for better cancellation support.
-	MonitorTx(tx *types.Transaction, network networks.Network, txCheckInterval time.Duration) <-chan TxStatus
+	MonitorTx(tx *types.Transaction, network networks.Network, txCheckInterval time.Duration) <-chan TxInfo
 	// MonitorTxContext is a context-aware version of MonitorTx that supports cancellation.
-	MonitorTxContext(ctx context.Context, tx *types.Transaction, network networks.Network, txCheckInterval time.Duration) <-chan TxStatus
+	MonitorTxContext(ctx context.Context, tx *types.Transaction, network networks.Network, txCheckInterval time.Duration) <-chan TxInfo
 
 	// High-Level Transaction Execution
 	EnsureTx(

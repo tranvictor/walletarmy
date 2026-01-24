@@ -23,6 +23,7 @@ type TxExecutionContext struct {
 	NumRetries      int
 	SleepDuration   time.Duration
 	TxCheckInterval time.Duration
+	SlowTxTimeout   time.Duration // Time before considering a tx "slow" during monitoring
 
 	// Transaction parameters
 	TxType        uint8
@@ -42,6 +43,10 @@ type TxExecutionContext struct {
 	// Gas price protection limits (caller-defined)
 	MaxGasPrice float64
 	MaxTipCap   float64
+
+	// Gas bumping configuration (for slow tx retry)
+	GasPriceIncreasePercent float64 // Multiplier for gas price when tx is slow (e.g., 1.2 = 20% increase)
+	TipCapIncreasePercent   float64 // Multiplier for tip cap when tx is slow (e.g., 1.1 = 10% increase)
 
 	// Transaction state
 	OldTxs     map[string]*types.Transaction
@@ -121,6 +126,7 @@ func NewTxExecutionContext(
 		NumRetries:                 numRetries,
 		SleepDuration:              sleepDuration,
 		TxCheckInterval:            txCheckInterval,
+		SlowTxTimeout:              DefaultSlowTxTimeout,
 		TxType:                     txType,
 		From:                       from,
 		To:                         to,
@@ -133,6 +139,8 @@ func NewTxExecutionContext(
 		ExtraTipCapGwei:            extraTipCapGwei,
 		MaxGasPrice:                maxGasPrice,
 		MaxTipCap:                  maxTipCap,
+		GasPriceIncreasePercent:    DefaultGasPriceIncreasePercent,
+		TipCapIncreasePercent:      DefaultTipCapIncreasePercent,
 		Data:                       data,
 		Network:                    network,
 		OldTxs:                     make(map[string]*types.Transaction),
@@ -153,9 +161,19 @@ func (ctx *TxExecutionContext) AdjustGasPricesForSlowTx(tx *types.Transaction) b
 		return false
 	}
 
+	// Use configured percentages, fall back to defaults if not set
+	gasPriceIncrease := ctx.GasPriceIncreasePercent
+	if gasPriceIncrease == 0 {
+		gasPriceIncrease = DefaultGasPriceIncreasePercent
+	}
+	tipCapIncrease := ctx.TipCapIncreasePercent
+	if tipCapIncrease == 0 {
+		tipCapIncrease = DefaultTipCapIncreasePercent
+	}
+
 	// Increase gas price by configured percentage
 	currentGasPrice := jarviscommon.BigToFloat(tx.GasPrice(), 9)
-	newGasPrice := currentGasPrice * GasPriceIncreasePercent
+	newGasPrice := currentGasPrice * gasPriceIncrease
 
 	// Check if new gas price would exceed the caller-defined maximum
 	if ctx.MaxGasPrice > 0 && newGasPrice > ctx.MaxGasPrice {
@@ -167,7 +185,7 @@ func (ctx *TxExecutionContext) AdjustGasPricesForSlowTx(tx *types.Transaction) b
 
 	// Increase tip cap by configured percentage
 	currentTipCap := jarviscommon.BigToFloat(tx.GasTipCap(), 9)
-	newTipCap := currentTipCap * TipCapIncreasePercent
+	newTipCap := currentTipCap * tipCapIncrease
 
 	// Check if new tip cap would exceed the caller-defined maximum
 	if ctx.MaxTipCap > 0 && newTipCap > ctx.MaxTipCap {

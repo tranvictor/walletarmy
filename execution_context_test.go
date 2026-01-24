@@ -41,8 +41,8 @@ func TestTxExecutionContext_AdjustGasPricesForSlowTx(t *testing.T) {
 		t.Error("AdjustGasPricesForSlowTx should return true for successful adjustment")
 	}
 
-	expectedGasPrice := 100.0 * GasPriceIncreasePercent // (100 * 1.2) = 120
-	expectedTipCap := 50.0 * TipCapIncreasePercent      // (50 * 1.1) = 55
+	expectedGasPrice := 100.0 * DefaultGasPriceIncreasePercent // (100 * 1.2) = 120
+	expectedTipCap := 50.0 * DefaultTipCapIncreasePercent      // (50 * 1.1) = 55
 
 	const epsilon = 0.0001
 	if diff := ctx.RetryGasPrice - expectedGasPrice; diff < -epsilon || diff > epsilon {

@@ -12,18 +12,13 @@ const (
 	DefaultNumRetries      = 9
 	DefaultSleepDuration   = 5 * time.Second
 	DefaultTxCheckInterval = 5 * time.Second
+	DefaultSlowTxTimeout   = 5 * time.Second // Time before considering a tx "slow"
 
-	// Gas adjustment constants
-	GasPriceIncreasePercent = 1.2 // 20% increase
-	TipCapIncreasePercent   = 1.1 // 10% increase
-	MaxCapMultiplier        = 5.0 // Multiplier for default max gas price/tip cap when not set
+	// Default gas adjustment values (can be overridden via ManagerDefaults)
+	DefaultGasPriceIncreasePercent = 1.2 // 20% increase when tx is slow
+	DefaultTipCapIncreasePercent   = 1.1 // 10% increase when tx is slow
+	MaxCapMultiplier               = 5.0 // Multiplier for default max gas price/tip cap when not set
 )
-
-// TxStatus represents the status of a monitored transaction
-type TxStatus struct {
-	Status  string
-	Receipt *types.Receipt
-}
 
 // TxExecutionResult represents the outcome of a transaction execution step
 type TxExecutionResult struct {
@@ -40,6 +35,7 @@ type ManagerDefaults struct {
 	NumRetries      int
 	SleepDuration   time.Duration
 	TxCheckInterval time.Duration
+	SlowTxTimeout   time.Duration // Time before considering a tx "slow" during monitoring
 
 	// Gas configuration
 	ExtraGasLimit   uint64
@@ -47,6 +43,10 @@ type ManagerDefaults struct {
 	ExtraTipCapGwei float64
 	MaxGasPrice     float64
 	MaxTipCap       float64
+
+	// Gas bumping configuration (for slow tx retry)
+	GasPriceIncreasePercent float64 // Multiplier for gas price when tx is slow (e.g., 1.2 = 20% increase)
+	TipCapIncreasePercent   float64 // Multiplier for tip cap when tx is slow (e.g., 1.1 = 10% increase)
 
 	// Default network (if not specified in request)
 	Network networks.Network

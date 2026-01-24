@@ -94,6 +94,29 @@ func WithDefaultTxType(txType uint8) WalletManagerOption {
 	}
 }
 
+// WithDefaultSlowTxTimeout sets the timeout before considering a transaction "slow"
+func WithDefaultSlowTxTimeout(timeout time.Duration) WalletManagerOption {
+	return func(wm *WalletManager) {
+		wm.defaults.SlowTxTimeout = timeout
+	}
+}
+
+// WithDefaultGasPriceIncreasePercent sets the gas price multiplier when tx is slow
+// For example, 1.2 means 20% increase
+func WithDefaultGasPriceIncreasePercent(percent float64) WalletManagerOption {
+	return func(wm *WalletManager) {
+		wm.defaults.GasPriceIncreasePercent = percent
+	}
+}
+
+// WithDefaultTipCapIncreasePercent sets the tip cap multiplier when tx is slow
+// For example, 1.1 means 10% increase
+func WithDefaultTipCapIncreasePercent(percent float64) WalletManagerOption {
+	return func(wm *WalletManager) {
+		wm.defaults.TipCapIncreasePercent = percent
+	}
+}
+
 // WithDefaults sets all default configuration at once
 func WithDefaults(defaults ManagerDefaults) WalletManagerOption {
 	return func(wm *WalletManager) {

@@ -197,47 +197,54 @@ func (wm *WalletManager) createErrorDecoder(abis []abi.ABI) *ErrorDecoder {
 //  3. other strings if the tx failed and the reason is returned by the node or other debugging error message that the node can return
 //
 // Deprecated: Use MonitorTxContext instead for better cancellation support.
-func (wm *WalletManager) MonitorTx(tx *types.Transaction, network networks.Network, txCheckInterval time.Duration) <-chan TxStatus {
+func (wm *WalletManager) MonitorTx(tx *types.Transaction, network networks.Network, txCheckInterval time.Duration) <-chan TxInfo {
 	return wm.MonitorTxContext(context.Background(), tx, network, txCheckInterval)
 }
 
 // MonitorTxContext is a context-aware version of MonitorTx that supports cancellation.
 // When the context is cancelled, the monitoring goroutine will exit and close the channel.
-func (wm *WalletManager) MonitorTxContext(ctx context.Context, tx *types.Transaction, network networks.Network, txCheckInterval time.Duration) <-chan TxStatus {
+func (wm *WalletManager) MonitorTxContext(ctx context.Context, tx *types.Transaction, network networks.Network, txCheckInterval time.Duration) <-chan TxInfo {
 	txMonitor := wm.getTxMonitor(network)
-	statusChan := make(chan TxStatus, 1) // Buffered to avoid goroutine leak on context cancellation
+	statusChan := make(chan TxInfo, 1) // Buffered to avoid goroutine leak on context cancellation
 	monitorChan := txMonitor.MakeWaitChannelWithInterval(tx.Hash().Hex(), txCheckInterval)
+
+	// Get slow timeout from defaults, fall back to constant if not set
+	slowTimeout := wm.Defaults().SlowTxTimeout
+	if slowTimeout <= 0 {
+		slowTimeout = DefaultSlowTxTimeout
+	}
+
 	go func() {
 		defer close(statusChan)
 		select {
 		case <-ctx.Done():
-			statusChan <- TxStatus{
-				Status:  "cancelled",
+			statusChan <- TxInfo{
+				Status:  TxStatusCancelled,
 				Receipt: nil,
 			}
 		case status := <-monitorChan:
 			switch status.Status {
 			case "done":
-				statusChan <- TxStatus{
-					Status:  "mined",
+				statusChan <- TxInfo{
+					Status:  TxStatusMined,
 					Receipt: status.Receipt,
 				}
 			case "reverted":
-				statusChan <- TxStatus{
-					Status:  "reverted",
+				statusChan <- TxInfo{
+					Status:  TxStatusReverted,
 					Receipt: status.Receipt,
 				}
 			case "lost":
-				statusChan <- TxStatus{
-					Status:  "lost",
+				statusChan <- TxInfo{
+					Status:  TxStatusLost,
 					Receipt: nil,
 				}
 			default:
 				// ignore other statuses
 			}
-		case <-time.After(5 * time.Second):
-			statusChan <- TxStatus{
-				Status:  "slow",
+		case <-time.After(slowTimeout):
+			statusChan <- TxInfo{
+				Status:  TxStatusSlow,
 				Receipt: nil,
 			}
 		}
@@ -372,6 +379,18 @@ func (wm *WalletManager) EnsureTxWithHooksContext(
 		return nil, nil, err
 	}
 
+	// Apply manager defaults for gas bumping configuration
+	defaults := wm.Defaults()
+	if defaults.SlowTxTimeout > 0 {
+		execCtx.SlowTxTimeout = defaults.SlowTxTimeout
+	}
+	if defaults.GasPriceIncreasePercent > 0 {
+		execCtx.GasPriceIncreasePercent = defaults.GasPriceIncreasePercent
+	}
+	if defaults.TipCapIncreasePercent > 0 {
+		execCtx.TipCapIncreasePercent = defaults.TipCapIncreasePercent
+	}
+
 	// Create error decoder
 	errDecoder := wm.createErrorDecoder(execCtx.ABIs)
 
@@ -449,7 +468,7 @@ func (wm *WalletManager) executeTransactionLoop(
 
 			// Wait for status from the context-aware monitor
 			status := <-statusChan
-			if status.Status == "cancelled" {
+			if status.Status == TxStatusCancelled {
 				err = ctx.Err()
 				return nil, nil, err
 			}
@@ -618,7 +637,7 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 		} else {
 			// Check for completed transactions
 			for txhash, status := range statuses {
-				if status.Status == "done" || status.Status == "reverted" {
+				if status.Status == TxStatusDone || status.Status == TxStatusReverted {
 					if tx, exists := execCtx.OldTxs[txhash]; exists && tx != nil {
 						return wm.handleMinedTx(tx, status, execCtx)
 					}
@@ -629,7 +648,7 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 			highestGasPrice := big.NewInt(0)
 			var bestTx *types.Transaction
 			for txhash, status := range statuses {
-				if status.Status == "pending" {
+				if status.Status == TxStatusPending {
 					if tx, exists := execCtx.OldTxs[txhash]; exists && tx != nil {
 						if tx.GasPrice().Cmp(highestGasPrice) > 0 {
 							highestGasPrice = tx.GasPrice()
@@ -943,7 +962,7 @@ func (wm *WalletManager) handleNonceIsLowError(tx *types.Transaction, execCtx *T
 
 	// Check if any old transaction is completed
 	for txhash, status := range statuses {
-		if status.Status == "done" || status.Status == "reverted" {
+		if status.Status == TxStatusDone || status.Status == TxStatusReverted {
 			if tx, exists := execCtx.OldTxs[txhash]; exists && tx != nil {
 				return wm.handleMinedTx(tx, status, execCtx)
 			}
@@ -978,9 +997,9 @@ func (wm *WalletManager) handleMinedTx(tx *types.Transaction, txInfo TxInfo, exe
 		} else {
 			wm.persistTxMined(tx.Hash(), PendingTxStatusReverted, txInfo.Receipt)
 		}
-	case "done", "mined":
+	case TxStatusDone, TxStatusMined:
 		wm.persistTxMined(tx.Hash(), PendingTxStatusMined, txInfo.Receipt)
-	case "reverted":
+	case TxStatusReverted:
 		wm.persistTxMined(tx.Hash(), PendingTxStatusReverted, txInfo.Receipt)
 	}
 
@@ -1005,12 +1024,12 @@ func (wm *WalletManager) handleMinedTx(tx *types.Transaction, txInfo TxInfo, exe
 }
 
 // handleTransactionStatus processes different transaction statuses
-func (wm *WalletManager) handleTransactionStatus(status TxStatus, signedTx *types.Transaction, execCtx *TxExecutionContext) *TxExecutionResult {
+func (wm *WalletManager) handleTransactionStatus(status TxInfo, signedTx *types.Transaction, execCtx *TxExecutionContext) *TxExecutionResult {
 	switch status.Status {
-	case "mined", "reverted":
-		return wm.handleMinedTx(signedTx, TxInfo{Status: status.Status, Receipt: status.Receipt}, execCtx)
+	case TxStatusMined, TxStatusReverted:
+		return wm.handleMinedTx(signedTx, status, execCtx)
 
-	case "lost":
+	case TxStatusLost:
 		logger.WithFields(logger.Fields{
 			"tx_hash": signedTx.Hash().Hex(),
 		}).Info("Transaction lost, retrying...")
@@ -1034,13 +1053,21 @@ func (wm *WalletManager) handleTransactionStatus(status TxStatus, signedTx *type
 			Error:        nil,
 		}
 
-	case "slow":
+	case TxStatusSlow:
 		// Try to adjust gas prices for slow transaction
 		if execCtx.AdjustGasPricesForSlowTx(signedTx) {
+			gasPriceIncrease := execCtx.GasPriceIncreasePercent
+			if gasPriceIncrease == 0 {
+				gasPriceIncrease = DefaultGasPriceIncreasePercent
+			}
+			tipCapIncrease := execCtx.TipCapIncreasePercent
+			if tipCapIncrease == 0 {
+				tipCapIncrease = DefaultTipCapIncreasePercent
+			}
 			logger.WithFields(logger.Fields{
 				"tx_hash": signedTx.Hash().Hex(),
 			}).Info(fmt.Sprintf("Transaction slow, continuing to monitor with increased gas price by %.0f%% and tip cap by %.0f%%...",
-				(GasPriceIncreasePercent-1)*100, (TipCapIncreasePercent-1)*100))
+				(gasPriceIncrease-1)*100, (tipCapIncrease-1)*100))
 
 			// Continue retrying with adjusted gas prices
 			return &TxExecutionResult{

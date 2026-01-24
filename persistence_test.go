@@ -1412,11 +1412,11 @@ func TestRecoveryFlow_FullIntegration_SlowTx_GasBump_Replacement(t *testing.T) {
 	}
 
 	// Create mock monitor that triggers the "slow" timeout path, then returns "done"
-	// Important: MonitorTxContext has a 5 second hardcoded timeout that returns "slow".
-	// The monitor must NOT respond within 5 seconds to trigger the "slow" path.
+	// The SlowTxTimeout is set to 100ms on the WalletManager below.
+	// The monitor delay must be longer than that to trigger the "slow" path.
 	// For the second call (after gas bump), we want it to return "done" immediately.
 	mockMonitor := &mockTxMonitor{
-		Delay: 6 * time.Second, // Longer than the 5 second timeout - triggers "slow" on first call
+		Delay: 200 * time.Millisecond, // Longer than the 100ms slow timeout - triggers "slow" on first call
 	}
 	mockMonitor.StatusSequence = []TxMonitorStatus{
 		{Status: "pending"}, // First call - ignored due to timeout, "slow" path fires
@@ -1455,9 +1455,11 @@ func TestRecoveryFlow_FullIntegration_SlowTx_GasBump_Replacement(t *testing.T) {
 
 	// Create the "recovered" WalletManager with same persistence stores
 	// Use WithNetworkResolver to return our mock network for the test chain ID
+	// Use short SlowTxTimeout so test runs faster
 	wm := NewWalletManager(
 		WithNonceStore(nonceStore),
 		WithTxStore(txStore),
+		WithDefaultSlowTxTimeout(100*time.Millisecond), // Short timeout for fast test
 		WithNetworkResolver(func(chainID uint64) (networks.Network, error) {
 			if chainID == testChainID {
 				return mockNetwork, nil
@@ -1530,15 +1532,15 @@ func TestRecoveryFlow_FullIntegration_SlowTx_GasBump_Replacement(t *testing.T) {
 	// Step 4: Wait for async recovery to complete
 	// ========================================
 	// Recovery launches goroutines, so we need to wait for them
-	// Note: First monitor call will timeout after 5 seconds (triggering "slow"),
+	// Note: First monitor call will timeout after 100ms (triggering "slow"),
 	// then gas bump happens, then second call returns immediately.
-	// Total expected time: ~6 seconds
+	// Total expected time: ~200ms
 	require.Eventually(t, func() bool {
 		hookMu.Lock()
 		defer hookMu.Unlock()
 		// Wait until OnTxMined is called (recovery complete) OR OnTxDropped
 		return len(minedTxs) > 0 || len(droppedTxs) > 0
-	}, 20*time.Second, 100*time.Millisecond, "OnTxMined or OnTxDropped should be called after recovery")
+	}, 5*time.Second, 50*time.Millisecond, "OnTxMined or OnTxDropped should be called after recovery")
 
 	// Check if any txs were dropped (indicates an error in resume process)
 	hookMu.Lock()

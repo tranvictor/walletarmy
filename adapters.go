@@ -47,7 +47,7 @@ func (r *readerAdapter) TxInfoFromHash(hash string) (TxInfo, error) {
 		return TxInfo{}, err
 	}
 	return TxInfo{
-		Status:  info.Status,
+		Status:  TxInfoStatus(info.Status),
 		Receipt: info.Receipt,
 	}, nil
 }

@@ -161,19 +161,19 @@ func (rh *RecoveryHandler) processPendingTransactions(ctx context.Context, opts 
 		}
 
 		switch txInfo.Status {
-		case "done":
+		case TxStatusDone:
 			result.MinedTxs++
 			_ = rh.txStore.UpdateStatus(ctx, ptx.Hash, PendingTxStatusMined, txInfo.Receipt)
 			if opts.OnTxMined != nil {
 				opts.OnTxMined(ptx, txInfo.Receipt)
 			}
-		case "reverted":
+		case TxStatusReverted:
 			result.MinedTxs++
 			_ = rh.txStore.UpdateStatus(ctx, ptx.Hash, PendingTxStatusReverted, txInfo.Receipt)
 			if opts.OnTxMined != nil {
 				opts.OnTxMined(ptx, txInfo.Receipt)
 			}
-		case "pending":
+		case TxStatusPending:
 			result.RecoveredTxs++
 			if opts.OnTxRecovered != nil {
 				opts.OnTxRecovered(ptx)
