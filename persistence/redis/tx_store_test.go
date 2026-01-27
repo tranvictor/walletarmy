@@ -2,7 +2,9 @@ package redis
 
 import (
 	"context"
+	"fmt"
 	"math/big"
+	"sync"
 	"testing"
 	"time"
 
@@ -408,4 +410,248 @@ func TestTxStore_WithKeyPrefix(t *testing.T) {
 	retrieved, err = store2.Get(ctx, tx.Hash)
 	require.NoError(t, err)
 	assert.Nil(t, retrieved)
+}
+
+// Concurrency Tests - verify thread safety
+
+func TestTxStore_ConcurrentSave(t *testing.T) {
+	client := testRedisClient(t)
+	defer client.Close()
+
+	store := NewTxStore(client)
+	ctx := context.Background()
+
+	const numGoroutines = 20
+	var wg sync.WaitGroup
+	errors := make(chan error, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+
+			wallet := common.HexToAddress(fmt.Sprintf("0x%040x", idx))
+			tx := &walletarmy.PendingTx{
+				Hash:      common.HexToHash(fmt.Sprintf("0x%064x", idx)),
+				Wallet:    wallet,
+				ChainID:   1,
+				Nonce:     uint64(idx),
+				Status:    walletarmy.PendingTxStatusBroadcasted,
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+			}
+
+			if err := store.Save(ctx, tx); err != nil {
+				errors <- fmt.Errorf("goroutine %d save failed: %w", idx, err)
+				return
+			}
+
+			// Verify we can read it back
+			retrieved, err := store.Get(ctx, tx.Hash)
+			if err != nil {
+				errors <- fmt.Errorf("goroutine %d get failed: %w", idx, err)
+				return
+			}
+			if retrieved == nil {
+				errors <- fmt.Errorf("goroutine %d: saved tx not found", idx)
+				return
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		t.Error(err)
+	}
+
+	// Verify all transactions exist
+	for i := 0; i < numGoroutines; i++ {
+		hash := common.HexToHash(fmt.Sprintf("0x%064x", i))
+		tx, err := store.Get(ctx, hash)
+		require.NoError(t, err, "failed to get tx %d", i)
+		assert.NotNil(t, tx, "tx %d not found", i)
+	}
+}
+
+func TestTxStore_ConcurrentUpdateStatus(t *testing.T) {
+	client := testRedisClient(t)
+	defer client.Close()
+
+	store := NewTxStore(client)
+	ctx := context.Background()
+
+	// Create a transaction
+	wallet := common.HexToAddress("0x1234567890123456789012345678901234567890")
+	tx := &walletarmy.PendingTx{
+		Hash:      common.HexToHash("0x1111111111111111111111111111111111111111111111111111111111111111"),
+		Wallet:    wallet,
+		ChainID:   1,
+		Nonce:     1,
+		Status:    walletarmy.PendingTxStatusPending,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	require.NoError(t, store.Save(ctx, tx))
+
+	// Concurrently update status from multiple goroutines
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	errors := make(chan error, numGoroutines)
+
+	statuses := []walletarmy.PendingTxStatus{
+		walletarmy.PendingTxStatusPending,
+		walletarmy.PendingTxStatusBroadcasted,
+		walletarmy.PendingTxStatusMined,
+	}
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			status := statuses[idx%len(statuses)]
+			if err := store.UpdateStatus(ctx, tx.Hash, status, nil); err != nil {
+				errors <- fmt.Errorf("goroutine %d update failed: %w", idx, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		t.Error(err)
+	}
+
+	// Verify transaction still exists and has a valid status
+	retrieved, err := store.Get(ctx, tx.Hash)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Contains(t, statuses, retrieved.Status)
+}
+
+func TestTxStore_ConcurrentSaveAndDelete(t *testing.T) {
+	client := testRedisClient(t)
+	defer client.Close()
+
+	store := NewTxStore(client)
+	ctx := context.Background()
+
+	const numTxs = 50
+	var wg sync.WaitGroup
+	errors := make(chan error, numTxs*2)
+
+	// First, create all transactions
+	wallet := common.HexToAddress("0x1234567890123456789012345678901234567890")
+	for i := 0; i < numTxs; i++ {
+		tx := &walletarmy.PendingTx{
+			Hash:      common.HexToHash(fmt.Sprintf("0x%064x", i)),
+			Wallet:    wallet,
+			ChainID:   1,
+			Nonce:     uint64(i),
+			Status:    walletarmy.PendingTxStatusBroadcasted,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		require.NoError(t, store.Save(ctx, tx))
+	}
+
+	// Concurrently: half goroutines update transactions, half delete them
+	for i := 0; i < numTxs; i++ {
+		wg.Add(2)
+
+		// Updater goroutine
+		go func(idx int) {
+			defer wg.Done()
+			hash := common.HexToHash(fmt.Sprintf("0x%064x", idx))
+			err := store.UpdateStatus(ctx, hash, walletarmy.PendingTxStatusMined, nil)
+			// Ignore "not found" errors from race with delete
+			if err != nil && err.Error() != "failed to update transaction status after 3 retries: redis: transaction failed" {
+				// Only report non-race errors
+				errors <- fmt.Errorf("update %d: %w", idx, err)
+			}
+		}(i)
+
+		// Deleter goroutine
+		go func(idx int) {
+			defer wg.Done()
+			hash := common.HexToHash(fmt.Sprintf("0x%064x", idx))
+			if err := store.Delete(ctx, hash); err != nil {
+				errors <- fmt.Errorf("delete %d: %w", idx, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		t.Error(err)
+	}
+
+	// All transactions should be deleted
+	for i := 0; i < numTxs; i++ {
+		hash := common.HexToHash(fmt.Sprintf("0x%064x", i))
+		tx, err := store.Get(ctx, hash)
+		require.NoError(t, err)
+		assert.Nil(t, tx, "tx %d should be deleted", i)
+	}
+}
+
+func TestTxStore_ConcurrentListPending(t *testing.T) {
+	client := testRedisClient(t)
+	defer client.Close()
+
+	store := NewTxStore(client)
+	ctx := context.Background()
+
+	wallet := common.HexToAddress("0x1234567890123456789012345678901234567890")
+
+	const numGoroutines = 20
+	var wg sync.WaitGroup
+	errors := make(chan error, numGoroutines*2)
+
+	// Half goroutines write, half goroutines read
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(2)
+
+		// Writer
+		go func(idx int) {
+			defer wg.Done()
+			tx := &walletarmy.PendingTx{
+				Hash:      common.HexToHash(fmt.Sprintf("0x%064x", idx)),
+				Wallet:    wallet,
+				ChainID:   1,
+				Nonce:     uint64(idx),
+				Status:    walletarmy.PendingTxStatusBroadcasted,
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+			}
+			if err := store.Save(ctx, tx); err != nil {
+				errors <- fmt.Errorf("write %d: %w", idx, err)
+			}
+		}(i)
+
+		// Reader
+		go func(idx int) {
+			defer wg.Done()
+			_, err := store.ListPending(ctx, wallet, 1)
+			if err != nil {
+				errors <- fmt.Errorf("list %d: %w", idx, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		t.Error(err)
+	}
+
+	// Verify we can list all pending
+	pending, err := store.ListPending(ctx, wallet, 1)
+	require.NoError(t, err)
+	assert.Len(t, pending, numGoroutines)
 }

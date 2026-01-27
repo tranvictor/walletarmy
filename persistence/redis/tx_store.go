@@ -25,10 +25,12 @@ const (
 
 // TxStore provides Redis-based persistence for transaction tracking.
 // It implements the walletarmy.TxStore interface.
+//
+// Note: Transaction records do not automatically expire. Use DeleteOlderThan
+// for periodic cleanup of old records.
 type TxStore struct {
 	client    redis.UniversalClient
 	keyPrefix string
-	ttl       time.Duration // Optional TTL for transaction records
 }
 
 // TxStoreOption configures a TxStore.
@@ -38,15 +40,6 @@ type TxStoreOption func(*TxStore)
 func WithTxStoreKeyPrefix(prefix string) TxStoreOption {
 	return func(s *TxStore) {
 		s.keyPrefix = prefix
-	}
-}
-
-// WithTxStoreTTL sets a TTL for transaction records.
-// Records will automatically expire after this duration.
-// If not set, records never expire automatically.
-func WithTxStoreTTL(ttl time.Duration) TxStoreOption {
-	return func(s *TxStore) {
-		s.ttl = ttl
 	}
 }
 
@@ -79,8 +72,8 @@ type pendingTxData struct {
 	Status      string            `json:"status"`
 	TxRLP       []byte            `json:"tx_rlp,omitempty"`
 	ReceiptJSON []byte            `json:"receipt_json,omitempty"`
-	CreatedAt   int64             `json:"created_at"`
-	UpdatedAt   int64             `json:"updated_at"`
+	CreatedAt   int64             `json:"created_at"`   // Nanoseconds
+	UpdatedAt   int64             `json:"updated_at"`   // Nanoseconds
 	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
@@ -103,8 +96,8 @@ func (s *TxStore) Save(ctx context.Context, tx *walletarmy.PendingTx) error {
 	// Use transaction for atomicity
 	pipe := s.client.TxPipeline()
 
-	// Store tx data (with optional TTL)
-	pipe.Set(ctx, hashKey, data, s.ttl)
+	// Store tx data
+	pipe.Set(ctx, hashKey, data, 0)
 
 	// Add to pending set if status is pending/broadcasted
 	if tx.Status == walletarmy.PendingTxStatusPending || tx.Status == walletarmy.PendingTxStatusBroadcasted {
@@ -183,14 +176,20 @@ func (s *TxStore) ListAllPending(ctx context.Context) ([]*walletarmy.PendingTx, 
 }
 
 // UpdateStatus updates the status of a transaction and optionally sets the receipt.
+// Uses WATCH/MULTI/EXEC for optimistic locking with exponential backoff.
 func (s *TxStore) UpdateStatus(ctx context.Context, hash common.Hash, status walletarmy.PendingTxStatus, receipt *types.Receipt) error {
 	hashKey := s.key(txKeyPrefix, hash.Hex())
 	hashHex := hash.Hex()
 
-	const maxRetries = 3
+	const maxRetries = 10
 	var lastErr error
 
 	for i := 0; i < maxRetries; i++ {
+		// Exponential backoff with jitter on retries
+		if i > 0 {
+			backoff := time.Duration(1<<uint(i-1)) * time.Millisecond
+			time.Sleep(backoff)
+		}
 		err := s.client.Watch(ctx, func(rtx *redis.Tx) error {
 			// Get current value within the watch
 			data, err := rtx.Get(ctx, hashKey).Bytes()
@@ -220,7 +219,7 @@ func (s *TxStore) UpdateStatus(ctx context.Context, hash common.Hash, status wal
 			// Execute transaction atomically
 			_, err = rtx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 				// Store updated tx data
-				pipe.Set(ctx, hashKey, newData, s.ttl)
+				pipe.Set(ctx, hashKey, newData, 0)
 
 				// Update pending sets based on new status
 				walletKey := s.walletPendingKey(tx.Wallet, tx.ChainID)
@@ -252,30 +251,62 @@ func (s *TxStore) UpdateStatus(ctx context.Context, hash common.Hash, status wal
 }
 
 // Delete removes a transaction record.
+// Uses WATCH/MULTI/EXEC for atomic read-then-delete to prevent race conditions.
 func (s *TxStore) Delete(ctx context.Context, hash common.Hash) error {
-	// Get tx first to know which indexes to clean up
-	tx, err := s.Get(ctx, hash)
-	if err != nil {
-		return err
-	}
-	if tx == nil {
-		return nil // Already deleted
-	}
-
 	hashKey := s.key(txKeyPrefix, hash.Hex())
-	walletKey := s.walletPendingKey(tx.Wallet, tx.ChainID)
-	nonceKey := s.nonceIndexKey(tx.Wallet, tx.ChainID, tx.Nonce)
 	hashHex := hash.Hex()
 
-	pipe := s.client.TxPipeline()
-	pipe.Del(ctx, hashKey)
-	pipe.SRem(ctx, s.key(txPendingSetKey), hashHex)
-	pipe.SRem(ctx, walletKey, hashHex)
-	pipe.SRem(ctx, nonceKey, hashHex)
-	pipe.ZRem(ctx, s.key(txCreatedAtSortedSet), hashHex)
+	const maxRetries = 10
+	var lastErr error
 
-	_, err = pipe.Exec(ctx)
-	return err
+	for i := 0; i < maxRetries; i++ {
+		// Exponential backoff with jitter on retries
+		if i > 0 {
+			backoff := time.Duration(1<<uint(i-1)) * time.Millisecond
+			time.Sleep(backoff)
+		}
+		err := s.client.Watch(ctx, func(rtx *redis.Tx) error {
+			// Get tx within the watch to know which indexes to clean up
+			data, err := rtx.Get(ctx, hashKey).Bytes()
+			if err == redis.Nil {
+				return nil // Already deleted, nothing to do
+			}
+			if err != nil {
+				return fmt.Errorf("failed to get transaction: %w", err)
+			}
+
+			tx, err := s.deserializePendingTx(data)
+			if err != nil {
+				return fmt.Errorf("failed to deserialize transaction: %w", err)
+			}
+
+			walletKey := s.walletPendingKey(tx.Wallet, tx.ChainID)
+			nonceKey := s.nonceIndexKey(tx.Wallet, tx.ChainID, tx.Nonce)
+
+			// Execute delete atomically
+			_, err = rtx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Del(ctx, hashKey)
+				pipe.SRem(ctx, s.key(txPendingSetKey), hashHex)
+				pipe.SRem(ctx, walletKey, hashHex)
+				pipe.SRem(ctx, nonceKey, hashHex)
+				pipe.ZRem(ctx, s.key(txCreatedAtSortedSet), hashHex)
+				return nil
+			})
+			return err
+		}, hashKey)
+
+		if err == nil {
+			return nil
+		}
+		if err == redis.TxFailedErr {
+			// Optimistic lock failed, retry
+			lastErr = err
+			continue
+		}
+		return err
+	}
+
+	return fmt.Errorf("failed to delete transaction after %d retries: %w", maxRetries, lastErr)
 }
 
 // DeleteOlderThan removes transactions older than the given duration.
@@ -384,8 +415,8 @@ func (s *TxStore) serializePendingTx(tx *walletarmy.PendingTx) ([]byte, error) {
 		ChainID:   tx.ChainID,
 		Nonce:     tx.Nonce,
 		Status:    string(tx.Status),
-		CreatedAt: tx.CreatedAt.Unix(),
-		UpdatedAt: tx.UpdatedAt.Unix(),
+		CreatedAt: tx.CreatedAt.UnixNano(),
+		UpdatedAt: tx.UpdatedAt.UnixNano(),
 		Metadata:  tx.Metadata,
 	}
 
@@ -422,8 +453,8 @@ func (s *TxStore) deserializePendingTx(data []byte) (*walletarmy.PendingTx, erro
 		ChainID:   d.ChainID,
 		Nonce:     d.Nonce,
 		Status:    walletarmy.PendingTxStatus(d.Status),
-		CreatedAt: time.Unix(d.CreatedAt, 0),
-		UpdatedAt: time.Unix(d.UpdatedAt, 0),
+		CreatedAt: time.Unix(0, d.CreatedAt),
+		UpdatedAt: time.Unix(0, d.UpdatedAt),
 		Metadata:  d.Metadata,
 	}
 

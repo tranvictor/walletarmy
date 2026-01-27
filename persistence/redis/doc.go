@@ -82,6 +82,10 @@
 //
 //	deleted, err := txStore.DeleteOlderThan(ctx, 24*time.Hour)
 //
+// Use NonceStore.Cleanup to remove orphaned index entries:
+//
+//	removed, err := nonceStore.Cleanup(ctx)
+//
 // # Supported Redis Configurations
 //
 // Both stores work with:

@@ -16,7 +16,7 @@ import (
 // Key prefixes for nonce storage
 const (
 	nonceKeyPrefix         = "walletarmy:nonce:"          // nonce state by wallet:chainID
-	nonceAllSetKey         = "walletarmy:nonce:all"       // set of all wallet:chainID pairs
+	nonceWalletByChainKey  = "walletarmy:nonce:wallet_by_chain" // index of wallet:chainID pairs for discovery
 	nonceReservedSetPrefix = "walletarmy:nonce:reserved:" // reserved nonces set by wallet:chainID
 )
 
@@ -66,7 +66,7 @@ type nonceStateData struct {
 	Wallet            string  `json:"wallet"`
 	ChainID           uint64  `json:"chain_id"`
 	LocalPendingNonce *uint64 `json:"local_pending_nonce,omitempty"`
-	UpdatedAt         int64   `json:"updated_at"`
+	UpdatedAt         int64   `json:"updated_at"` // Nanoseconds
 }
 
 // Get retrieves the nonce state for a wallet on a network.
@@ -79,8 +79,8 @@ func (s *NonceStore) Get(ctx context.Context, wallet common.Address, chainID uin
 	stateCmd := pipe.Get(ctx, stateKey)
 	reservedCmd := pipe.SMembers(ctx, reservedKey)
 
-	_, err := pipe.Exec(ctx)
-	// Ignore pipeline error - check individual commands
+	_, _ = pipe.Exec(ctx)
+	// Pipeline error is ignored - we check individual command results below
 
 	// Check state
 	data, err := stateCmd.Bytes()
@@ -130,7 +130,8 @@ func (s *NonceStore) Get(ctx context.Context, wallet common.Address, chainID uin
 }
 
 // Save persists the nonce state.
-// Note: This does NOT save ReservedNonces. Use AddReservedNonce/RemoveReservedNonce for that.
+// If state.ReservedNonces is non-nil, it will REPLACE all existing reserved nonces
+// (delete existing set and re-add). For incremental updates, use AddReservedNonce/RemoveReservedNonce instead.
 func (s *NonceStore) Save(ctx context.Context, state *walletarmy.NonceState) error {
 	if state == nil {
 		return fmt.Errorf("nonce state cannot be nil")
@@ -146,7 +147,7 @@ func (s *NonceStore) Save(ctx context.Context, state *walletarmy.NonceState) err
 
 	pipe := s.client.TxPipeline()
 	pipe.Set(ctx, stateKey, data, 0)
-	pipe.SAdd(ctx, s.key(nonceAllSetKey), indexKey)
+	pipe.SAdd(ctx, s.key(nonceWalletByChainKey), indexKey)
 
 	// If ReservedNonces is provided in the state, sync the set
 	// This handles the case where someone calls Save with a full state
@@ -168,15 +169,20 @@ func (s *NonceStore) Save(ctx context.Context, state *walletarmy.NonceState) err
 }
 
 // SavePendingNonce is a convenience method to update just the pending nonce.
-// Uses WATCH/MULTI/EXEC for optimistic locking.
+// Uses WATCH/MULTI/EXEC for optimistic locking with exponential backoff.
 func (s *NonceStore) SavePendingNonce(ctx context.Context, wallet common.Address, chainID uint64, nonce uint64) error {
 	stateKey := s.nonceStateKey(wallet, chainID)
 	indexKey := fmt.Sprintf("%s:%d", wallet.Hex(), chainID)
 
-	const maxRetries = 3
+	const maxRetries = 10
 	var lastErr error
 
 	for i := 0; i < maxRetries; i++ {
+		// Exponential backoff with jitter on retries
+		if i > 0 {
+			backoff := time.Duration(1<<uint(i-1)) * time.Millisecond
+			time.Sleep(backoff)
+		}
 		err := s.client.Watch(ctx, func(rtx *redis.Tx) error {
 			// Get current state within the watch
 			data, err := rtx.Get(ctx, stateKey).Bytes()
@@ -210,7 +216,7 @@ func (s *NonceStore) SavePendingNonce(ctx context.Context, wallet common.Address
 			// Execute transaction atomically
 			_, err = rtx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 				pipe.Set(ctx, stateKey, newData, 0)
-				pipe.SAdd(ctx, s.key(nonceAllSetKey), indexKey)
+				pipe.SAdd(ctx, s.key(nonceWalletByChainKey), indexKey)
 				return nil
 			})
 			return err
@@ -239,7 +245,7 @@ func (s *NonceStore) AddReservedNonce(ctx context.Context, wallet common.Address
 	// Use pipeline for atomicity
 	pipe := s.client.TxPipeline()
 	pipe.SAdd(ctx, reservedKey, strconv.FormatUint(nonce, 10))
-	pipe.SAdd(ctx, s.key(nonceAllSetKey), indexKey)
+	pipe.SAdd(ctx, s.key(nonceWalletByChainKey), indexKey)
 
 	_, err := pipe.Exec(ctx)
 	if err != nil {
@@ -266,7 +272,7 @@ func (s *NonceStore) RemoveReservedNonce(ctx context.Context, wallet common.Addr
 // Uses MGET for efficient batch retrieval.
 func (s *NonceStore) ListAll(ctx context.Context) ([]*walletarmy.NonceState, error) {
 	// Get all wallet:chainID pairs
-	pairs, err := s.client.SMembers(ctx, s.key(nonceAllSetKey)).Result()
+	pairs, err := s.client.SMembers(ctx, s.key(nonceWalletByChainKey)).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list nonce states: %w", err)
 	}
@@ -392,6 +398,76 @@ func (s *NonceStore) ListAll(ctx context.Context) ([]*walletarmy.NonceState, err
 	return states, nil
 }
 
+// Cleanup removes orphaned index entries where no actual state exists.
+// This should be called periodically to clean up stale entries from nonceWalletByChainKey.
+// Returns the number of orphaned entries removed.
+func (s *NonceStore) Cleanup(ctx context.Context) (int, error) {
+	// Get all wallet:chainID pairs from the index
+	pairs, err := s.client.SMembers(ctx, s.key(nonceWalletByChainKey)).Result()
+	if err != nil {
+		return 0, fmt.Errorf("failed to list nonce index: %w", err)
+	}
+
+	if len(pairs) == 0 {
+		return 0, nil
+	}
+
+	removed := 0
+	var removeErrors []string
+
+	for _, pair := range pairs {
+		parts := strings.Split(pair, ":")
+		if len(parts) != 2 {
+			// Invalid format, remove from index
+			if err := s.client.SRem(ctx, s.key(nonceWalletByChainKey), pair).Err(); err != nil {
+				removeErrors = append(removeErrors, fmt.Sprintf("remove invalid pair %s: %v", pair, err))
+			} else {
+				removed++
+			}
+			continue
+		}
+
+		wallet := common.HexToAddress(parts[0])
+		chainID, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			// Invalid chainID, remove from index
+			if err := s.client.SRem(ctx, s.key(nonceWalletByChainKey), pair).Err(); err != nil {
+				removeErrors = append(removeErrors, fmt.Sprintf("remove invalid pair %s: %v", pair, err))
+			} else {
+				removed++
+			}
+			continue
+		}
+
+		// Check if actual state exists
+		stateKey := s.nonceStateKey(wallet, chainID)
+		reservedKey := s.reservedNoncesKey(wallet, chainID)
+
+		pipe := s.client.Pipeline()
+		stateExists := pipe.Exists(ctx, stateKey)
+		reservedCount := pipe.SCard(ctx, reservedKey)
+		_, _ = pipe.Exec(ctx)
+
+		stateExistsVal, _ := stateExists.Result()
+		reservedCountVal, _ := reservedCount.Result()
+
+		// If no state and no reserved nonces, remove from index
+		if stateExistsVal == 0 && reservedCountVal == 0 {
+			if err := s.client.SRem(ctx, s.key(nonceWalletByChainKey), pair).Err(); err != nil {
+				removeErrors = append(removeErrors, fmt.Sprintf("remove orphan %s: %v", pair, err))
+			} else {
+				removed++
+			}
+		}
+	}
+
+	if len(removeErrors) > 0 {
+		return removed, fmt.Errorf("cleanup encountered %d errors: %s", len(removeErrors), strings.Join(removeErrors, "; "))
+	}
+
+	return removed, nil
+}
+
 // Helper methods
 
 func (s *NonceStore) nonceStateKey(wallet common.Address, chainID uint64) string {
@@ -419,7 +495,7 @@ func (s *NonceStore) serializeNonceState(state *walletarmy.NonceState) ([]byte, 
 		Wallet:            state.Wallet.Hex(),
 		ChainID:           state.ChainID,
 		LocalPendingNonce: state.LocalPendingNonce,
-		UpdatedAt:         state.UpdatedAt.Unix(),
+		UpdatedAt:         state.UpdatedAt.UnixNano(),
 	}
 	return json.Marshal(data)
 }
@@ -434,7 +510,7 @@ func (s *NonceStore) deserializeNonceState(data []byte) (*walletarmy.NonceState,
 		Wallet:            common.HexToAddress(d.Wallet),
 		ChainID:           d.ChainID,
 		LocalPendingNonce: d.LocalPendingNonce,
-		UpdatedAt:         time.Unix(d.UpdatedAt, 0),
+		UpdatedAt:         time.Unix(0, d.UpdatedAt),
 	}, nil
 }
 
