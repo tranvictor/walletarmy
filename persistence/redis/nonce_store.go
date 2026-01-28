@@ -4,20 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/redis/go-redis/v9"
+
 	"github.com/tranvictor/walletarmy"
 )
 
 // Key prefixes for nonce storage
 const (
-	nonceKeyPrefix         = "walletarmy:nonce:"          // nonce state by wallet:chainID
+	nonceKeyPrefix         = "walletarmy:nonce:"                // nonce state by wallet:chainID
 	nonceWalletByChainKey  = "walletarmy:nonce:wallet_by_chain" // index of wallet:chainID pairs for discovery
-	nonceReservedSetPrefix = "walletarmy:nonce:reserved:" // reserved nonces set by wallet:chainID
+	nonceReservedSetPrefix = "walletarmy:nonce:reserved:"       // reserved nonces set by wallet:chainID
 )
 
 // NonceStore provides Redis-based persistence for nonce state tracking.
@@ -70,102 +72,219 @@ type nonceStateData struct {
 }
 
 // Get retrieves the nonce state for a wallet on a network.
+// Uses WATCH/MULTI/EXEC to ensure consistent read of state and reserved nonces.
+// If the watched keys change during the read, the operation retries with exponential
+// backoff and jitter.
 func (s *NonceStore) Get(ctx context.Context, wallet common.Address, chainID uint64) (*walletarmy.NonceState, error) {
 	stateKey := s.nonceStateKey(wallet, chainID)
 	reservedKey := s.reservedNoncesKey(wallet, chainID)
 
-	// Get both the state and reserved nonces in parallel
-	pipe := s.client.Pipeline()
-	stateCmd := pipe.Get(ctx, stateKey)
-	reservedCmd := pipe.SMembers(ctx, reservedKey)
+	const maxRetries = 10
+	var lastErr error
 
-	_, _ = pipe.Exec(ctx)
-	// Pipeline error is ignored - we check individual command results below
+	for i := range maxRetries {
+		// Exponential backoff with jitter on retries
+		if i > 0 {
+			backoff := time.Duration(1<<uint(i-1)) * time.Millisecond
+			jitter := time.Duration(rand.Int63n(int64(backoff/2 + 1)))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff + jitter):
+			}
+		}
 
-	// Check state
-	data, err := stateCmd.Bytes()
-	if err == redis.Nil {
-		// No state exists, but check if there are reserved nonces
-		reservedStrs, err := reservedCmd.Result()
-		if err != nil && err != redis.Nil {
-			return nil, fmt.Errorf("failed to get reserved nonces: %w", err)
-		}
-		if len(reservedStrs) == 0 {
-			return nil, nil // Nothing exists
-		}
-		// Reserved nonces exist but no main state - reconstruct
-		reservedNonces, err := s.parseReservedNonces(reservedStrs)
-		if err != nil {
-			return nil, err
-		}
-		return &walletarmy.NonceState{
-			Wallet:         wallet,
-			ChainID:        chainID,
-			ReservedNonces: reservedNonces,
-		}, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get nonce state: %w", err)
-	}
+		var result *walletarmy.NonceState
 
-	state, err := s.deserializeNonceState(data)
-	if err != nil {
+		err := s.client.Watch(ctx, func(rtx *redis.Tx) error {
+			// Execute reads within MULTI/EXEC to detect concurrent modifications.
+			// If stateKey or reservedKey change between WATCH and EXEC, TxFailedErr is returned.
+			cmds, err := rtx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Get(ctx, stateKey)
+				pipe.SMembers(ctx, reservedKey)
+				return nil
+			})
+			// TxPipelined returns redis.Nil if the first command returns Nil,
+			// but we need to check individual command results
+			if err != nil && err != redis.Nil {
+				return err
+			}
+
+			// Extract results from commands
+			stateCmd := cmds[0].(*redis.StringCmd)
+			reservedCmd := cmds[1].(*redis.StringSliceCmd)
+
+			// Check state
+			data, err := stateCmd.Bytes()
+			if err == redis.Nil {
+				// No state exists, but check if there are reserved nonces
+				reservedStrs, err := reservedCmd.Result()
+				if err != nil && err != redis.Nil {
+					return fmt.Errorf("failed to get reserved nonces: %w", err)
+				}
+				if len(reservedStrs) == 0 {
+					result = nil // Nothing exists
+					return nil
+				}
+				// Reserved nonces exist but no main state - reconstruct
+				reservedNonces, err := s.parseReservedNonces(reservedStrs)
+				if err != nil {
+					return err
+				}
+				result = &walletarmy.NonceState{
+					Wallet:         wallet,
+					ChainID:        chainID,
+					ReservedNonces: reservedNonces,
+				}
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("failed to get nonce state: %w", err)
+			}
+
+			state, err := s.deserializeNonceState(data)
+			if err != nil {
+				return err
+			}
+
+			// Get reserved nonces
+			reservedStrs, err := reservedCmd.Result()
+			if err != nil && err != redis.Nil {
+				return fmt.Errorf("failed to get reserved nonces: %w", err)
+			}
+
+			if len(reservedStrs) > 0 {
+				state.ReservedNonces, err = s.parseReservedNonces(reservedStrs)
+				if err != nil {
+					return err
+				}
+			}
+
+			result = state
+			return nil
+		}, stateKey, reservedKey)
+
+		if err == nil {
+			return result, nil
+		}
+		if err == redis.TxFailedErr {
+			// Data changed during read, retry
+			lastErr = err
+			continue
+		}
 		return nil, err
 	}
 
-	// Get reserved nonces
-	reservedStrs, err := reservedCmd.Result()
-	if err != nil && err != redis.Nil {
-		return nil, fmt.Errorf("failed to get reserved nonces: %w", err)
-	}
-
-	if len(reservedStrs) > 0 {
-		state.ReservedNonces, err = s.parseReservedNonces(reservedStrs)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return state, nil
+	return nil, fmt.Errorf("failed to get nonce state after %d retries: %w", maxRetries, lastErr)
 }
 
 // Save persists the nonce state.
-// If state.ReservedNonces is non-nil, it will REPLACE all existing reserved nonces
-// (delete existing set and re-add). For incremental updates, use AddReservedNonce/RemoveReservedNonce instead.
+// If state.ReservedNonces is non-nil, it will SYNC the reserved nonces set
+// by computing the diff and applying incremental changes (SREM/SADD).
+// Uses WATCH/MULTI/EXEC for consistency.
+// For incremental updates, prefer AddReservedNonce/RemoveReservedNonce instead.
 func (s *NonceStore) Save(ctx context.Context, state *walletarmy.NonceState) error {
 	if state == nil {
 		return fmt.Errorf("nonce state cannot be nil")
 	}
 
-	data, err := s.serializeNonceState(state)
-	if err != nil {
-		return fmt.Errorf("failed to serialize nonce state: %w", err)
-	}
-
 	stateKey := s.nonceStateKey(state.Wallet, state.ChainID)
+	reservedKey := s.reservedNoncesKey(state.Wallet, state.ChainID)
 	indexKey := fmt.Sprintf("%s:%d", state.Wallet.Hex(), state.ChainID)
 
-	pipe := s.client.TxPipeline()
-	pipe.Set(ctx, stateKey, data, 0)
-	pipe.SAdd(ctx, s.key(nonceWalletByChainKey), indexKey)
-
-	// If ReservedNonces is provided in the state, sync the set
-	// This handles the case where someone calls Save with a full state
-	if state.ReservedNonces != nil {
-		reservedKey := s.reservedNoncesKey(state.Wallet, state.ChainID)
-		// Delete existing and add new
-		pipe.Del(ctx, reservedKey)
-		if len(state.ReservedNonces) > 0 {
-			members := make([]interface{}, len(state.ReservedNonces))
-			for i, n := range state.ReservedNonces {
-				members[i] = strconv.FormatUint(n, 10)
-			}
-			pipe.SAdd(ctx, reservedKey, members...)
+	// If no reserved nonces to sync, use simple pipeline
+	if state.ReservedNonces == nil {
+		data, err := s.serializeNonceState(state)
+		if err != nil {
+			return fmt.Errorf("failed to serialize nonce state: %w", err)
 		}
+
+		pipe := s.client.TxPipeline()
+		pipe.Set(ctx, stateKey, data, 0)
+		pipe.SAdd(ctx, s.key(nonceWalletByChainKey), indexKey)
+		_, err = pipe.Exec(ctx)
+		return err
 	}
 
-	_, err = pipe.Exec(ctx)
-	return err
+	// Need to sync reserved nonces - use WATCH for consistency
+	const maxRetries = 10
+	var lastErr error
+
+	for i := range maxRetries {
+		// Exponential backoff with jitter on retries
+		if i > 0 {
+			backoff := time.Duration(1<<uint(i-1)) * time.Millisecond
+			jitter := time.Duration(rand.Int63n(int64(backoff/2 + 1)))
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff + jitter):
+			}
+		}
+
+		err := s.client.Watch(ctx, func(rtx *redis.Tx) error {
+			// Get current reserved nonces
+			currentReserved, err := rtx.SMembers(ctx, reservedKey).Result()
+			if err != nil && err != redis.Nil {
+				return fmt.Errorf("failed to get current reserved nonces: %w", err)
+			}
+
+			// Build sets for comparison
+			currentSet := make(map[string]struct{}, len(currentReserved))
+			for _, n := range currentReserved {
+				currentSet[n] = struct{}{}
+			}
+
+			newSet := make(map[string]struct{}, len(state.ReservedNonces))
+			for _, n := range state.ReservedNonces {
+				newSet[strconv.FormatUint(n, 10)] = struct{}{}
+			}
+
+			// Compute diff
+			var toRemove, toAdd []interface{}
+			for n := range currentSet {
+				if _, exists := newSet[n]; !exists {
+					toRemove = append(toRemove, n)
+				}
+			}
+			for n := range newSet {
+				if _, exists := currentSet[n]; !exists {
+					toAdd = append(toAdd, n)
+				}
+			}
+
+			data, err := s.serializeNonceState(state)
+			if err != nil {
+				return fmt.Errorf("failed to serialize nonce state: %w", err)
+			}
+
+			// Execute atomically
+			_, err = rtx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Set(ctx, stateKey, data, 0)
+				pipe.SAdd(ctx, s.key(nonceWalletByChainKey), indexKey)
+
+				if len(toRemove) > 0 {
+					pipe.SRem(ctx, reservedKey, toRemove...)
+				}
+				if len(toAdd) > 0 {
+					pipe.SAdd(ctx, reservedKey, toAdd...)
+				}
+				return nil
+			})
+			return err
+		}, stateKey, reservedKey)
+
+		if err == nil {
+			return nil
+		}
+		if err == redis.TxFailedErr {
+			lastErr = err
+			continue
+		}
+		return err
+	}
+
+	return fmt.Errorf("failed to save nonce state after %d retries: %w", maxRetries, lastErr)
 }
 
 // SavePendingNonce is a convenience method to update just the pending nonce.
@@ -177,11 +296,16 @@ func (s *NonceStore) SavePendingNonce(ctx context.Context, wallet common.Address
 	const maxRetries = 10
 	var lastErr error
 
-	for i := 0; i < maxRetries; i++ {
+	for i := range maxRetries {
 		// Exponential backoff with jitter on retries
 		if i > 0 {
 			backoff := time.Duration(1<<uint(i-1)) * time.Millisecond
-			time.Sleep(backoff)
+			jitter := time.Duration(rand.Int63n(int64(backoff/2 + 1)))
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff + jitter):
+			}
 		}
 		err := s.client.Watch(ctx, func(rtx *redis.Tx) error {
 			// Get current state within the watch
@@ -269,7 +393,13 @@ func (s *NonceStore) RemoveReservedNonce(ctx context.Context, wallet common.Addr
 }
 
 // ListAll returns all stored nonce states.
-// Uses MGET for efficient batch retrieval.
+// Uses a single pipeline for efficient batch retrieval (2 round trips total).
+//
+// Note: This method does NOT provide atomic/transactional consistency across all
+// returned states. Each individual state is read independently, so if data changes
+// during the batch read, the returned states may represent different points in time.
+// This is acceptable for recovery/initialization purposes but callers should be
+// aware of this limitation.
 func (s *NonceStore) ListAll(ctx context.Context) ([]*walletarmy.NonceState, error) {
 	// Get all wallet:chainID pairs
 	pairs, err := s.client.SMembers(ctx, s.key(nonceWalletByChainKey)).Result()
@@ -287,7 +417,6 @@ func (s *NonceStore) ListAll(ctx context.Context) ([]*walletarmy.NonceState, err
 		chainID uint64
 	}
 	validPairs := make([]pairInfo, 0, len(pairs))
-	stateKeys := make([]string, 0, len(pairs))
 	var parseErrors []string
 
 	for _, pair := range pairs {
@@ -305,61 +434,48 @@ func (s *NonceStore) ListAll(ctx context.Context) ([]*walletarmy.NonceState, err
 		}
 
 		validPairs = append(validPairs, pairInfo{wallet: wallet, chainID: chainID})
-		stateKeys = append(stateKeys, s.nonceStateKey(wallet, chainID))
 	}
 
-	if len(stateKeys) == 0 {
+	if len(validPairs) == 0 {
 		if len(parseErrors) > 0 {
 			return nil, fmt.Errorf("all pairs invalid: %s", strings.Join(parseErrors, "; "))
 		}
 		return nil, nil
 	}
 
-	// Batch get all state data
-	results, err := s.client.MGet(ctx, stateKeys...).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to batch get nonce states: %w", err)
-	}
-
-	// Build reserved nonce keys for batch retrieval
-	reservedKeys := make([]string, len(validPairs))
-	for i, p := range validPairs {
-		reservedKeys[i] = s.reservedNoncesKey(p.wallet, p.chainID)
-	}
-
-	// Get all reserved nonces using pipeline
+	// Single pipeline to get both state data and reserved nonces
 	pipe := s.client.Pipeline()
-	reservedCmds := make([]*redis.StringSliceCmd, len(reservedKeys))
-	for i, key := range reservedKeys {
-		reservedCmds[i] = pipe.SMembers(ctx, key)
+	stateCmds := make([]*redis.StringCmd, len(validPairs))
+	reservedCmds := make([]*redis.StringSliceCmd, len(validPairs))
+
+	for i, p := range validPairs {
+		stateCmds[i] = pipe.Get(ctx, s.nonceStateKey(p.wallet, p.chainID))
+		reservedCmds[i] = pipe.SMembers(ctx, s.reservedNoncesKey(p.wallet, p.chainID))
 	}
+
 	_, _ = pipe.Exec(ctx) // Ignore pipeline error, check individual commands
 
 	// Process results
-	states := make([]*walletarmy.NonceState, 0, len(results))
+	states := make([]*walletarmy.NonceState, 0, len(validPairs))
 	var deserializeErrors []string
 
-	for i, result := range results {
-		p := validPairs[i]
-
+	for i, p := range validPairs {
 		var state *walletarmy.NonceState
 
-		if result == nil {
+		// Get state data
+		data, err := stateCmds[i].Bytes()
+		if err == redis.Nil {
 			// No main state, but might have reserved nonces
 			state = &walletarmy.NonceState{
 				Wallet:  p.wallet,
 				ChainID: p.chainID,
 			}
+		} else if err != nil {
+			deserializeErrors = append(deserializeErrors,
+				fmt.Sprintf("%s:%d state: %v", p.wallet.Hex(), p.chainID, err))
+			continue
 		} else {
-			data, ok := result.(string)
-			if !ok {
-				deserializeErrors = append(deserializeErrors,
-					fmt.Sprintf("%s:%d: unexpected type %T", p.wallet.Hex(), p.chainID, result))
-				continue
-			}
-
-			var err error
-			state, err = s.deserializeNonceState([]byte(data))
+			state, err = s.deserializeNonceState(data)
 			if err != nil {
 				deserializeErrors = append(deserializeErrors,
 					fmt.Sprintf("%s:%d: %v", p.wallet.Hex(), p.chainID, err))
@@ -400,6 +516,7 @@ func (s *NonceStore) ListAll(ctx context.Context) ([]*walletarmy.NonceState, err
 
 // Cleanup removes orphaned index entries where no actual state exists.
 // This should be called periodically to clean up stale entries from nonceWalletByChainKey.
+// Uses batched operations for better performance.
 // Returns the number of orphaned entries removed.
 func (s *NonceStore) Cleanup(ctx context.Context) (int, error) {
 	// Get all wallet:chainID pairs from the index
@@ -412,60 +529,80 @@ func (s *NonceStore) Cleanup(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	removed := 0
-	var removeErrors []string
+	// First pass: parse pairs and build keys for batch existence check
+	type pairInfo struct {
+		pair     string
+		wallet   common.Address
+		chainID  uint64
+		stateKey string
+		reserved string
+	}
+
+	validPairs := make([]pairInfo, 0, len(pairs))
+	invalidPairs := make([]string, 0)
 
 	for _, pair := range pairs {
 		parts := strings.Split(pair, ":")
 		if len(parts) != 2 {
-			// Invalid format, remove from index
-			if err := s.client.SRem(ctx, s.key(nonceWalletByChainKey), pair).Err(); err != nil {
-				removeErrors = append(removeErrors, fmt.Sprintf("remove invalid pair %s: %v", pair, err))
-			} else {
-				removed++
-			}
+			invalidPairs = append(invalidPairs, pair)
 			continue
 		}
 
 		wallet := common.HexToAddress(parts[0])
 		chainID, err := strconv.ParseUint(parts[1], 10, 64)
 		if err != nil {
-			// Invalid chainID, remove from index
-			if err := s.client.SRem(ctx, s.key(nonceWalletByChainKey), pair).Err(); err != nil {
-				removeErrors = append(removeErrors, fmt.Sprintf("remove invalid pair %s: %v", pair, err))
-			} else {
-				removed++
-			}
+			invalidPairs = append(invalidPairs, pair)
 			continue
 		}
 
-		// Check if actual state exists
-		stateKey := s.nonceStateKey(wallet, chainID)
-		reservedKey := s.reservedNoncesKey(wallet, chainID)
+		validPairs = append(validPairs, pairInfo{
+			pair:     pair,
+			wallet:   wallet,
+			chainID:  chainID,
+			stateKey: s.nonceStateKey(wallet, chainID),
+			reserved: s.reservedNoncesKey(wallet, chainID),
+		})
+	}
 
-		pipe := s.client.Pipeline()
-		stateExists := pipe.Exists(ctx, stateKey)
-		reservedCount := pipe.SCard(ctx, reservedKey)
-		_, _ = pipe.Exec(ctx)
+	// Batch check existence of all state keys and reserved sets
+	pipe := s.client.Pipeline()
+	existsCmds := make([]*redis.IntCmd, len(validPairs))
+	scardCmds := make([]*redis.IntCmd, len(validPairs))
 
-		stateExistsVal, _ := stateExists.Result()
-		reservedCountVal, _ := reservedCount.Result()
+	for i, p := range validPairs {
+		existsCmds[i] = pipe.Exists(ctx, p.stateKey)
+		scardCmds[i] = pipe.SCard(ctx, p.reserved)
+	}
 
-		// If no state and no reserved nonces, remove from index
-		if stateExistsVal == 0 && reservedCountVal == 0 {
-			if err := s.client.SRem(ctx, s.key(nonceWalletByChainKey), pair).Err(); err != nil {
-				removeErrors = append(removeErrors, fmt.Sprintf("remove orphan %s: %v", pair, err))
-			} else {
-				removed++
-			}
+	_, _ = pipe.Exec(ctx)
+
+	// Find orphans
+	orphanPairs := make([]interface{}, 0)
+	for i, p := range validPairs {
+		stateExists, _ := existsCmds[i].Result()
+		reservedCount, _ := scardCmds[i].Result()
+
+		if stateExists == 0 && reservedCount == 0 {
+			orphanPairs = append(orphanPairs, p.pair)
 		}
 	}
 
-	if len(removeErrors) > 0 {
-		return removed, fmt.Errorf("cleanup encountered %d errors: %s", len(removeErrors), strings.Join(removeErrors, "; "))
+	// Add invalid pairs to removal list
+	for _, p := range invalidPairs {
+		orphanPairs = append(orphanPairs, p)
 	}
 
-	return removed, nil
+	if len(orphanPairs) == 0 {
+		return 0, nil
+	}
+
+	// Batch remove all orphans
+	removed, err := s.client.SRem(ctx, s.key(nonceWalletByChainKey), orphanPairs...).Result()
+	if err != nil {
+		return 0, fmt.Errorf("failed to remove orphan entries: %w", err)
+	}
+
+	return int(removed), nil
 }
 
 // Helper methods

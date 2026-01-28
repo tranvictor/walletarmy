@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -11,17 +12,29 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/redis/go-redis/v9"
+
 	"github.com/tranvictor/walletarmy"
 )
 
 // Key prefixes for transaction storage
 const (
-	txKeyPrefix          = "walletarmy:tx:"           // tx data by hash
-	txPendingSetKey      = "walletarmy:tx:pending"    // set of all pending tx hashes
-	txWalletPendingKey   = "walletarmy:tx:wallet:"    // pending txs by wallet:chainID
-	txNonceKey           = "walletarmy:tx:nonce:"     // txs by wallet:chainID:nonce
-	txCreatedAtSortedSet = "walletarmy:tx:created_at" // sorted set by creation time
+	txKeyPrefix          = "walletarmy:tx:"          // tx data by hash
+	txPendingSetKey      = "walletarmy:tx:pending"   // set of all pending tx hashes
+	txWalletPendingKey   = "walletarmy:tx:wallet:"   // pending txs by wallet:chainID
+	txNonceKey           = "walletarmy:tx:nonce:"    // txs by wallet:chainID:nonce
+	txTimestampSortedSet = "walletarmy:tx:timestamp" // sorted set by timestamp (created_at initially, updated to updated_at when skipped during cleanup)
 )
+
+// statusPriority defines the priority order for transaction statuses.
+// Higher values indicate more "final" states that should not be overwritten.
+var statusPriority = map[walletarmy.PendingTxStatus]int{
+	walletarmy.PendingTxStatusPending:     1,
+	walletarmy.PendingTxStatusBroadcasted: 2,
+	walletarmy.PendingTxStatusDropped:     3,
+	walletarmy.PendingTxStatusReplaced:    4,
+	walletarmy.PendingTxStatusReverted:    5,
+	walletarmy.PendingTxStatusMined:       5,
+}
 
 // TxStore provides Redis-based persistence for transaction tracking.
 // It implements the walletarmy.TxStore interface.
@@ -72,20 +85,17 @@ type pendingTxData struct {
 	Status      string            `json:"status"`
 	TxRLP       []byte            `json:"tx_rlp,omitempty"`
 	ReceiptJSON []byte            `json:"receipt_json,omitempty"`
-	CreatedAt   int64             `json:"created_at"`   // Nanoseconds
-	UpdatedAt   int64             `json:"updated_at"`   // Nanoseconds
+	CreatedAt   int64             `json:"created_at"` // Nanoseconds
+	UpdatedAt   int64             `json:"updated_at"` // Nanoseconds
 	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
 // Save persists a pending transaction to Redis.
+// Uses WATCH/MULTI/EXEC for optimistic locking to prevent race conditions
+// with concurrent UpdateStatus calls.
 func (s *TxStore) Save(ctx context.Context, tx *walletarmy.PendingTx) error {
 	if tx == nil {
 		return fmt.Errorf("transaction cannot be nil")
-	}
-
-	data, err := s.serializePendingTx(tx)
-	if err != nil {
-		return fmt.Errorf("failed to serialize transaction: %w", err)
 	}
 
 	hashKey := s.key(txKeyPrefix, tx.Hash.Hex())
@@ -93,37 +103,93 @@ func (s *TxStore) Save(ctx context.Context, tx *walletarmy.PendingTx) error {
 	nonceKey := s.nonceIndexKey(tx.Wallet, tx.ChainID, tx.Nonce)
 	hashHex := tx.Hash.Hex()
 
-	// Use transaction for atomicity
-	pipe := s.client.TxPipeline()
+	const maxRetries = 10
+	var lastErr error
 
-	// Store tx data
-	pipe.Set(ctx, hashKey, data, 0)
+	for i := 0; i < maxRetries; i++ {
+		// Exponential backoff with jitter on retries
+		if i > 0 {
+			backoff := time.Duration(1<<uint(i-1)) * time.Millisecond
+			jitter := time.Duration(rand.Int63n(int64(backoff/2 + 1)))
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff + jitter):
+			}
+		}
 
-	// Add to pending set if status is pending/broadcasted
-	if tx.Status == walletarmy.PendingTxStatusPending || tx.Status == walletarmy.PendingTxStatusBroadcasted {
-		pipe.SAdd(ctx, s.key(txPendingSetKey), hashHex)
-		pipe.SAdd(ctx, walletKey, hashHex)
-	} else {
-		// Remove from pending sets if status changed
-		pipe.SRem(ctx, s.key(txPendingSetKey), hashHex)
-		pipe.SRem(ctx, walletKey, hashHex)
+		err := s.client.Watch(ctx, func(rtx *redis.Tx) error {
+			// Check if tx already exists and has a "final" status
+			existingData, err := rtx.Get(ctx, hashKey).Bytes()
+			if err != nil && err != redis.Nil {
+				return fmt.Errorf("failed to get existing transaction: %w", err)
+			}
+
+			// If tx exists, check if we should allow overwrite
+			if err != redis.Nil {
+				existingTx, parseErr := s.deserializePendingTx(existingData)
+				if parseErr == nil {
+					// Don't overwrite if existing tx has a more "final" status
+					// Status priority: mined/reverted > replaced > dropped > broadcasted > pending
+					if isMoreFinalStatus(existingTx.Status, tx.Status) {
+						// Existing status is more final, skip update
+						return nil
+					}
+				}
+			}
+
+			data, err := s.serializePendingTx(tx)
+			if err != nil {
+				return fmt.Errorf("failed to serialize transaction: %w", err)
+			}
+
+			// Execute atomically
+			_, err = rtx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				// Store tx data
+				pipe.Set(ctx, hashKey, data, 0)
+
+				// Add to pending set if status is pending/broadcasted
+				if tx.Status == walletarmy.PendingTxStatusPending || tx.Status == walletarmy.PendingTxStatusBroadcasted {
+					pipe.SAdd(ctx, s.key(txPendingSetKey), hashHex)
+					pipe.SAdd(ctx, walletKey, hashHex)
+				} else {
+					// Remove from pending sets if status changed
+					pipe.SRem(ctx, s.key(txPendingSetKey), hashHex)
+					pipe.SRem(ctx, walletKey, hashHex)
+				}
+
+				// Add to nonce index
+				pipe.SAdd(ctx, nonceKey, hashHex)
+
+				// Add to sorted set for time-based cleanup
+				pipe.ZAdd(ctx, s.key(txTimestampSortedSet), redis.Z{
+					Score:  float64(tx.CreatedAt.Unix()),
+					Member: hashHex,
+				})
+
+				return nil
+			})
+			return err
+		}, hashKey)
+
+		if err == nil {
+			return nil
+		}
+		if err == redis.TxFailedErr {
+			// Optimistic lock failed, retry
+			lastErr = err
+			continue
+		}
+		return err
 	}
 
-	// Add to nonce index
-	pipe.SAdd(ctx, nonceKey, hashHex)
+	return fmt.Errorf("failed to save transaction after %d retries: %w", maxRetries, lastErr)
+}
 
-	// Add to sorted set for time-based cleanup
-	pipe.ZAdd(ctx, s.key(txCreatedAtSortedSet), redis.Z{
-		Score:  float64(tx.CreatedAt.Unix()),
-		Member: hashHex,
-	})
-
-	_, err = pipe.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to save transaction: %w", err)
-	}
-
-	return nil
+// isMoreFinalStatus returns true if existingStatus is more "final" than newStatus.
+// Status priority (most final first): mined, reverted > replaced > dropped > broadcasted > pending
+func isMoreFinalStatus(existingStatus, newStatus walletarmy.PendingTxStatus) bool {
+	return statusPriority[existingStatus] > statusPriority[newStatus]
 }
 
 // Get retrieves a pending transaction by hash.
@@ -188,7 +254,12 @@ func (s *TxStore) UpdateStatus(ctx context.Context, hash common.Hash, status wal
 		// Exponential backoff with jitter on retries
 		if i > 0 {
 			backoff := time.Duration(1<<uint(i-1)) * time.Millisecond
-			time.Sleep(backoff)
+			jitter := time.Duration(rand.Int63n(int64(backoff/2 + 1)))
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff + jitter):
+			}
 		}
 		err := s.client.Watch(ctx, func(rtx *redis.Tx) error {
 			// Get current value within the watch
@@ -203,6 +274,11 @@ func (s *TxStore) UpdateStatus(ctx context.Context, hash common.Hash, status wal
 			tx, err := s.deserializePendingTx(data)
 			if err != nil {
 				return fmt.Errorf("failed to deserialize transaction: %w", err)
+			}
+
+			// Don't downgrade to a less final status
+			if isMoreFinalStatus(tx.Status, status) {
+				return nil
 			}
 
 			// Update fields
@@ -263,7 +339,12 @@ func (s *TxStore) Delete(ctx context.Context, hash common.Hash) error {
 		// Exponential backoff with jitter on retries
 		if i > 0 {
 			backoff := time.Duration(1<<uint(i-1)) * time.Millisecond
-			time.Sleep(backoff)
+			jitter := time.Duration(rand.Int63n(int64(backoff/2 + 1)))
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff + jitter):
+			}
 		}
 		err := s.client.Watch(ctx, func(rtx *redis.Tx) error {
 			// Get tx within the watch to know which indexes to clean up
@@ -289,7 +370,7 @@ func (s *TxStore) Delete(ctx context.Context, hash common.Hash) error {
 				pipe.SRem(ctx, s.key(txPendingSetKey), hashHex)
 				pipe.SRem(ctx, walletKey, hashHex)
 				pipe.SRem(ctx, nonceKey, hashHex)
-				pipe.ZRem(ctx, s.key(txCreatedAtSortedSet), hashHex)
+				pipe.ZRem(ctx, s.key(txTimestampSortedSet), hashHex)
 				return nil
 			})
 			return err
@@ -310,42 +391,185 @@ func (s *TxStore) Delete(ctx context.Context, hash common.Hash) error {
 }
 
 // DeleteOlderThan removes transactions older than the given duration.
+// Uses batched operations for better performance with configurable batch size.
+// Transactions that have been updated recently (within a grace period) are skipped
+// to avoid race conditions with concurrent status updates.
+// Also cleans up empty nonce index sets after removal.
 func (s *TxStore) DeleteOlderThan(ctx context.Context, age time.Duration) (int, error) {
+	return s.DeleteOlderThanWithOptions(ctx, age, 1000, 5*time.Minute)
+}
+
+// DeleteOlderThanWithOptions removes transactions older than the given duration.
+// Parameters:
+//   - age: minimum age of transactions to delete (based on CreatedAt)
+//   - batchSize: maximum number of transactions to process per batch (0 = unlimited)
+//   - gracePeriod: skip transactions updated within this duration to avoid race conditions
+func (s *TxStore) DeleteOlderThanWithOptions(ctx context.Context, age time.Duration, batchSize int64, gracePeriod time.Duration) (int, error) {
 	cutoff := time.Now().Add(-age).Unix()
+	graceTime := time.Now().Add(-gracePeriod)
+	totalDeleted := 0
 
-	// Get hashes of old transactions
-	hashes, err := s.client.ZRangeByScore(ctx, s.key(txCreatedAtSortedSet), &redis.ZRangeBy{
-		Min: "-inf",
-		Max: strconv.FormatInt(cutoff, 10),
-	}).Result()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get old transactions: %w", err)
-	}
-
-	if len(hashes) == 0 {
-		return 0, nil
-	}
-
-	// Delete each transaction, tracking failures
-	deleted := 0
-	var deleteErrors []string
-
-	for _, hashHex := range hashes {
-		hash := common.HexToHash(hashHex)
-		if err := s.Delete(ctx, hash); err != nil {
-			deleteErrors = append(deleteErrors, fmt.Sprintf("hash %s: %v", hashHex, err))
-			continue
+	for {
+		// Get hashes of old transactions with batch limit
+		rangeBy := &redis.ZRangeBy{
+			Min: "-inf",
+			Max: strconv.FormatInt(cutoff, 10),
 		}
-		deleted++
+		if batchSize > 0 {
+			rangeBy.Count = batchSize
+		}
+
+		hashes, err := s.client.ZRangeByScore(ctx, s.key(txTimestampSortedSet), rangeBy).Result()
+		if err != nil {
+			return totalDeleted, fmt.Errorf("failed to get old transactions: %w", err)
+		}
+
+		if len(hashes) == 0 {
+			break
+		}
+
+		// Batch get all transactions to know which indexes to clean up
+		keys := make([]string, len(hashes))
+		for i, h := range hashes {
+			keys[i] = s.key(txKeyPrefix, h)
+		}
+
+		results, err := s.client.MGet(ctx, keys...).Result()
+		if err != nil {
+			return totalDeleted, fmt.Errorf("failed to batch get transactions: %w", err)
+		}
+
+		// Build batch delete operations
+		pipe := s.client.TxPipeline()
+		deleted := 0
+		skipped := 0
+		var parseErrors []string
+		nonceKeysToCheck := make(map[string]struct{})
+
+		for i, result := range results {
+			hashHex := hashes[i]
+
+			if result == nil {
+				// Already deleted, just clean up indexes
+				pipe.ZRem(ctx, s.key(txTimestampSortedSet), hashHex)
+				pipe.SRem(ctx, s.key(txPendingSetKey), hashHex)
+				deleted++
+				continue
+			}
+
+			data, ok := result.(string)
+			if !ok {
+				parseErrors = append(parseErrors, fmt.Sprintf("hash %s: unexpected type %T", hashHex, result))
+				continue
+			}
+
+			tx, err := s.deserializePendingTx([]byte(data))
+			if err != nil {
+				parseErrors = append(parseErrors, fmt.Sprintf("hash %s: %v", hashHex, err))
+				// Still try to delete the corrupted data
+				pipe.Del(ctx, s.key(txKeyPrefix, hashHex))
+				pipe.ZRem(ctx, s.key(txTimestampSortedSet), hashHex)
+				pipe.SRem(ctx, s.key(txPendingSetKey), hashHex)
+				deleted++
+				continue
+			}
+
+			// Skip if the transaction was updated recently (within grace period)
+			// This prevents race conditions with concurrent UpdateStatus calls
+			if tx.UpdatedAt.After(graceTime) {
+				skipped++
+				// Remove from sorted set so we don't keep checking it
+				pipe.ZRem(ctx, s.key(txTimestampSortedSet), hashHex)
+				// Re-add with updated timestamp to maintain sorted set integrity
+				pipe.ZAdd(ctx, s.key(txTimestampSortedSet), redis.Z{
+					Score:  float64(tx.UpdatedAt.Unix()),
+					Member: hashHex,
+				})
+				continue
+			}
+
+			// Queue all delete operations
+			walletKey := s.walletPendingKey(tx.Wallet, tx.ChainID)
+			nonceKey := s.nonceIndexKey(tx.Wallet, tx.ChainID, tx.Nonce)
+
+			pipe.Del(ctx, s.key(txKeyPrefix, hashHex))
+			pipe.SRem(ctx, s.key(txPendingSetKey), hashHex)
+			pipe.SRem(ctx, walletKey, hashHex)
+			pipe.SRem(ctx, nonceKey, hashHex)
+			pipe.ZRem(ctx, s.key(txTimestampSortedSet), hashHex)
+			deleted++
+
+			// Track nonce keys for cleanup
+			nonceKeysToCheck[nonceKey] = struct{}{}
+		}
+
+		// Execute batch delete
+		_, err = pipe.Exec(ctx)
+		if err != nil {
+			return totalDeleted, fmt.Errorf("failed to execute batch delete: %w", err)
+		}
+
+		totalDeleted += deleted
+
+		// Clean up empty nonce index sets
+		if len(nonceKeysToCheck) > 0 {
+			if err := s.cleanupEmptyNonceIndexes(ctx, nonceKeysToCheck); err != nil {
+				// Log but don't fail - empty sets are just wasted memory, not data corruption
+				parseErrors = append(parseErrors, fmt.Sprintf("nonce index cleanup: %v", err))
+			}
+		}
+
+		// Return partial results with error if there were parse failures
+		if len(parseErrors) > 0 {
+			return totalDeleted, fmt.Errorf("encountered %d errors during delete: %s",
+				len(parseErrors), strings.Join(parseErrors, "; "))
+		}
+
+		// If we processed fewer than batch size, we're done
+		if batchSize == 0 || int64(len(hashes)) < batchSize {
+			break
+		}
+
+		// If we skipped all items in this batch, break to avoid infinite loop
+		if skipped == len(hashes) {
+			break
+		}
 	}
 
-	// Return partial results with error if there were deletion failures
-	if len(deleteErrors) > 0 {
-		return deleted, fmt.Errorf("failed to delete %d of %d transactions: %s",
-			len(deleteErrors), len(hashes), strings.Join(deleteErrors, "; "))
+	return totalDeleted, nil
+}
+
+// cleanupEmptyNonceIndexes removes nonce index sets that are now empty.
+func (s *TxStore) cleanupEmptyNonceIndexes(ctx context.Context, nonceKeys map[string]struct{}) error {
+	if len(nonceKeys) == 0 {
+		return nil
 	}
 
-	return deleted, nil
+	// Check cardinality of each set
+	pipe := s.client.Pipeline()
+	cardCmds := make(map[string]*redis.IntCmd, len(nonceKeys))
+	for key := range nonceKeys {
+		cardCmds[key] = pipe.SCard(ctx, key)
+	}
+	_, _ = pipe.Exec(ctx)
+
+	// Delete empty sets
+	var emptyKeys []string
+	for key, cmd := range cardCmds {
+		count, err := cmd.Result()
+		if err != nil {
+			continue // Skip on error
+		}
+		if count == 0 {
+			emptyKeys = append(emptyKeys, key)
+		}
+	}
+
+	if len(emptyKeys) > 0 {
+		return s.client.Del(ctx, emptyKeys...).Err()
+	}
+
+	return nil
 }
 
 // Helper methods

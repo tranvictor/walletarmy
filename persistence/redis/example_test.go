@@ -19,7 +19,7 @@ func Example_basicUsage() {
 		Password: "", // no password
 		DB:       0,
 	})
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Create separate stores for transactions and nonces
 	txStore := redisstore.NewTxStore(client)
@@ -42,7 +42,7 @@ func Example_multiTenant() {
 	client := redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
 	})
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Create separate stores for different applications/tenants
 	appATxStore := redisstore.NewTxStore(client, redisstore.WithTxStoreKeyPrefix("app-a"))
@@ -65,7 +65,7 @@ func Example_recovery() {
 	client := redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
 	})
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Create separate stores
 	txStore := redisstore.NewTxStore(client)
@@ -104,7 +104,7 @@ func Example_cleanup() {
 	client := redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
 	})
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	txStore := redisstore.NewTxStore(client)
 	ctx := context.Background()
@@ -124,12 +124,12 @@ func Example_separateRedisInstances() {
 	txClient := redis.NewClient(&redis.Options{
 		Addr: "redis-tx:6379",
 	})
-	defer txClient.Close()
+	defer func() { _ = txClient.Close() }()
 
 	nonceClient := redis.NewClient(&redis.Options{
 		Addr: "redis-nonce:6379",
 	})
-	defer nonceClient.Close()
+	defer func() { _ = nonceClient.Close() }()
 
 	txStore := redisstore.NewTxStore(txClient)
 	nonceStore := redisstore.NewNonceStore(nonceClient)
