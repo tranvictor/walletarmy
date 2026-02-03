@@ -143,3 +143,54 @@ func Example_separateRedisInstances() {
 	fmt.Println("Separate Redis instances configured")
 	// Output: Separate Redis instances configured
 }
+
+
+func Example_idempotencyStore() {
+	// Create Redis client
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	defer func() { _ = client.Close() }()
+
+	// Create idempotency store
+	idempotencyStore := NewIdempotencyStore(client)
+
+	_ = idempotencyStore
+	fmt.Println("Idempotency store created")
+	// Output: Idempotency store created
+}
+
+func Example_idempotencyStoreWithTTL() {
+	// Create Redis client
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	defer func() { _ = client.Close() }()
+
+	// Create store with TTL - records automatically expire after 24 hours
+	idempotencyStore := NewIdempotencyStore(client, WithIdempotencyStoreTTL(24*time.Hour))
+
+	_ = idempotencyStore
+	fmt.Println("Idempotency store with TTL created")
+	// Output: Idempotency store with TTL created
+}
+
+func Example_idempotencyStoreMultiTenant() {
+	// Create Redis client
+	client := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	defer func() { _ = client.Close() }()
+
+	// Create separate stores for different applications/tenants
+	appAStore := NewIdempotencyStore(client, WithIdempotencyStoreKeyPrefix("app-a"))
+	appBStore := NewIdempotencyStore(client, WithIdempotencyStoreKeyPrefix("app-b"))
+
+	// Each app has isolated storage for idempotency keys
+	_ = appAStore
+	_ = appBStore
+	fmt.Println("Multi-tenant idempotency stores created")
+	// Output: Multi-tenant idempotency stores created
+}
+
+

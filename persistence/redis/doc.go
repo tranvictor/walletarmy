@@ -1,9 +1,10 @@
 // Package redis provides Redis-based implementations of walletarmy persistence interfaces.
 //
 // This package enables crash-resilient transaction management by persisting transaction
-// and nonce state to Redis. It provides two separate store implementations:
+// and nonce state to Redis. It provides three separate store implementations:
 //   - TxStore: implements walletarmy.TxStore for transaction tracking
 //   - NonceStore: implements walletarmy.NonceStore for nonce state management
+//   - IdempotencyStore: implements idempotency.Store for preventing duplicate transactions
 //
 // # Basic Usage
 //
@@ -63,9 +64,13 @@
 //   - walletarmy:nonce:{wallet}:{chainID} - Nonce state (JSON)
 //   - walletarmy:nonce:all - Set of all wallet:chainID pairs
 //
+// IdempotencyStore uses the following key patterns:
+//
+//   - walletarmy:idempotency:{key} - Record data (JSON, with TTL for automatic expiration)
+//
 // # Thread Safety
 //
-// Both TxStore and NonceStore are thread-safe and can be used from multiple goroutines.
+// All stores are thread-safe and can be used from multiple goroutines.
 // Redis handles the underlying concurrency control.
 //
 // # Recovery
@@ -86,9 +91,25 @@
 //
 //	removed, err := nonceStore.Cleanup(ctx)
 //
+// # Idempotency Store
+//
+// The IdempotencyStore prevents duplicate transaction submissions by tracking
+// idempotency keys. Typical usage:
+//
+//	store := redisstore.NewIdempotencyStore(client)
+//
+//	// With TTL for automatic expiration
+//	store := redisstore.NewIdempotencyStore(client, redisstore.WithIdempotencyStoreTTL(24*time.Hour))
+//
+//	// Create a record (returns ErrDuplicateKey if key exists)
+//	record, err := store.Create(idempotencyKey)
+//	if err == idempotency.ErrDuplicateKey {
+//	    // Key already exists - check record.Status for current state
+//	}
+//
 // # Supported Redis Configurations
 //
-// Both stores work with:
+// All stores work with:
 //   - Standalone Redis
 //   - Redis Sentinel
 //   - Redis Cluster
