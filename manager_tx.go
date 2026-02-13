@@ -521,6 +521,8 @@ func (wm *WalletManager) executeTransactionAttempt(ctx context.Context, execCtx 
 	// simulate the tx at pending state to see if it will be reverted
 	r, readerErr := wm.Reader(execCtx.Network)
 	if readerErr != nil {
+		// Release the nonce since the tx was never broadcast
+		wm.ReleaseNonce(execCtx.From, execCtx.Network, builtTx.Nonce())
 		return &TxExecutionResult{
 			Transaction:  nil,
 			ShouldRetry:  false,
@@ -534,6 +536,8 @@ func (wm *WalletManager) executeTransactionAttempt(ctx context.Context, execCtx 
 		if isRevert {
 			return wm.handleEthCallRevertFailure(execCtx, errDecoder, builtTx, revertData, err)
 		} else {
+			// Release the nonce since the tx was never broadcast
+			wm.ReleaseNonce(execCtx.From, execCtx.Network, builtTx.Nonce())
 			err = errors.Join(ErrSimulatedTxFailed, fmt.Errorf("couldn't simulate tx at pending state. Detail: %w", err))
 			logger.WithFields(logger.Fields{
 				"tx_hash":         builtTx.Hash().Hex(),

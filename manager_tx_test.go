@@ -2751,3 +2751,152 @@ func TestSyncBroadcast_Timeout_TriggersMonitorFlow(t *testing.T) {
 
 	assert.Len(t, setup.Monitor.MakeWaitChannelCalls, 1, "Monitor should have been called after sync timeout")
 }
+
+// ============================================================
+// Nonce Leak Tests - Path 2 & 3
+// ============================================================
+
+// TestNonceLeak_NonRevertSimulationFailure_ShouldReleaseNonce tests that when
+// executeTransactionAttempt acquires a nonce internally (RetryNonce is nil on first attempt)
+// and then the simulation (EthCall) fails with a non-revert error, the nonce is released
+// so the next acquire gets the same nonce back.
+//
+// This is Path 2: BuildTx succeeds → simulation fails (non-revert) → nonce should be released.
+func TestNonceLeak_NonRevertSimulationFailure_ShouldReleaseNonce(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// Chain state: mined=5, pending=5 (no pending txs on node)
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Simulation fails with a non-revert error (e.g., network timeout)
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, fmt.Errorf("network connection timeout")
+	}
+
+	// First attempt: RetryNonce is nil, so BuildTx acquires nonce internally
+	execCtx := &TxExecutionContext{
+		NumRetries:    5,
+		TxType:        2,
+		From:          testAddr1,
+		To:            testAddr2,
+		Value:         oneEth,
+		GasLimit:      21000,
+		RetryGasPrice: 20.0,
+		RetryTipCap:   2.0,
+		Network:       networks.EthereumMainnet,
+		OldTxs:        make(map[string]*types.Transaction),
+		// RetryNonce is nil — simulates the first attempt in executeTransactionLoop
+	}
+
+	result := setup.WM.executeTransactionAttempt(context.Background(), execCtx, nil)
+
+	// Confirm it returned an error (simulation failed)
+	require.True(t, result.ShouldReturn)
+	require.Error(t, result.Error)
+	assert.True(t, errors.Is(result.Error, ErrSimulatedTxFailed))
+
+	// Now the key assertion: the nonce should have been released.
+	// If we acquire again with the same chain state, we should get nonce 5 again,
+	// NOT nonce 6 (which would mean nonce 5 was leaked).
+	nonce, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), nonce.Uint64(),
+		"Nonce should be 5 again after release; got %d means nonce was leaked", nonce.Uint64())
+}
+
+// TestNonceLeak_NonRevertSimulationFailure_CompoundsOverMultipleCalls tests that the
+// nonce leak from non-revert simulation failures compounds: each failed attempt
+// permanently increments the local nonce by 1, creating a growing gap between
+// the local tracker and the chain state.
+func TestNonceLeak_NonRevertSimulationFailure_CompoundsOverMultipleCalls(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// Chain state: mined=5, pending=5 (no pending txs on node)
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Simulation always fails with a non-revert error
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, fmt.Errorf("network connection timeout")
+	}
+
+	// Simulate 3 consecutive failed attempts via executeTransactionAttempt
+	for i := 0; i < 3; i++ {
+		execCtx := &TxExecutionContext{
+			NumRetries:    5,
+			TxType:        2,
+			From:          testAddr1,
+			To:            testAddr2,
+			Value:         oneEth,
+			GasLimit:      21000,
+			RetryGasPrice: 20.0,
+			RetryTipCap:   2.0,
+			Network:       networks.EthereumMainnet,
+			OldTxs:        make(map[string]*types.Transaction),
+			// RetryNonce is nil — each call acquires a new nonce internally
+		}
+
+		result := setup.WM.executeTransactionAttempt(context.Background(), execCtx, nil)
+		require.True(t, result.ShouldReturn, "attempt %d should return", i)
+		require.Error(t, result.Error, "attempt %d should error", i)
+	}
+
+	// After 3 failed simulation attempts, the chain state hasn't changed (mined=5, pending=5).
+	// If nonces are properly released, the next acquire should still return 5.
+	// If nonces are leaked, the local tracker has been ratcheted up to 7 (5, 6, 7 acquired and not released)
+	// and the next acquire would return 8.
+	nonce, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), nonce.Uint64(),
+		"Nonce should still be 5 after 3 failed simulations; got %d means %d nonces were leaked",
+		nonce.Uint64(), nonce.Uint64()-5)
+}
+
+// TestNonceLeak_NonRevertSimulationFailure_FullLoop_ShouldReleaseNonce tests the full
+// executeTransactionLoop to verify the defer cleanup releases the nonce when
+// simulation fails with a non-revert error on the first attempt (RetryNonce is nil).
+func TestNonceLeak_NonRevertSimulationFailure_FullLoop_ShouldReleaseNonce(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// Chain state: mined=5, pending=5 (no pending txs on node)
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Simulation fails with a non-revert error
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, fmt.Errorf("network connection timeout")
+	}
+
+	// Run through the full EnsureTxWithHooksContext which uses executeTransactionLoop
+	_, _, err := setup.WM.EnsureTxWithHooksContext(
+		context.Background(),
+		1,                  // numRetries
+		10*time.Millisecond, // sleepDuration
+		10*time.Millisecond, // txCheckInterval
+		2,                  // txType
+		testAddr1,
+		testAddr2,
+		oneEth,
+		21000, 0, // gasLimit, extraGasLimit
+		20, 0,    // gasPrice, extraGasPrice
+		2, 0,     // tipCapGwei, extraTipCapGwei
+		0, 0,     // maxGasPrice, maxTipCap
+		nil,      // data
+		networks.EthereumMainnet,
+		nil, nil, // hooks
+		nil, nil, // abis, gasEstimationFailedHook
+		nil, nil, // simulationFailedHook, txMinedHook
+	)
+
+	// Should fail with simulation error
+	require.Error(t, err)
+
+	// The critical check: acquire a nonce again and verify it's 5, not 6.
+	// If the loop's defer didn't release the nonce, the local tracker will
+	// have stored nonce 5 and the next acquire will return 6.
+	nonce, acquireErr := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+	require.NoError(t, acquireErr)
+	assert.Equal(t, uint64(5), nonce.Uint64(),
+		"Nonce should be 5 after the failed EnsureTx released it; got %d means the nonce was leaked by executeTransactionLoop", nonce.Uint64())
+}
