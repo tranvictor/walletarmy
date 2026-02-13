@@ -3158,3 +3158,319 @@ func TestHandleTransactionStatus_Slow_NonBlockingNonce_JustWaits(t *testing.T) {
 	assert.Equal(t, 0.0, execCtx.RetryTipCap, "Tip cap should NOT be bumped for non-blocking slow tx")
 	assert.Nil(t, execCtx.RetryNonce, "RetryNonce should remain nil — keep monitoring the same tx")
 }
+
+// ============================================================
+// Nonce Gap Detection Tests
+// ============================================================
+//
+// When localPendingNonce > remotePendingNonce, there may be nonces in the
+// [remotePending, localPending) range that were acquired (via BuildTx) but
+// never broadcast. The gap detection scans TxStore for each nonce in that
+// range and returns the first missing nonce instead of blindly using localPending.
+
+// newTestSetupWithTxStore creates a test setup that includes a TxStore,
+// needed for nonce gap detection tests.
+func newTestSetupWithTxStore(t *testing.T) (*testSetup, *mockTxStore) {
+	t.Helper()
+
+	reader := &mockEthReader{
+		GetMinedNonceFn:        func(addr string) (uint64, error) { return 0, nil },
+		GetPendingNonceFn:      func(addr string) (uint64, error) { return 0, nil },
+		SuggestedGasSettingsFn: func() (float64, float64, error) { return 20.0, 2.0, nil },
+		EthCallFn: func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+			return nil, nil
+		},
+		TxInfoFromHashFn: func(hash string) (TxInfo, error) {
+			return TxInfo{Status: "pending"}, nil
+		},
+	}
+
+	broadcaster := &mockEthBroadcaster{}
+	monitor := &mockTxMonitor{
+		StatusToReturn: TxMonitorStatus{Status: "done"},
+	}
+	txStore := newMockTxStore()
+
+	wm := NewWalletManager(
+		WithReaderFactory(func(network networks.Network) (EthReader, error) {
+			return reader, nil
+		}),
+		WithBroadcasterFactory(func(network networks.Network) (EthBroadcaster, error) {
+			return broadcaster, nil
+		}),
+		WithTxMonitorFactory(func(r EthReader) TxMonitor {
+			return monitor
+		}),
+		WithTxStore(txStore),
+	)
+
+	_, err := wm.Reader(networks.EthereumMainnet)
+	require.NoError(t, err)
+
+	return &testSetup{
+		WM:          wm,
+		Reader:      reader,
+		Broadcaster: broadcaster,
+		Monitor:     monitor,
+	}, txStore
+}
+
+// TestAcquireNonce_GapDetection_FillsGap tests that when local nonce is ahead
+// of remote pending nonce and a nonce in the range has no tx in the TxStore,
+// acquireNonce returns that gap nonce instead of the local pending nonce.
+func TestAcquireNonce_GapDetection_FillsGap(t *testing.T) {
+	setup, txStore := newTestSetupWithTxStore(t)
+
+	// Chain state: mined=5, remotePending=5 (no pending on nodes)
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Local tracker has advanced to nonce 8 (nonces 5, 6, 7 were acquired)
+	setup.WM.nonceTracker.SetPendingNonce(testAddr1, networks.EthereumMainnet.GetChainID(), networks.EthereumMainnet.GetName(), 7)
+
+	// TxStore has txs for nonces 5 and 7, but NOT 6 — nonce 6 is the gap
+	ctx := context.Background()
+	_ = txStore.Save(ctx, &PendingTx{
+		Hash:    common.HexToHash("0xaaa"),
+		Wallet:  testAddr1,
+		ChainID: networks.EthereumMainnet.GetChainID(),
+		Nonce:   5,
+		Status:  PendingTxStatusBroadcasted,
+	})
+	_ = txStore.Save(ctx, &PendingTx{
+		Hash:    common.HexToHash("0xbbb"),
+		Wallet:  testAddr1,
+		ChainID: networks.EthereumMainnet.GetChainID(),
+		Nonce:   7,
+		Status:  PendingTxStatusBroadcasted,
+	})
+
+	nonce, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+	require.NoError(t, err)
+
+	// Should return nonce 6 (the gap), not 8 (the next local nonce)
+	assert.Equal(t, uint64(6), nonce.Uint64(),
+		"Should fill the gap at nonce 6 instead of using local pending nonce 8")
+}
+
+// TestAcquireNonce_GapDetection_NoGap_UsesLocalPending tests that when all nonces
+// in [remotePending, localPending) are present in TxStore, acquireNonce returns
+// the next local pending nonce as usual.
+func TestAcquireNonce_GapDetection_NoGap_UsesLocalPending(t *testing.T) {
+	setup, txStore := newTestSetupWithTxStore(t)
+
+	// Chain state: mined=5, remotePending=5
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Local tracker at nonce 7 (nonces 5, 6, 7 were acquired)
+	setup.WM.nonceTracker.SetPendingNonce(testAddr1, networks.EthereumMainnet.GetChainID(), networks.EthereumMainnet.GetName(), 7)
+
+	// TxStore has txs for ALL nonces 5, 6, 7 — no gap
+	ctx := context.Background()
+	for i := uint64(5); i <= 7; i++ {
+		_ = txStore.Save(ctx, &PendingTx{
+			Hash:    common.BigToHash(big.NewInt(int64(i))),
+			Wallet:  testAddr1,
+			ChainID: networks.EthereumMainnet.GetChainID(),
+			Nonce:   i,
+			Status:  PendingTxStatusBroadcasted,
+		})
+	}
+
+	nonce, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+	require.NoError(t, err)
+
+	// All nonces accounted for — should get next nonce (8)
+	assert.Equal(t, uint64(8), nonce.Uint64(),
+		"No gap — should acquire the next local pending nonce")
+}
+
+// TestAcquireNonce_GapDetection_MultipleGaps_FillsLowest tests that when there
+// are multiple gaps, the lowest gap nonce is returned first.
+func TestAcquireNonce_GapDetection_MultipleGaps_FillsLowest(t *testing.T) {
+	setup, txStore := newTestSetupWithTxStore(t)
+
+	// Chain state: mined=5, remotePending=5
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Local tracker at nonce 9 (nonces 5-9 were acquired)
+	setup.WM.nonceTracker.SetPendingNonce(testAddr1, networks.EthereumMainnet.GetChainID(), networks.EthereumMainnet.GetName(), 9)
+
+	// TxStore has nonces 5, 7, 9 — gaps at 6 and 8
+	ctx := context.Background()
+	for _, n := range []uint64{5, 7, 9} {
+		_ = txStore.Save(ctx, &PendingTx{
+			Hash:    common.BigToHash(big.NewInt(int64(n))),
+			Wallet:  testAddr1,
+			ChainID: networks.EthereumMainnet.GetChainID(),
+			Nonce:   n,
+			Status:  PendingTxStatusBroadcasted,
+		})
+	}
+
+	nonce, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+	require.NoError(t, err)
+
+	// Should return the lowest gap: nonce 6
+	assert.Equal(t, uint64(6), nonce.Uint64(),
+		"Should fill the lowest gap at nonce 6")
+}
+
+// TestAcquireNonce_GapDetection_NoTxStore_SkipsCheck tests that when no TxStore
+// is configured, gap detection is skipped and normal nonce logic applies.
+func TestAcquireNonce_GapDetection_NoTxStore_SkipsCheck(t *testing.T) {
+	setup := newTestSetup(t) // No TxStore
+
+	// Chain state: mined=5, remotePending=5
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Local tracker at nonce 7
+	setup.WM.nonceTracker.SetPendingNonce(testAddr1, networks.EthereumMainnet.GetChainID(), networks.EthereumMainnet.GetName(), 7)
+
+	nonce, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+	require.NoError(t, err)
+
+	// Without TxStore, should use local pending (8) — no gap detection
+	assert.Equal(t, uint64(8), nonce.Uint64(),
+		"Without TxStore, should use normal nonce logic (local pending)")
+}
+
+// TestAcquireNonce_GapDetection_WithPendingOnNodes tests gap detection when
+// there ARE pending txs on nodes (remotePending > mined) and local is even higher.
+func TestAcquireNonce_GapDetection_WithPendingOnNodes(t *testing.T) {
+	setup, txStore := newTestSetupWithTxStore(t)
+
+	// Chain state: mined=5, remotePending=7 (2 pending txs on nodes)
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 7, nil }
+
+	// Local tracker at nonce 9 (local has nonces 7, 8, 9 beyond what node sees)
+	setup.WM.nonceTracker.SetPendingNonce(testAddr1, networks.EthereumMainnet.GetChainID(), networks.EthereumMainnet.GetName(), 9)
+
+	// TxStore has nonces 7 and 9, but NOT 8
+	ctx := context.Background()
+	for _, n := range []uint64{7, 9} {
+		_ = txStore.Save(ctx, &PendingTx{
+			Hash:    common.BigToHash(big.NewInt(int64(n))),
+			Wallet:  testAddr1,
+			ChainID: networks.EthereumMainnet.GetChainID(),
+			Nonce:   n,
+			Status:  PendingTxStatusBroadcasted,
+		})
+	}
+
+	nonce, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+	require.NoError(t, err)
+
+	// Gap at nonce 8 — should be filled
+	assert.Equal(t, uint64(8), nonce.Uint64(),
+		"Should fill gap at nonce 8 between remote pending and local pending")
+}
+
+// TestAcquireNonce_GapDetection_ConsecutiveCallsFillGaps tests that calling
+// acquireNonce repeatedly fills consecutive gaps one by one.
+func TestAcquireNonce_GapDetection_ConsecutiveCallsFillGaps(t *testing.T) {
+	setup, txStore := newTestSetupWithTxStore(t)
+
+	// Chain state: mined=5, remotePending=5
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Local tracker at nonce 8 (nonces 5-8 acquired)
+	setup.WM.nonceTracker.SetPendingNonce(testAddr1, networks.EthereumMainnet.GetChainID(), networks.EthereumMainnet.GetName(), 8)
+
+	// Only nonce 5 is in TxStore — gaps at 6, 7, 8
+	ctx := context.Background()
+	_ = txStore.Save(ctx, &PendingTx{
+		Hash:    common.HexToHash("0xaaa"),
+		Wallet:  testAddr1,
+		ChainID: networks.EthereumMainnet.GetChainID(),
+		Nonce:   5,
+		Status:  PendingTxStatusBroadcasted,
+	})
+
+	// First call: should get nonce 6 (first gap)
+	nonce1, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(6), nonce1.Uint64(), "First call should fill gap at nonce 6")
+
+	// Simulate that nonce 6 was broadcast (add to TxStore)
+	_ = txStore.Save(ctx, &PendingTx{
+		Hash:    common.HexToHash("0xbbb"),
+		Wallet:  testAddr1,
+		ChainID: networks.EthereumMainnet.GetChainID(),
+		Nonce:   6,
+		Status:  PendingTxStatusBroadcasted,
+	})
+
+	// Second call: should get nonce 7 (next gap)
+	nonce2, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(7), nonce2.Uint64(), "Second call should fill gap at nonce 7")
+
+	// Simulate nonce 7 broadcast
+	_ = txStore.Save(ctx, &PendingTx{
+		Hash:    common.HexToHash("0xccc"),
+		Wallet:  testAddr1,
+		ChainID: networks.EthereumMainnet.GetChainID(),
+		Nonce:   7,
+		Status:  PendingTxStatusBroadcasted,
+	})
+
+	// Third call: should get nonce 8 (next gap)
+	nonce3, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(8), nonce3.Uint64(), "Third call should fill gap at nonce 8")
+}
+
+// TestBuildTx_GapDetection_FillsGapBeforeAdvancing tests that BuildTx with
+// a TxStore fills nonce gaps. When a user calls BuildTx without specifying
+// a nonce, and there's a gap in the TxStore, the gap nonce is returned.
+func TestBuildTx_GapDetection_FillsGapBeforeAdvancing(t *testing.T) {
+	setup, txStore := newTestSetupWithTxStore(t)
+
+	// Chain state: mined=5, remotePending=5
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Local tracker at nonce 7
+	setup.WM.nonceTracker.SetPendingNonce(testAddr1, networks.EthereumMainnet.GetChainID(), networks.EthereumMainnet.GetName(), 7)
+
+	// TxStore has nonce 5 and 7, gap at 6
+	ctx := context.Background()
+	_ = txStore.Save(ctx, &PendingTx{
+		Hash:    common.HexToHash("0xaaa"),
+		Wallet:  testAddr1,
+		ChainID: networks.EthereumMainnet.GetChainID(),
+		Nonce:   5,
+		Status:  PendingTxStatusBroadcasted,
+	})
+	_ = txStore.Save(ctx, &PendingTx{
+		Hash:    common.HexToHash("0xbbb"),
+		Wallet:  testAddr1,
+		ChainID: networks.EthereumMainnet.GetChainID(),
+		Nonce:   7,
+		Status:  PendingTxStatusBroadcasted,
+	})
+
+	tx, err := setup.WM.BuildTx(
+		2, // EIP-1559
+		testAddr1, testAddr2,
+		nil, // nonce = nil → auto-acquire
+		oneEth,
+		21000, 0,
+		20.0, 0,
+		2.0, 0,
+		nil,
+		networks.EthereumMainnet,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+
+	// The built tx should use nonce 6 (the gap), not 8
+	assert.Equal(t, uint64(6), tx.Nonce(),
+		"BuildTx should fill nonce gap at 6 instead of advancing to 8")
+}

@@ -27,9 +27,11 @@ func (wm *WalletManager) pendingNonce(wallet common.Address, network networks.Ne
 // Logic:
 //  1. Get remote pending nonce and mined nonce from the network
 //  2. Compare with local pending nonce to determine the correct next nonce
-//  3. Atomically reserve the nonce by incrementing local pending nonce
-//  4. Persist the nonce acquisition (if persistence is enabled)
-//  5. Return the reserved nonce
+//  3. If local > remote and a TxStore is configured, scan for nonce gaps
+//     (nonces acquired via BuildTx but never broadcast) and fill the first gap
+//  4. Atomically reserve the nonce by incrementing local pending nonce
+//  5. Persist the nonce acquisition (if persistence is enabled)
+//  6. Return the reserved nonce
 func (wm *WalletManager) acquireNonce(wallet common.Address, network networks.Network) (*big.Int, error) {
 	// Get remote nonces first (before acquiring lock to avoid holding lock during network calls)
 	r, err := wm.Reader(network)
@@ -45,6 +47,26 @@ func (wm *WalletManager) acquireNonce(wallet common.Address, network networks.Ne
 	remotePendingNonce, err := r.GetPendingNonce(wallet.Hex())
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get remote pending nonce in context manager: %s", err)
+	}
+
+	// Check for nonce gaps before delegating to the tracker.
+	// If local pending > remote pending, there may be nonces that were acquired
+	// (via BuildTx) but never broadcast. Scan the TxStore to find and fill gaps.
+	if wm.txStore != nil {
+		localPending := wm.nonceTracker.GetPendingNonce(wallet, network.GetChainID())
+		if localPending != nil {
+			localNonce := localPending.Uint64()
+			if localNonce > remotePendingNonce {
+				gapNonce, found := wm.findNonceGap(wallet, network.GetChainID(), remotePendingNonce, localNonce)
+				if found {
+					// Reserve this gap nonce — the tracker doesn't need to advance
+					// because the gap nonce is below the current local pending.
+					wm.persistNonceAcquisition(wallet, network.GetChainID(), gapNonce)
+
+					return big.NewInt(int64(gapNonce)), nil
+				}
+			}
+		}
 	}
 
 	// Delegate to the nonce tracker
@@ -63,6 +85,24 @@ func (wm *WalletManager) acquireNonce(wallet common.Address, network networks.Ne
 	wm.persistNonceAcquisition(wallet, network.GetChainID(), result.Nonce)
 
 	return big.NewInt(int64(result.Nonce)), nil
+}
+
+// findNonceGap scans the TxStore for the first nonce in [from, to) that has no
+// associated transaction. Returns the gap nonce and true if found, or 0 and false
+// if all nonces in the range are accounted for.
+func (wm *WalletManager) findNonceGap(wallet common.Address, chainID uint64, from, to uint64) (uint64, bool) {
+	ctx := context.Background()
+	for n := from; n < to; n++ {
+		txs, err := wm.txStore.GetByNonce(ctx, wallet, chainID, n)
+		if err != nil {
+			// If we can't check, skip this nonce — don't fill what we can't verify
+			continue
+		}
+		if len(txs) == 0 {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 // ReleaseNonce releases a previously acquired nonce that was not used.
