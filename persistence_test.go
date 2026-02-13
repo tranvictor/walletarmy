@@ -1309,7 +1309,8 @@ func TestRecoveryFlow_FullIntegration_SlowTx_GasBump_Replacement(t *testing.T) {
 	err = txStore.Save(context.Background(), pendingTx)
 	require.NoError(t, err)
 
-	// Save nonce state
+	// Save nonce state — nonce 5 is "blocking" because it equals the mined nonce,
+	// which is the next nonce the chain expects. This triggers the slow tx gas bump.
 	savedNonce := originalNonce
 	err = nonceStore.Save(context.Background(), &NonceState{
 		Wallet:            fromAddr,

@@ -660,23 +660,34 @@ func TestHandleTransactionStatus_Reverted(t *testing.T) {
 func TestHandleTransactionStatus_Lost_Retries(t *testing.T) {
 	setup := newTestSetup(t)
 
-	tx := newTestTx(5, testAddr2, oneEth)
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(1),
+	)
 
 	execCtx := &TxExecutionContext{
 		NumRetries:       5,
 		ActualRetryCount: 0,
+		MaxGasPrice:      100.0,
+		MaxTipCap:        50.0,
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
 
 	assert.False(t, result.ShouldReturn)
 	assert.True(t, result.ShouldRetry)
-	assert.Equal(t, 1, execCtx.ActualRetryCount)
-	assert.Nil(t, execCtx.RetryNonce) // Should get new nonce
+	// Lost tx should retry with the same nonce and bumped gas
+	require.NotNil(t, execCtx.RetryNonce)
+	assert.Equal(t, big.NewInt(5), execCtx.RetryNonce)
 }
 
 func TestHandleTransactionStatus_Slow_BumpsGas(t *testing.T) {
 	setup := newTestSetup(t)
+
+	// Make this a blocking nonce so gas gets bumped (nonce == minedNonce)
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
 
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
 		big.NewInt(2000000000),  // 2 gwei
@@ -685,6 +696,8 @@ func TestHandleTransactionStatus_Slow_BumpsGas(t *testing.T) {
 	)
 
 	execCtx := &TxExecutionContext{
+		From:        testAddr1,
+		Network:     networks.EthereumMainnet,
 		MaxGasPrice: 100.0,
 		MaxTipCap:   50.0,
 	}
@@ -700,6 +713,10 @@ func TestHandleTransactionStatus_Slow_BumpsGas(t *testing.T) {
 func TestHandleTransactionStatus_Slow_HitsLimit(t *testing.T) {
 	setup := newTestSetup(t)
 
+	// Make this a blocking nonce so gas bump is attempted (and hits limit)
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
 		big.NewInt(2000000000),
 		big.NewInt(20000000000),
@@ -707,6 +724,8 @@ func TestHandleTransactionStatus_Slow_HitsLimit(t *testing.T) {
 	)
 
 	execCtx := &TxExecutionContext{
+		From:        testAddr1,
+		Network:     networks.EthereumMainnet,
 		MaxGasPrice: 22.0, // Low limit
 		MaxTipCap:   50.0,
 	}
@@ -1960,19 +1979,13 @@ func TestEnsureTx_SyncTx_ReturnsImmediately(t *testing.T) {
 	require.NotNil(t, receipt)
 }
 
-func TestEnsureTx_LostTx_RetriesWithNewNonce(t *testing.T) {
+func TestEnsureTx_LostTx_RetriesWithSameNonceAndBumpedGas(t *testing.T) {
 	setup := setupEnsureTxTest(t)
 
 	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
 
-	nonceCall := 0
-	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) {
-		nonceCall++
-		return uint64(nonceCall - 1), nil // Increment each call to simulate progression
-	}
-	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) {
-		return uint64(nonceCall - 1), nil
-	}
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
 	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil
 	}
@@ -2003,7 +2016,13 @@ func TestEnsureTx_LostTx_RetriesWithNewNonce(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, tx)
 	require.NotNil(t, receipt)
-	assert.GreaterOrEqual(t, len(broadcastedNonces), 2, "should have broadcast multiple times")
+	require.GreaterOrEqual(t, len(broadcastedNonces), 2, "should have broadcast multiple times")
+
+	// All broadcasts should use the same nonce — lost tx retries with same nonce
+	for i, n := range broadcastedNonces {
+		assert.Equal(t, broadcastedNonces[0], n,
+			"broadcast %d should use the same nonce as the first, got %d vs %d", i, n, broadcastedNonces[0])
+	}
 }
 
 func TestEnsureTx_AfterSignAndBroadcastHook_CalledOnSuccess(t *testing.T) {
@@ -2899,4 +2918,243 @@ func TestNonceLeak_NonRevertSimulationFailure_FullLoop_ShouldReleaseNonce(t *tes
 	require.NoError(t, acquireErr)
 	assert.Equal(t, uint64(5), nonce.Uint64(),
 		"Nonce should be 5 after the failed EnsureTx released it; got %d means the nonce was leaked by executeTransactionLoop", nonce.Uint64())
+}
+
+// ============================================================
+// Lost Transaction Handler Tests
+// ============================================================
+
+// TestHandleTransactionStatus_Lost_RetriesWithSameNonce tests that when a
+// transaction is detected as "lost" (dropped from mempool), the handler
+// retries with the SAME nonce and bumped gas, not a brand new nonce.
+// A lost tx means the mempool dropped it — re-broadcasting with the same
+// nonce and higher gas is the correct response.
+func TestHandleTransactionStatus_Lost_RetriesWithSameNonce(t *testing.T) {
+	setup := newTestSetup(t)
+
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(1),
+	)
+
+	execCtx := &TxExecutionContext{
+		NumRetries:       5,
+		ActualRetryCount: 0,
+		MaxGasPrice:      100.0,
+		MaxTipCap:        50.0,
+	}
+
+	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
+
+	assert.False(t, result.ShouldReturn)
+	assert.True(t, result.ShouldRetry)
+
+	// The key assertion: RetryNonce should be set to the SAME nonce (5),
+	// not nil (which would cause a new nonce to be acquired).
+	require.NotNil(t, execCtx.RetryNonce,
+		"RetryNonce should be set to the lost tx's nonce, not nil")
+	assert.Equal(t, big.NewInt(5), execCtx.RetryNonce,
+		"RetryNonce should be the same nonce as the lost tx")
+
+	// Gas should be bumped (same behavior as slow tx)
+	assert.Greater(t, execCtx.RetryGasPrice, 20.0,
+		"Gas price should be bumped for lost tx retry")
+	assert.Greater(t, execCtx.RetryTipCap, 2.0,
+		"Tip cap should be bumped for lost tx retry")
+}
+
+// TestHandleTransactionStatus_Lost_HitsGasLimit tests that when a lost tx
+// retry would exceed gas price limits, it returns an error instead of
+// retrying forever.
+func TestHandleTransactionStatus_Lost_HitsGasLimit(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// Chain state: mined=5, but the lost tx is also nonce 5.
+	// No higher local nonces, so it's NOT blocking — should respect gas limit.
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(1),
+	)
+
+	execCtx := &TxExecutionContext{
+		NumRetries:       5,
+		ActualRetryCount: 0,
+		From:             testAddr1,
+		Network:          networks.EthereumMainnet,
+		MaxGasPrice:      22.0, // Low limit — bumping 20 gwei by 10% = 22, which hits limit
+		MaxTipCap:        50.0,
+	}
+
+	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
+
+	assert.True(t, result.ShouldReturn,
+		"Should return when gas limit reached for non-blocking lost tx")
+	assert.False(t, result.ShouldRetry)
+	assert.True(t, errors.Is(result.Error, ErrGasPriceLimitReached))
+}
+
+// TestEnsureTx_LostTx_RetriesWithSameNonce is an integration test that verifies
+// the full EnsureTx flow re-broadcasts a lost transaction with the same nonce
+// and higher gas, rather than acquiring a new nonce.
+func TestEnsureTx_LostTx_RetriesWithSameNonce(t *testing.T) {
+	setup := setupEnsureTxTest(t)
+
+	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil
+	}
+
+	broadcastedNonces := []uint64{}
+	var mu sync.Mutex
+	setup.Broadcaster.BroadcastTxFn = func(tx *types.Transaction) (string, bool, error) {
+		mu.Lock()
+		broadcastedNonces = append(broadcastedNonces, tx.Nonce())
+		mu.Unlock()
+		return tx.Hash().Hex(), true, nil
+	}
+
+	// First tx is "lost", second is mined
+	setup.Monitor.StatusSequence = []TxMonitorStatus{
+		{Status: "lost"},
+		{Status: "done", Receipt: &types.Receipt{Status: types.ReceiptStatusSuccessful}},
+	}
+
+	ctx := context.Background()
+	tx, receipt, err := setup.WM.EnsureTxWithHooksContext(
+		ctx,
+		5, time.Millisecond, time.Millisecond,
+		2, fromAddr, testAddr2, oneEth,
+		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		nil, networks.BSCMainnet,
+		nil, nil, nil, nil, nil, nil,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	require.NotNil(t, receipt)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(broadcastedNonces), 2,
+		"should have broadcast at least twice (original + retry)")
+
+	// The critical assertion: ALL broadcasts should use the SAME nonce.
+	// The lost tx should be retried with the same nonce, not a new one.
+	for i, n := range broadcastedNonces {
+		assert.Equal(t, broadcastedNonces[0], n,
+			"broadcast %d should use the same nonce as the first broadcast, got nonce %d vs %d",
+			i, n, broadcastedNonces[0])
+	}
+}
+
+// ============================================================
+// Blocking Nonce Tests — Lost Tx with Gas Limit Reached
+// ============================================================
+
+// TestHandleTransactionStatus_Lost_HitsGasLimit_RespectsLimit tests that when
+// a lost transaction reaches the gas price protection limit, it stops retrying.
+// No 2x bypass — users should set aggressive limits since gas bumping only
+// applies to one transaction at a time.
+func TestHandleTransactionStatus_Lost_HitsGasLimit_RespectsLimit(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// Even if this is a blocking nonce, gas limit is respected
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(1),
+	)
+
+	execCtx := &TxExecutionContext{
+		NumRetries:  5,
+		From:        testAddr1,
+		Network:     networks.EthereumMainnet,
+		MaxGasPrice: 22.0, // Low limit — gas bumping will exceed this
+		MaxTipCap:   2.5,
+	}
+
+	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
+
+	assert.True(t, result.ShouldReturn)
+	assert.False(t, result.ShouldRetry)
+	assert.True(t, errors.Is(result.Error, ErrGasPriceLimitReached))
+}
+
+// ============================================================
+// Slow Tx — Only Bump Gas for Blocking Nonces
+// ============================================================
+
+// TestHandleTransactionStatus_Slow_BlockingNonce_BumpsGas tests that a slow tx
+// with a blocking nonce (nonce == minedNonce, the next the chain expects) gets
+// its gas price bumped.
+func TestHandleTransactionStatus_Slow_BlockingNonce_BumpsGas(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// Chain state: mined=5 — nonce 5 is the next expected, so tx with nonce 5 is blocking
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(1),
+	)
+
+	execCtx := &TxExecutionContext{
+		From:        testAddr1,
+		Network:     networks.EthereumMainnet,
+		MaxGasPrice: 100.0,
+		MaxTipCap:   50.0,
+	}
+
+	result := setup.WM.handleTransactionStatus(TxInfo{Status: "slow"}, tx, execCtx)
+
+	assert.False(t, result.ShouldReturn)
+	assert.True(t, result.ShouldRetry)
+	assert.Greater(t, execCtx.RetryGasPrice, 20.0, "Gas price should be bumped for blocking slow tx")
+	assert.Greater(t, execCtx.RetryTipCap, 2.0, "Tip cap should be bumped for blocking slow tx")
+}
+
+// TestHandleTransactionStatus_Slow_NonBlockingNonce_JustWaits tests that a slow tx
+// whose nonce is NOT blocking (nonce != minedNonce) does NOT get gas bumped.
+// Instead it just continues waiting (retry with same gas).
+func TestHandleTransactionStatus_Slow_NonBlockingNonce_JustWaits(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// Chain state: mined=3 — nonce 3 is next, our tx is nonce 5 (not blocking)
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 3, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 3, nil }
+
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(1),
+	)
+
+	execCtx := &TxExecutionContext{
+		From:        testAddr1,
+		Network:     networks.EthereumMainnet,
+		MaxGasPrice: 100.0,
+		MaxTipCap:   50.0,
+	}
+
+	result := setup.WM.handleTransactionStatus(TxInfo{Status: "slow"}, tx, execCtx)
+
+	// Should retry (keep waiting) but NOT bump gas
+	assert.False(t, result.ShouldReturn)
+	assert.True(t, result.ShouldRetry)
+	assert.Equal(t, 0.0, execCtx.RetryGasPrice, "Gas price should NOT be bumped for non-blocking slow tx")
+	assert.Equal(t, 0.0, execCtx.RetryTipCap, "Tip cap should NOT be bumped for non-blocking slow tx")
+	assert.Nil(t, execCtx.RetryNonce, "RetryNonce should remain nil — keep monitoring the same tx")
 }

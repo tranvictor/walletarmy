@@ -92,6 +92,29 @@ func (wm *WalletManager) persistNonceAcquisition(wallet common.Address, chainID 
 	_ = wm.nonceStore.SavePendingNonce(ctx, wallet, chainID, nonce)
 }
 
+// isBlockingNonce checks whether the given nonce is the next nonce the chain
+// expects to process. A blocking nonce is one that equals the current mined nonce —
+// it must be confirmed before any higher-nonce transactions can proceed.
+//
+// Since gas bumping is only applied to this single transaction (not all queued txs),
+// users should set gas protection limits aggressively enough for the blocking nonce.
+//
+// If we can't determine the chain state (reader error), we assume it's not blocking
+// to avoid being overly aggressive with gas.
+func (wm *WalletManager) isBlockingNonce(nonce uint64, wallet common.Address, network networks.Network) bool {
+	r, err := wm.Reader(network)
+	if err != nil {
+		return false
+	}
+
+	minedNonce, err := r.GetMinedNonce(wallet.Hex())
+	if err != nil {
+		return false
+	}
+
+	return nonce == minedNonce
+}
+
 // persistNonceRelease persists a nonce release to the nonce store
 func (wm *WalletManager) persistNonceRelease(wallet common.Address, chainID uint64, nonce uint64) {
 	if wm.nonceStore == nil {

@@ -1034,31 +1034,9 @@ func (wm *WalletManager) handleTransactionStatus(status TxInfo, signedTx *types.
 		return wm.handleMinedTx(signedTx, status, execCtx)
 
 	case TxStatusLost:
-		logger.WithFields(logger.Fields{
-			"tx_hash": signedTx.Hash().Hex(),
-		}).Info("Transaction lost, retrying...")
-
-		execCtx.ActualRetryCount++
-		if execCtx.ActualRetryCount > execCtx.NumRetries {
-			return &TxExecutionResult{
-				Transaction:  nil,
-				ShouldRetry:  false,
-				ShouldReturn: true,
-				Error:        errors.Join(ErrEnsureTxOutOfRetries, fmt.Errorf("transaction lost after %d retries", execCtx.NumRetries)),
-			}
-		}
-		execCtx.RetryNonce = nil
-
-		// Sleep will be handled in main loop based on actualRetryCount
-		return &TxExecutionResult{
-			Transaction:  nil,
-			ShouldRetry:  true,
-			ShouldReturn: false,
-			Error:        nil,
-		}
-
-	case TxStatusSlow:
-		// Try to adjust gas prices for slow transaction
+		// Transaction was dropped from the mempool. Re-broadcast with the same nonce
+		// and higher gas, similar to the "slow" handler. Acquiring a new nonce would
+		// create a gap that can never be filled.
 		if execCtx.AdjustGasPricesForSlowTx(signedTx) {
 			gasPriceIncrease := execCtx.GasPriceIncreasePercent
 			if gasPriceIncrease == 0 {
@@ -1070,10 +1048,66 @@ func (wm *WalletManager) handleTransactionStatus(status TxInfo, signedTx *types.
 			}
 			logger.WithFields(logger.Fields{
 				"tx_hash": signedTx.Hash().Hex(),
-			}).Info(fmt.Sprintf("Transaction slow, continuing to monitor with increased gas price by %.0f%% and tip cap by %.0f%%...",
+				"nonce":   signedTx.Nonce(),
+			}).Info(fmt.Sprintf("Transaction lost, retrying with same nonce and increased gas price by %.0f%% and tip cap by %.0f%%...",
 				(gasPriceIncrease-1)*100, (tipCapIncrease-1)*100))
 
-			// Continue retrying with adjusted gas prices
+			return &TxExecutionResult{
+				Transaction:  nil,
+				ShouldRetry:  true,
+				ShouldReturn: false,
+				Error:        nil,
+			}
+		}
+
+		logger.WithFields(logger.Fields{
+			"tx_hash":       signedTx.Hash().Hex(),
+			"nonce":         signedTx.Nonce(),
+			"max_gas_price": execCtx.MaxGasPrice,
+			"max_tip_cap":   execCtx.MaxTipCap,
+		}).Warn("Transaction lost but gas price protection limits reached. Stopping retry attempts.")
+
+		return &TxExecutionResult{
+			Transaction:  signedTx,
+			ShouldRetry:  false,
+			ShouldReturn: true,
+			Error:        errors.Join(ErrGasPriceLimitReached, fmt.Errorf("transaction lost, maxGasPrice: %f, maxTipCap: %f", execCtx.MaxGasPrice, execCtx.MaxTipCap)),
+		}
+
+	case TxStatusSlow:
+		// Only bump gas if this nonce is blocking higher-nonce transactions.
+		// Non-blocking slow txs just keep waiting — they'll get mined once
+		// the blocking nonce ahead of them is resolved.
+		if !wm.isBlockingNonce(signedTx.Nonce(), execCtx.From, execCtx.Network) {
+			logger.WithFields(logger.Fields{
+				"tx_hash": signedTx.Hash().Hex(),
+				"nonce":   signedTx.Nonce(),
+			}).Info("Transaction slow but not blocking, continuing to wait...")
+
+			return &TxExecutionResult{
+				Transaction:  nil,
+				ShouldRetry:  true,
+				ShouldReturn: false,
+				Error:        nil,
+			}
+		}
+
+		// This nonce is blocking — bump gas to speed it up
+		if execCtx.AdjustGasPricesForSlowTx(signedTx) {
+			gasPriceIncrease := execCtx.GasPriceIncreasePercent
+			if gasPriceIncrease == 0 {
+				gasPriceIncrease = DefaultGasPriceIncreasePercent
+			}
+			tipCapIncrease := execCtx.TipCapIncreasePercent
+			if tipCapIncrease == 0 {
+				tipCapIncrease = DefaultTipCapIncreasePercent
+			}
+			logger.WithFields(logger.Fields{
+				"tx_hash": signedTx.Hash().Hex(),
+				"nonce":   signedTx.Nonce(),
+			}).Info(fmt.Sprintf("Transaction slow and blocking, increasing gas price by %.0f%% and tip cap by %.0f%%...",
+				(gasPriceIncrease-1)*100, (tipCapIncrease-1)*100))
+
 			return &TxExecutionResult{
 				Transaction:  nil,
 				ShouldRetry:  true,
@@ -1084,9 +1118,10 @@ func (wm *WalletManager) handleTransactionStatus(status TxInfo, signedTx *types.
 			// Limits reached - stop retrying and return error
 			logger.WithFields(logger.Fields{
 				"tx_hash":       signedTx.Hash().Hex(),
+				"nonce":         signedTx.Nonce(),
 				"max_gas_price": execCtx.MaxGasPrice,
 				"max_tip_cap":   execCtx.MaxTipCap,
-			}).Warn("Transaction slow but gas price protection limits reached. Stopping retry attempts.")
+			}).Warn("Transaction slow and blocking but gas price protection limits reached. Stopping retry attempts.")
 
 			return &TxExecutionResult{
 				Transaction:  signedTx,

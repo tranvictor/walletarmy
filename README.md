@@ -832,6 +832,77 @@ wm.RecordNetworkSuccess(networks.EthereumMainnet)
 wm.RecordNetworkFailure(networks.EthereumMainnet)
 ```
 
+## Transaction Gas Management & Blocking Nonce Detection
+
+WalletArmy has intelligent gas management that distinguishes between **blocking** and **non-blocking** transactions to avoid wasting gas while ensuring the nonce sequence stays unblocked.
+
+### What is a Blocking Nonce?
+
+A nonce is **blocking** when it equals the chain's **mined nonce** — i.e., it's the next nonce the chain expects to process. This transaction must be confirmed before any higher-nonce transactions can proceed.
+
+For example, if the chain has mined up to nonce 36, then nonce 37 is **blocking** — it must be included in a block before nonces 38, 39, etc. can be mined.
+
+### Why Only Bump the Blocking Nonce?
+
+Since gas bumping is applied **one nonce at a time** (only the blocking nonce), you should set your gas protection limits (`MaxGasPrice`, `MaxTipCap`) aggressively enough to resolve stuck transactions. There is no automatic 2x override — the limits you configure are the limits WalletArmy will respect.
+
+### Slow Transaction Handling
+
+When a transaction is detected as **slow** (not confirmed within `SlowTxTimeout`):
+
+| Scenario | Behavior |
+|----------|----------|
+| **Blocking nonce** | Gas price and tip cap are bumped (default: +20% gas price, +10% tip cap) and the transaction is re-broadcast with the same nonce |
+| **Non-blocking nonce** | No gas bump — the transaction simply continues waiting. It will get mined once the blocking nonce ahead of it is resolved |
+
+This avoids unnecessarily spending gas on transactions that are only slow because they're waiting for an earlier nonce to be confirmed.
+
+### Lost Transaction Handling
+
+When a transaction is detected as **lost** (dropped from the node's mempool):
+
+| Scenario | Behavior |
+|----------|----------|
+| **Normal case** | Re-broadcast with the **same nonce** and bumped gas price. Unlike the old behavior (which acquired a new nonce and created an unfillable gap), the lost transaction is retried in place |
+| **Gas limit reached** | If bumping would exceed `MaxGasPrice` / `MaxTipCap`, the transaction gives up with `ErrGasPriceLimitReached` |
+
+### Example: Gas Escalation for a Blocking Nonce
+
+```
+Initial state:
+  MaxGasPrice: 100 gwei, MaxTipCap: 10 gwei
+  Mined nonce: 37, Tx nonce: 37 (blocking)
+
+Nonce 37 tx is lost from mempool:
+  1. Retry with same nonce, gas bumped to 55 gwei (+10%)  → broadcast
+  2. Lost again, gas bumped to 60.5 gwei (+10%)           → broadcast
+  3. Lost again, gas bumped to 66.5 gwei (+10%)           → broadcast
+  ...continues until MaxGasPrice (100 gwei) is reached
+  N. Gas bumped to 102 gwei > MaxGasPrice (100)
+     → ErrGasPriceLimitReached, stops retrying
+```
+
+### Configuration
+
+```go
+wm := walletarmy.NewWalletManager(
+    // Gas price protection — max gas price and tip cap per transaction.
+    // Set these aggressively since gas bumping only applies to the single
+    // blocking nonce, not all queued transactions.
+    walletarmy.WithDefaultMaxGasPrice(100.0), // gwei
+    walletarmy.WithDefaultMaxTipCap(10.0),    // gwei
+
+    // Gas bumping rate when tx is slow/lost
+    walletarmy.WithDefaultGasPriceIncreasePercent(1.2), // 20% increase per bump
+    walletarmy.WithDefaultTipCapIncreasePercent(1.1),   // 10% increase per bump
+
+    // How long to wait before considering a tx "slow"
+    walletarmy.WithDefaultSlowTxTimeout(5*time.Second),
+)
+```
+
+> **Note**: When `MaxGasPrice` or `MaxTipCap` is set to `0`, WalletArmy defaults to `5x` the initial gas price / tip cap as the protection limit (`MaxCapMultiplier = 5.0`).
+
 ## Enabling Debug Logs
 
 WalletArmy uses the `github.com/KyberNetwork/logger` package. Enable debug logging to troubleshoot nonce issues and transaction flow:
