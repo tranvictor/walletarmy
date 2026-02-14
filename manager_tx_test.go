@@ -2890,18 +2890,18 @@ func TestNonceLeak_NonRevertSimulationFailure_FullLoop_ShouldReleaseNonce(t *tes
 	// Run through the full EnsureTxWithHooksContext which uses executeTransactionLoop
 	_, _, err := setup.WM.EnsureTxWithHooksContext(
 		context.Background(),
-		1,                  // numRetries
+		1,                   // numRetries
 		10*time.Millisecond, // sleepDuration
 		10*time.Millisecond, // txCheckInterval
-		2,                  // txType
+		2,                   // txType
 		testAddr1,
 		testAddr2,
 		oneEth,
 		21000, 0, // gasLimit, extraGasLimit
-		20, 0,    // gasPrice, extraGasPrice
-		2, 0,     // tipCapGwei, extraTipCapGwei
-		0, 0,     // maxGasPrice, maxTipCap
-		nil,      // data
+		20, 0, // gasPrice, extraGasPrice
+		2, 0, // tipCapGwei, extraTipCapGwei
+		0, 0, // maxGasPrice, maxTipCap
+		nil, // data
 		networks.EthereumMainnet,
 		nil, nil, // hooks
 		nil, nil, // abis, gasEstimationFailedHook
@@ -3158,6 +3158,210 @@ func TestHandleTransactionStatus_Slow_NonBlockingNonce_JustWaits(t *testing.T) {
 	assert.Equal(t, 0.0, execCtx.RetryTipCap, "Tip cap should NOT be bumped for non-blocking slow tx")
 	assert.Nil(t, execCtx.RetryNonce, "RetryNonce should remain nil — keep monitoring the same tx")
 	assert.Equal(t, tx, execCtx.InitialTx, "InitialTx should be set so the loop re-monitors the same tx instead of building a new one")
+}
+
+// ============================================================
+// Integration: Non-blocking Slow Tx Waits, Then Bumps When Blocking
+// ============================================================
+
+// TestEnsureTx_SlowTx_NonBlocking_WaitsThenBumpsWhenBlocking is an end-to-end
+// integration test for the slow tx blocking nonce logic:
+//
+//  1. Tx with nonce 7 is broadcast. Mined nonce is 5, so nonce 7 is NOT blocking.
+//  2. SlowTxTimeout fires twice — gas should NOT be bumped, the SAME tx should
+//     be re-monitored each time (no new tx built).
+//  3. Mined nonce advances to 7 (lower nonces got mined elsewhere), so nonce 7
+//     IS now blocking.
+//  4. SlowTxTimeout fires again — now gas IS bumped, a replacement tx is built
+//     and broadcast with the same nonce but higher gas.
+//  5. Monitor reports "done" — success.
+//
+// Note: MonitorTxContext generates TxStatusSlow internally via time.After(slowTimeout),
+// NOT from the mock monitor. The mock monitor must block (not return) for the slow
+// timeout to fire. When we want "done", the mock returns before the timeout.
+//
+// Assertions:
+//   - Gas price is NOT increased while non-blocking.
+//   - The original tx hash is re-monitored (not a new build) while non-blocking.
+//   - Gas price IS increased once blocking.
+//   - Only 2 broadcasts total: the original + the replacement after becoming blocking.
+//   - No extra transactions are built.
+func TestEnsureTx_SlowTx_NonBlocking_WaitsThenBumpsWhenBlocking(t *testing.T) {
+	fromAddr := crypto.PubkeyToAddress(testPrivateKey1.PublicKey)
+
+	// --- Mined nonce changes over time ---
+	var minedNonce uint64 = 5
+	var nonceMu sync.Mutex
+
+	reader := &mockEthReader{
+		GetMinedNonceFn: func(addr string) (uint64, error) {
+			nonceMu.Lock()
+			defer nonceMu.Unlock()
+			return minedNonce, nil
+		},
+		GetPendingNonceFn: func(addr string) (uint64, error) {
+			nonceMu.Lock()
+			defer nonceMu.Unlock()
+			return minedNonce, nil
+		},
+		SuggestedGasSettingsFn: func() (float64, float64, error) { return 20.0, 2.0, nil },
+		EthCallFn: func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+			return nil, nil
+		},
+	}
+
+	broadcaster := &mockEthBroadcaster{}
+
+	// Use a short slow timeout so tests don't take forever.
+	// MonitorTxContext fires TxStatusSlow after this timeout.
+	slowTimeout := 50 * time.Millisecond
+
+	// --- Custom monitor that controls when to return ---
+	// - Calls 0, 1, 2: block forever (never return) → lets SlowTxTimeout fire → TxStatusSlow
+	// - Call 3: return "done" immediately → TxStatusMined
+	// On call 2, we also advance minedNonce to 7 so the 3rd slow becomes blocking.
+	wrapper := &slowThenDoneMonitor{
+		slowUntilCall: 3, // calls 0,1,2 → slow timeout; call 3 → done
+		onCall: func(callIdx int) {
+			if callIdx == 2 {
+				nonceMu.Lock()
+				minedNonce = 7
+				nonceMu.Unlock()
+			}
+		},
+	}
+
+	// Use BSCMainnet — it does NOT support sync tx, so the flow goes through
+	// BroadcastTx + monitor (the path where slow/blocking logic matters).
+	testNetwork := networks.BSCMainnet
+
+	wm := NewWalletManager(
+		WithReaderFactory(func(network networks.Network) (EthReader, error) {
+			return reader, nil
+		}),
+		WithBroadcasterFactory(func(network networks.Network) (EthBroadcaster, error) {
+			return broadcaster, nil
+		}),
+		WithTxMonitorFactory(func(r EthReader) TxMonitor {
+			return wrapper
+		}),
+		WithDefaultSlowTxTimeout(slowTimeout),
+	)
+
+	// Register the test wallet
+	acc, err := account.NewPrivateKeyAccount("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	require.NoError(t, err)
+	wm.SetAccount(acc)
+
+	// Initialize network
+	_, err = wm.Reader(testNetwork)
+	require.NoError(t, err)
+
+	// --- Track broadcasts ---
+	var broadcastedTxs []*types.Transaction
+	var broadcastMu sync.Mutex
+	broadcaster.BroadcastTxFn = func(tx *types.Transaction) (string, bool, error) {
+		broadcastMu.Lock()
+		broadcastedTxs = append(broadcastedTxs, tx)
+		broadcastMu.Unlock()
+		return tx.Hash().Hex(), true, nil
+	}
+
+	// --- Set local tracker so BuildTx acquires nonce 7 ---
+	// local=7 (stored 6, pending 7), mined=5, remotePending=5 → acquires 7
+	wm.nonceTracker.SetPendingNonce(fromAddr, testNetwork.GetChainID(), testNetwork.GetName(), 6)
+
+	ctx := context.Background()
+	tx, receipt, err := wm.EnsureTxWithHooksContext(
+		ctx,
+		5, time.Millisecond, time.Millisecond,
+		2, fromAddr, testAddr2, oneEth,
+		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		nil, testNetwork,
+		nil, nil, nil, nil, nil, nil,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	require.NotNil(t, receipt)
+
+	// --- Assertion 1: Only 2 broadcasts (original + replacement after becoming blocking) ---
+	broadcastMu.Lock()
+	defer broadcastMu.Unlock()
+	require.Equal(t, 2, len(broadcastedTxs),
+		"Should have exactly 2 broadcasts: original + gas-bumped replacement (no extra txs built)")
+
+	// --- Assertion 2: Both broadcasts use the same nonce ---
+	assert.Equal(t, broadcastedTxs[0].Nonce(), broadcastedTxs[1].Nonce(),
+		"Replacement tx should use the same nonce as the original")
+	assert.Equal(t, uint64(7), broadcastedTxs[0].Nonce(),
+		"Original tx should have nonce 7")
+
+	// --- Assertion 3: Replacement has higher gas than original ---
+	originalGasFeeCap := broadcastedTxs[0].GasFeeCap()
+	replacementGasFeeCap := broadcastedTxs[1].GasFeeCap()
+	assert.True(t, replacementGasFeeCap.Cmp(originalGasFeeCap) > 0,
+		"Replacement tx gas fee cap (%s) should be higher than original (%s)",
+		replacementGasFeeCap, originalGasFeeCap)
+
+	originalTipCap := broadcastedTxs[0].GasTipCap()
+	replacementTipCap := broadcastedTxs[1].GasTipCap()
+	assert.True(t, replacementTipCap.Cmp(originalTipCap) > 0,
+		"Replacement tx tip cap (%s) should be higher than original (%s)",
+		replacementTipCap, originalTipCap)
+
+	// --- Assertion 4: The same tx was re-monitored while non-blocking ---
+	wrapper.mu.Lock()
+	monitoredHashes := make([]string, len(wrapper.monitoredHashes))
+	copy(monitoredHashes, wrapper.monitoredHashes)
+	wrapper.mu.Unlock()
+
+	require.Equal(t, 4, len(monitoredHashes),
+		"Should have 4 monitor calls: 2 non-blocking waits + 1 blocking slow + 1 final mined")
+
+	// First 3 should all be the same tx hash (the original, re-monitored)
+	assert.Equal(t, monitoredHashes[0], monitoredHashes[1],
+		"Non-blocking slow iterations should re-monitor the same tx hash")
+	assert.Equal(t, monitoredHashes[0], monitoredHashes[2],
+		"The 3rd slow iteration should still monitor the original tx before rebuilding")
+
+	// 4th should be the replacement tx hash (different from original)
+	assert.NotEqual(t, monitoredHashes[0], monitoredHashes[3],
+		"After gas bump, a new replacement tx should be monitored (different hash)")
+}
+
+// slowThenDoneMonitor is a TxMonitor that blocks (causing SlowTxTimeout to fire)
+// for the first N calls, then returns "done" on subsequent calls.
+// This lets us test the slow → blocking → gas bump → done flow.
+type slowThenDoneMonitor struct {
+	slowUntilCall   int               // calls before this index block (→ slow timeout)
+	onCall          func(callIdx int) // side effect hook
+	callCount       int
+	monitoredHashes []string
+	mu              sync.Mutex
+}
+
+func (m *slowThenDoneMonitor) MakeWaitChannelWithInterval(hash string, interval time.Duration) <-chan TxMonitorStatus {
+	m.mu.Lock()
+	idx := m.callCount
+	m.monitoredHashes = append(m.monitoredHashes, hash)
+	m.callCount++
+	if m.onCall != nil {
+		m.onCall(idx)
+	}
+	m.mu.Unlock()
+
+	ch := make(chan TxMonitorStatus, 1)
+	if idx >= m.slowUntilCall {
+		// Return "done" immediately — MonitorTxContext will map this to TxStatusMined
+		ch <- TxMonitorStatus{
+			Status:  "done",
+			Receipt: &types.Receipt{Status: types.ReceiptStatusSuccessful},
+		}
+	}
+	// For idx < slowUntilCall: channel never receives a value,
+	// so MonitorTxContext's time.After(slowTimeout) fires → TxStatusSlow
+	return ch
 }
 
 // ============================================================
