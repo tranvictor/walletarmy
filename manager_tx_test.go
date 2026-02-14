@@ -309,6 +309,95 @@ func TestMonitorTxContext_ReturnsCancelledOnContextCancel(t *testing.T) {
 }
 
 // ============================================================
+// MonitorTxContext — Slow Timer Deferred Until First Monitor Event
+// ============================================================
+
+// TestMonitorTxContext_SlowTimerDefersUntilFirstCheck tests that when
+// SlowTxTimeout < txCheckInterval, the slow timer does NOT fire before
+// the monitor has checked the node. If the monitor returns "done" on its
+// first check (even though it's after SlowTxTimeout), we get TxStatusMined.
+func TestMonitorTxContext_SlowTimerDefersUntilFirstCheck(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// SlowTxTimeout is much shorter than the monitor delay.
+	// Under the old code, the slow timer would fire at 20ms before the
+	// monitor returns "done" at 100ms. With the fix, the slow timer
+	// doesn't start until after the monitor delivers a status.
+	setup.WM.SetDefaults(ManagerDefaults{SlowTxTimeout: 20 * time.Millisecond})
+	setup.Monitor.Delay = 100 * time.Millisecond
+	setup.Monitor.StatusToReturn = TxMonitorStatus{
+		Status:  "done",
+		Receipt: &types.Receipt{Status: types.ReceiptStatusSuccessful},
+	}
+
+	tx := newTestTx(0, testAddr2, oneEth)
+	ctx := context.Background()
+	statusChan := setup.WM.MonitorTxContext(ctx, tx, networks.EthereumMainnet, time.Second)
+
+	status := <-statusChan
+	assert.Equal(t, TxStatusMined, status.Status,
+		"Should get TxStatusMined, not TxStatusSlow — slow timer must not fire before first monitor check")
+	assert.NotNil(t, status.Receipt)
+}
+
+// TestMonitorTxContext_SlowTimerFiresAfterFirstNonTerminalCheck tests that
+// after the monitor delivers a non-terminal status (e.g., unknown/pending),
+// the slow timer starts and eventually fires TxStatusSlow.
+func TestMonitorTxContext_SlowTimerFiresAfterFirstNonTerminalCheck(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.WM.SetDefaults(ManagerDefaults{SlowTxTimeout: 50 * time.Millisecond})
+
+	// The monitor returns an unrecognized status (treated as non-terminal).
+	// This arms the slow timer, which fires after 50ms.
+	setup.Monitor.StatusToReturn = TxMonitorStatus{Status: "pending"}
+
+	tx := newTestTx(0, testAddr2, oneEth)
+	ctx := context.Background()
+	statusChan := setup.WM.MonitorTxContext(ctx, tx, networks.EthereumMainnet, time.Second)
+
+	status := <-statusChan
+	assert.Equal(t, TxStatusSlow, status.Status,
+		"Should get TxStatusSlow after non-terminal status arms the timer")
+}
+
+// TestMonitorTxContext_SlowTimerFiresAfterMonitorClose tests that when
+// the monitor channel closes without a terminal status, the slow timer
+// is armed and eventually fires.
+func TestMonitorTxContext_SlowTimerFiresAfterMonitorClose(t *testing.T) {
+	closingMon := &closingMonitor{}
+
+	wm := NewWalletManager(
+		WithTxMonitorFactory(func(reader EthReader) TxMonitor {
+			return closingMon
+		}),
+	)
+	wm.SetDefaults(ManagerDefaults{SlowTxTimeout: 50 * time.Millisecond})
+
+	// Store the monitor directly so getTxMonitor finds it
+	wm.txMonitors.Store(networks.EthereumMainnet.GetChainID(), closingMon)
+
+	tx := newTestTx(0, testAddr2, oneEth)
+	ctx := context.Background()
+	statusChan := wm.MonitorTxContext(ctx, tx, networks.EthereumMainnet, time.Second)
+
+	status := <-statusChan
+	assert.Equal(t, TxStatusSlow, status.Status,
+		"Should get TxStatusSlow after monitor channel closes without terminal status")
+}
+
+// closingMonitor is a TxMonitor that immediately closes the channel without sending a status.
+type closingMonitor struct{}
+
+func (m *closingMonitor) MakeWaitChannelWithInterval(hash string, interval time.Duration) <-chan TxMonitorStatus {
+	ch := make(chan TxMonitorStatus)
+	go func() {
+		close(ch)
+	}()
+	return ch
+}
+
+// ============================================================
 // TxExecutionContext Tests
 // ============================================================
 
@@ -3458,9 +3547,11 @@ func (m *slowThenDoneMonitor) MakeWaitChannelWithInterval(hash string, interval 
 			Status:  "done",
 			Receipt: &types.Receipt{Status: types.ReceiptStatusSuccessful},
 		}
+	} else {
+		// Return "pending" (non-terminal) — this arms the slow timer in
+		// MonitorTxContext, which then fires TxStatusSlow after SlowTxTimeout.
+		ch <- TxMonitorStatus{Status: "pending"}
 	}
-	// For idx < slowUntilCall: channel never receives a value,
-	// so MonitorTxContext's time.After(slowTimeout) fires → TxStatusSlow
 	return ch
 }
 

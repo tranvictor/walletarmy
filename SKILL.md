@@ -299,7 +299,7 @@ wm := walletarmy.NewWalletManager(
     walletarmy.WithDefaultNumRetries(9),
     walletarmy.WithDefaultSleepDuration(5 * time.Second),
     walletarmy.WithDefaultTxCheckInterval(5 * time.Second),
-    walletarmy.WithDefaultSlowTxTimeout(5 * time.Second),
+    walletarmy.WithDefaultSlowTxTimeout(5 * time.Second), // starts after first monitor check, not broadcast
     walletarmy.WithDefaultExtraGasLimit(0),
     walletarmy.WithDefaultExtraGasPrice(0),
     walletarmy.WithDefaultExtraTipCap(0),
@@ -341,7 +341,7 @@ wm := walletarmy.NewWalletManager(
 5. **Gas price protection** — `SetMaxGasPrice` / `SetMaxTipCap` prevent runaway costs. When 0, defaults to 5x the suggested price.
 6. **Circuit breaker** — if an RPC node fails repeatedly, the circuit opens and returns `ErrCircuitBreakerOpen`. It auto-recovers.
 7. **Idempotency requires a store** — `SetIdempotencyKey` is a no-op without `WithDefaultIdempotencyStore` or `WithIdempotencyStore`.
-8. **Slow tx handling** — "slow" is a walletarmy-internal concept (not from the node/monitor): when a broadcasted tx is not mined within `SlowTxTimeout`, walletarmy generates a `TxStatusSlow` signal. Gas is only bumped if the tx's nonce is the blocking nonce (next nonce the chain expects). Non-blocking slow txs just keep waiting.
+8. **Slow tx handling** — "slow" is a walletarmy-internal concept (not from the node/monitor): the slow timer starts after the monitor confirms the tx is still pending (not from broadcast time), then fires after `SlowTxTimeout`. Gas is only bumped if the tx's nonce is the blocking nonce (next nonce the chain expects). Non-blocking slow txs just keep waiting.
 9. **Thread safety** — `WalletManager` is safe for concurrent use from multiple goroutines. Each `R()` call creates an independent request.
 10. **`GasEstimationFailedHook` requires ABIs** — it won't fire unless you set `SetAbis(...)` on the request.
 

@@ -874,9 +874,11 @@ Since gas bumping is applied **one nonce at a time** (only the blocking nonce), 
 
 ### Slow Transaction Handling
 
-> **Note**: "Slow" is a walletarmy-internal concept, not a status from the node or transaction monitor. WalletArmy generates `TxStatusSlow` when a broadcasted transaction is not mined within `SlowTxTimeout` (default: 5s). The external TxMonitor only reports terminal statuses like "done", "reverted", and "lost".
+> **Note**: "Slow" is a walletarmy-internal concept, not a status from the node or transaction monitor. WalletArmy generates `TxStatusSlow` when a broadcasted transaction is not mined within `SlowTxTimeout` (default: 5s) **after the monitor has checked the node at least once**. The external TxMonitor only reports terminal statuses like "done", "reverted", and "lost".
+>
+> The slow timer is deferred until the monitor delivers its first non-terminal status (e.g., "pending"). This ensures that a `SlowTxTimeout` shorter than `TxCheckInterval` does not produce false "slow" signals before the node is ever queried. The timeout counts from the first check, not from broadcast time.
 
-When a transaction is detected as **slow** (not confirmed within `SlowTxTimeout`):
+When a transaction is detected as **slow** (not confirmed within `SlowTxTimeout` after the first monitor check):
 
 | Scenario | Behavior |
 |----------|----------|
@@ -924,8 +926,9 @@ wm := walletarmy.NewWalletManager(
     walletarmy.WithDefaultGasPriceIncreasePercent(1.2), // 20% increase per bump
     walletarmy.WithDefaultTipCapIncreasePercent(1.1),   // 10% increase per bump
 
-    // How long to wait before walletarmy considers a broadcasted tx "slow"
-    // (this is a walletarmy-internal timeout, not from the node/monitor)
+    // How long to wait (after the first monitor check) before walletarmy
+    // considers a broadcasted tx "slow". The timer starts after the monitor
+    // confirms the tx is still pending, not from broadcast time.
     walletarmy.WithDefaultSlowTxTimeout(5*time.Second),
 )
 ```

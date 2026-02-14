@@ -212,6 +212,14 @@ func (wm *WalletManager) MonitorTx(tx *types.Transaction, network networks.Netwo
 //   - TxStatusCancelled is generated when the caller's context is cancelled.
 //   - Any unrecognized status from the monitor is treated as "still pending" and
 //     the slow timeout is allowed to fire.
+//
+// Slow timer behavior:
+//   The slow timer is NOT started immediately. It is deferred until the monitor
+//   delivers its first non-terminal event (e.g., "pending", unknown status, or
+//   channel close). This ensures the monitor has checked the node at least once
+//   before judging the transaction as slow. Without this, a SlowTxTimeout shorter
+//   than txCheckInterval would always fire before the first check, producing false
+//   "slow" signals.
 func (wm *WalletManager) MonitorTxContext(ctx context.Context, tx *types.Transaction, network networks.Network, txCheckInterval time.Duration) <-chan TxInfo {
 	txMonitor := wm.getTxMonitor(network)
 	statusChan := make(chan TxInfo, 1) // Buffered to avoid goroutine leak on context cancellation
@@ -225,8 +233,27 @@ func (wm *WalletManager) MonitorTxContext(ctx context.Context, tx *types.Transac
 
 	go func() {
 		defer close(statusChan)
-		timer := time.NewTimer(slowTimeout)
-		defer timer.Stop()
+
+		// slowCh is nil until the monitor delivers its first non-terminal event.
+		// A nil channel blocks forever in select, so the slow case is effectively
+		// disabled until we know the monitor has checked the node at least once.
+		var slowCh <-chan time.Time
+		var timer *time.Timer
+		defer func() {
+			if timer != nil {
+				timer.Stop()
+			}
+		}()
+
+		// armSlowTimer starts the slow timer on the first non-terminal monitor event.
+		// Subsequent calls are no-ops — the timer is not reset on later "pending" checks
+		// because slowTimeout counts from the first check, not the last.
+		armSlowTimer := func() {
+			if timer == nil {
+				timer = time.NewTimer(slowTimeout)
+				slowCh = timer.C
+			}
+		}
 
 		for {
 			select {
@@ -239,8 +266,9 @@ func (wm *WalletManager) MonitorTxContext(ctx context.Context, tx *types.Transac
 			case status, ok := <-monitorChan:
 				if !ok {
 					// Monitor channel closed without a terminal status.
-					// Disable it and let the slow timeout fire.
+					// Disable it and arm the slow timer so it can fire.
 					monitorChan = nil
+					armSlowTimer()
 					continue
 				}
 				switch status.Status {
@@ -263,12 +291,14 @@ func (wm *WalletManager) MonitorTxContext(ctx context.Context, tx *types.Transac
 					}
 					return
 				default:
-					// Unrecognized status from monitor — treat as "still pending".
-					// Disable the monitor channel and let the slow timeout fire.
+					// Unrecognized or non-terminal status from monitor —
+					// treat as "still pending". Disable the monitor channel
+					// and arm the slow timer so it can fire.
 					monitorChan = nil
+					armSlowTimer()
 					continue
 				}
-			case <-timer.C:
+			case <-slowCh:
 				statusChan <- TxInfo{
 					Status:  TxStatusSlow,
 					Receipt: nil,

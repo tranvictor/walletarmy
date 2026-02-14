@@ -57,8 +57,10 @@ const (
 	// TxStatusLost indicates the transaction was dropped from the mempool.
 	// Origin: mapped from TxMonitor "lost" status.
 	TxStatusLost TxInfoStatus = "lost"
-	// TxStatusSlow indicates the transaction has not been mined within SlowTxTimeout.
-	// Origin: generated internally by MonitorTxContext via time.After(SlowTxTimeout).
+	// TxStatusSlow indicates the transaction has not been mined within SlowTxTimeout
+	// after the monitor has checked the node at least once.
+	// Origin: generated internally by MonitorTxContext. The slow timer is deferred
+	// until the first non-terminal monitor event, then fires after SlowTxTimeout.
 	// This is NOT a status from the TxMonitor — it is a walletarmy-level timeout signal.
 	TxStatusSlow TxInfoStatus = "slow"
 	// TxStatusCancelled indicates the monitoring was cancelled via context.

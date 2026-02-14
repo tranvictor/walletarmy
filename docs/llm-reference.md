@@ -117,7 +117,7 @@ func NewWalletManager(opts ...WalletManagerOption) *WalletManager
 | `WithDefaultNumRetries` | `int` | `9` | Retry attempts |
 | `WithDefaultSleepDuration` | `time.Duration` | `5s` | Sleep between retries |
 | `WithDefaultTxCheckInterval` | `time.Duration` | `5s` | Tx status polling interval |
-| `WithDefaultSlowTxTimeout` | `time.Duration` | `5s` | Walletarmy-internal timeout: time before a broadcasted tx is considered "slow" (not from monitor) |
+| `WithDefaultSlowTxTimeout` | `time.Duration` | `5s` | Walletarmy-internal timeout: time after first monitor check before tx is considered "slow" (deferred until monitor confirms pending) |
 | `WithDefaultExtraGasLimit` | `uint64` | `0` | Added to gas estimate |
 | `WithDefaultExtraGasPrice` | `float64` | `0` | Added to suggested gas price (gwei) |
 | `WithDefaultExtraTipCap` | `float64` | `0` | Added to suggested tip cap (gwei) |
@@ -338,13 +338,16 @@ TxStatusDone      = "done"      // raw monitor status (mapped to TxStatusMined i
 
 **Generated internally by walletarmy** (NOT from the monitor):
 ```go
-TxStatusSlow      = "slow"      // fired by MonitorTxContext when tx is not mined within SlowTxTimeout
+TxStatusSlow      = "slow"      // fired by MonitorTxContext after first monitor check + SlowTxTimeout
 TxStatusCancelled = "cancelled" // fired by MonitorTxContext when caller's context is cancelled
 ```
 
 > **Important**: `TxStatusSlow` is a walletarmy-level timeout signal, not a status reported by
-> any node or TxMonitor implementation. Custom TxMonitor implementations should NOT return "slow" —
-> it will be treated as an unrecognized status and the slow timeout will fire independently.
+> any node or TxMonitor implementation. The slow timer is deferred until the monitor delivers
+> its first non-terminal event (e.g., "pending"), then fires after `SlowTxTimeout`. This prevents
+> false "slow" signals when `SlowTxTimeout < TxCheckInterval`. Custom TxMonitor implementations
+> should NOT return "slow" — it will be treated as an unrecognized status (non-terminal) and the
+> slow timeout will fire independently after it.
 
 ## PendingTxStatus Values
 
