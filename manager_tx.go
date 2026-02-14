@@ -1084,6 +1084,12 @@ func (wm *WalletManager) handleTransactionStatus(status TxInfo, signedTx *types.
 				"nonce":   signedTx.Nonce(),
 			}).Info("Transaction slow but not blocking, continuing to wait...")
 
+			// Set InitialTx so the next loop iteration re-monitors this same
+			// transaction instead of building a new one with a fresh nonce.
+			// Without this, the original tx would be orphaned and its mined
+			// status would never be reported to the caller.
+			execCtx.InitialTx = signedTx
+
 			return &TxExecutionResult{
 				Transaction:  nil,
 				ShouldRetry:  true,

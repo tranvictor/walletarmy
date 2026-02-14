@@ -3157,6 +3157,7 @@ func TestHandleTransactionStatus_Slow_NonBlockingNonce_JustWaits(t *testing.T) {
 	assert.Equal(t, 0.0, execCtx.RetryGasPrice, "Gas price should NOT be bumped for non-blocking slow tx")
 	assert.Equal(t, 0.0, execCtx.RetryTipCap, "Tip cap should NOT be bumped for non-blocking slow tx")
 	assert.Nil(t, execCtx.RetryNonce, "RetryNonce should remain nil — keep monitoring the same tx")
+	assert.Equal(t, tx, execCtx.InitialTx, "InitialTx should be set so the loop re-monitors the same tx instead of building a new one")
 }
 
 // ============================================================
