@@ -62,7 +62,7 @@ func WithDefaultExtraGasPrice(extraGasPrice float64) WalletManagerOption {
 // WithDefaultExtraTipCap sets the default extra tip cap added to suggestions
 func WithDefaultExtraTipCap(extraTipCap float64) WalletManagerOption {
 	return func(wm *WalletManager) {
-		wm.defaults.ExtraTipCapGwei = extraTipCap
+		wm.defaults.ExtraTipCap = extraTipCap
 	}
 }
 
@@ -101,20 +101,30 @@ func WithDefaultSlowTxTimeout(timeout time.Duration) WalletManagerOption {
 	}
 }
 
-// WithDefaultGasPriceIncreasePercent sets the gas price multiplier when tx is slow
-// For example, 1.2 means 20% increase
-func WithDefaultGasPriceIncreasePercent(percent float64) WalletManagerOption {
+// WithDefaultGasPriceBumpFactor sets the gas price multiplier when tx is slow.
+// For example, 1.2 means 20% increase.
+func WithDefaultGasPriceBumpFactor(factor float64) WalletManagerOption {
 	return func(wm *WalletManager) {
-		wm.defaults.GasPriceIncreasePercent = percent
+		wm.defaults.GasPriceBumpFactor = factor
 	}
 }
 
-// WithDefaultTipCapIncreasePercent sets the tip cap multiplier when tx is slow
-// For example, 1.1 means 10% increase
-func WithDefaultTipCapIncreasePercent(percent float64) WalletManagerOption {
+// WithDefaultTipCapBumpFactor sets the tip cap multiplier when tx is slow.
+// For example, 1.1 means 10% increase.
+func WithDefaultTipCapBumpFactor(factor float64) WalletManagerOption {
 	return func(wm *WalletManager) {
-		wm.defaults.TipCapIncreasePercent = percent
+		wm.defaults.TipCapBumpFactor = factor
 	}
+}
+
+// Deprecated: Use WithDefaultGasPriceBumpFactor instead.
+func WithDefaultGasPriceIncreasePercent(percent float64) WalletManagerOption {
+	return WithDefaultGasPriceBumpFactor(percent)
+}
+
+// Deprecated: Use WithDefaultTipCapBumpFactor instead.
+func WithDefaultTipCapIncreasePercent(percent float64) WalletManagerOption {
+	return WithDefaultTipCapBumpFactor(percent)
 }
 
 // WithDefaults sets all default configuration at once

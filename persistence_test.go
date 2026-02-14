@@ -1101,18 +1101,20 @@ func TestResumeTransactionOptions_Fields(t *testing.T) {
 	assert.True(t, hookCalled)
 }
 
-func TestTxExecutionContext_InitialTx_Field(t *testing.T) {
+func TestTxExecutionContext_ResumeWith_Field(t *testing.T) {
 	tx := types.NewTx(&types.LegacyTx{Nonce: 5})
 
 	execCtx := &TxExecutionContext{
-		InitialTx: tx,
+		State: TxRetryState{
+			ResumeWith: tx,
+		},
 	}
 
-	assert.Equal(t, tx, execCtx.InitialTx)
+	assert.Equal(t, tx, execCtx.State.ResumeWith)
 
 	// Simulate clearing after use
-	execCtx.InitialTx = nil
-	assert.Nil(t, execCtx.InitialTx)
+	execCtx.State.ResumeWith = nil
+	assert.Nil(t, execCtx.State.ResumeWith)
 }
 
 // ============================================================

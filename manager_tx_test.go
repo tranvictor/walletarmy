@@ -403,8 +403,7 @@ func (m *closingMonitor) MakeWaitChannelWithInterval(hash string, interval time.
 
 func TestTxExecutionContext_AdjustGasPricesForSlowTx_Success(t *testing.T) {
 	ctx := &TxExecutionContext{
-		MaxGasPrice: 200.0, // High limit
-		MaxTipCap:   100.0, // High limit
+		Gas: GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0},
 	}
 
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
@@ -416,20 +415,19 @@ func TestTxExecutionContext_AdjustGasPricesForSlowTx_Success(t *testing.T) {
 	adjusted := ctx.AdjustGasPricesForSlowTx(tx)
 
 	assert.True(t, adjusted)
-	// Gas price should be increased by DefaultGasPriceIncreasePercent (1.2)
-	expectedGasPrice := 20.0 * DefaultGasPriceIncreasePercent
-	assert.InDelta(t, expectedGasPrice, ctx.RetryGasPrice, 0.001)
-	// Tip cap should be increased by DefaultTipCapIncreasePercent (1.1)
-	expectedTipCap := 2.0 * DefaultTipCapIncreasePercent
-	assert.InDelta(t, expectedTipCap, ctx.RetryTipCap, 0.001)
+	// Gas price should be increased by DefaultGasPriceBumpFactor (1.2)
+	expectedGasPrice := 20.0 * DefaultGasPriceBumpFactor
+	assert.InDelta(t, expectedGasPrice, ctx.State.GasPrice, 0.001)
+	// Tip cap should be increased by DefaultTipCapBumpFactor (1.1)
+	expectedTipCap := 2.0 * DefaultTipCapBumpFactor
+	assert.InDelta(t, expectedTipCap, ctx.State.TipCap, 0.001)
 	// Nonce should be preserved
-	assert.Equal(t, big.NewInt(5), ctx.RetryNonce)
+	assert.Equal(t, big.NewInt(5), ctx.State.Nonce)
 }
 
 func TestTxExecutionContext_AdjustGasPricesForSlowTx_HitsGasPriceLimit(t *testing.T) {
 	ctx := &TxExecutionContext{
-		MaxGasPrice: 22.0, // Low limit - 20 * 1.2 = 24 would exceed
-		MaxTipCap:   100.0,
+		Gas: GasBounds{MaxGasPrice: 22.0, MaxTipCap: 100.0},
 	}
 
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
@@ -445,8 +443,7 @@ func TestTxExecutionContext_AdjustGasPricesForSlowTx_HitsGasPriceLimit(t *testin
 
 func TestTxExecutionContext_AdjustGasPricesForSlowTx_HitsTipCapLimit(t *testing.T) {
 	ctx := &TxExecutionContext{
-		MaxGasPrice: 200.0,
-		MaxTipCap:   2.1, // Low limit - 2 * 1.1 = 2.2 would exceed
+		Gas: GasBounds{MaxGasPrice: 200.0, MaxTipCap: 2.1},
 	}
 
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
@@ -477,16 +474,15 @@ func TestTxExecutionContext_IncrementRetryCountAndCheck(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := &TxExecutionContext{
-				NumRetries:       tt.numRetries,
-				ActualRetryCount: tt.currentRetries,
+				Retry: RetryConfig{MaxAttempts: tt.numRetries},
+				State: TxRetryState{AttemptCount: tt.currentRetries},
 			}
 
 			result := ctx.IncrementRetryCountAndCheck("test error")
 
 			if tt.expectResult {
 				assert.NotNil(t, result)
-				assert.True(t, result.ShouldReturn)
-				assert.False(t, result.ShouldRetry)
+				assert.Equal(t, ActionReturn, result.Action)
 				assert.True(t, errors.Is(result.Error, ErrEnsureTxOutOfRetries))
 			} else {
 				assert.Nil(t, result)
@@ -592,11 +588,11 @@ func TestHandleBroadcastError_NonceTooLow_ChecksOldTxs(t *testing.T) {
 	}
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		OldTxs: map[string]*types.Transaction{
+		Retry:  RetryConfig{MaxAttempts: 5},
+		State: TxRetryState{OldTxs: map[string]*types.Transaction{
 			oldTx.Hash().Hex(): oldTx,
-		},
-		Network: networks.EthereumMainnet,
+		}},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	newTx := newTestTx(6, testAddr2, oneEth)
@@ -604,8 +600,7 @@ func TestHandleBroadcastError_NonceTooLow_ChecksOldTxs(t *testing.T) {
 	result := setup.WM.handleNonceIsLowError(newTx, execCtx)
 
 	// Should return the old tx that was mined
-	assert.True(t, result.ShouldReturn)
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Equal(t, oldTx, result.Transaction)
 	assert.Nil(t, result.Error)
 }
@@ -628,17 +623,17 @@ func TestHandleNonceIsLowError_TxMinedHook_Called(t *testing.T) {
 	var receivedReceipt *types.Receipt
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		OldTxs: map[string]*types.Transaction{
+		Retry: RetryConfig{MaxAttempts: 5},
+		State: TxRetryState{OldTxs: map[string]*types.Transaction{
 			oldTx.Hash().Hex(): oldTx,
-		},
-		Network: networks.EthereumMainnet,
-		TxMinedHook: func(tx *types.Transaction, r *types.Receipt) error {
+		}},
+		Params: TxParams{Network: networks.EthereumMainnet},
+		Hooks: TxHooks{TxMined: func(tx *types.Transaction, r *types.Receipt) error {
 			hookCalled = true
 			receivedTx = tx
 			receivedReceipt = r
 			return nil
-		},
+		}},
 	}
 
 	newTx := newTestTx(6, testAddr2, oneEth)
@@ -647,7 +642,7 @@ func TestHandleNonceIsLowError_TxMinedHook_Called(t *testing.T) {
 	assert.True(t, hookCalled, "TxMinedHook should be called when old tx is mined")
 	assert.Equal(t, oldTx, receivedTx)
 	assert.Equal(t, oldReceipt, receivedReceipt)
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Equal(t, oldTx, result.Transaction)
 }
 
@@ -657,16 +652,15 @@ func TestHandleBroadcastError_TxIsKnown_RetriesWithSameNonce(t *testing.T) {
 	tx := newTestTx(5, testAddr2, oneEth)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		OldTxs:     make(map[string]*types.Transaction),
-		Network:    networks.EthereumMainnet,
+		Retry:  RetryConfig{MaxAttempts: 5},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	result := setup.WM.handleBroadcastError(ErrTxIsKnown, tx, execCtx)
 
-	assert.False(t, result.ShouldReturn)
-	assert.True(t, result.ShouldRetry)
-	assert.Equal(t, big.NewInt(5), execCtx.RetryNonce)
+	assert.Equal(t, ActionRetry, result.Action)
+	assert.Equal(t, big.NewInt(5), execCtx.State.Nonce)
 }
 
 func TestHandleBroadcastError_InsufficientFunds_IncrementsRetry(t *testing.T) {
@@ -675,18 +669,16 @@ func TestHandleBroadcastError_InsufficientFunds_IncrementsRetry(t *testing.T) {
 	tx := newTestTx(5, testAddr2, oneEth)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:       5,
-		ActualRetryCount: 0,
-		OldTxs:           make(map[string]*types.Transaction),
-		Network:          networks.EthereumMainnet,
+		Retry:  RetryConfig{MaxAttempts: 5},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	result := setup.WM.handleBroadcastError(ErrInsufficientFund, tx, execCtx)
 
-	assert.False(t, result.ShouldReturn)
-	assert.True(t, result.ShouldRetry)
-	assert.Equal(t, 1, execCtx.ActualRetryCount)
-	assert.Equal(t, big.NewInt(5), execCtx.RetryNonce)
+	assert.Equal(t, ActionRetry, result.Action)
+	assert.Equal(t, 1, execCtx.State.AttemptCount)
+	assert.Equal(t, big.NewInt(5), execCtx.State.Nonce)
 }
 
 func TestHandleBroadcastError_ExceedsRetries(t *testing.T) {
@@ -695,16 +687,14 @@ func TestHandleBroadcastError_ExceedsRetries(t *testing.T) {
 	tx := newTestTx(5, testAddr2, oneEth)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:       2,
-		ActualRetryCount: 2, // Already at limit
-		OldTxs:           make(map[string]*types.Transaction),
-		Network:          networks.EthereumMainnet,
+		Retry:  RetryConfig{MaxAttempts: 2},
+		State:  TxRetryState{AttemptCount: 2, OldTxs: make(map[string]*types.Transaction)},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	result := setup.WM.handleBroadcastError(ErrInsufficientFund, tx, execCtx)
 
-	assert.True(t, result.ShouldReturn)
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.True(t, errors.Is(result.Error, ErrEnsureTxOutOfRetries))
 }
 
@@ -722,8 +712,7 @@ func TestHandleTransactionStatus_Mined(t *testing.T) {
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "mined", Receipt: receipt}, tx, execCtx)
 
-	assert.True(t, result.ShouldReturn)
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Nil(t, result.Error)
 	assert.Equal(t, tx, result.Transaction)
 	assert.Equal(t, receipt, result.Receipt)
@@ -739,8 +728,7 @@ func TestHandleTransactionStatus_Reverted(t *testing.T) {
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "reverted", Receipt: receipt}, tx, execCtx)
 
-	assert.True(t, result.ShouldReturn)
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Nil(t, result.Error)
 	assert.Equal(t, tx, result.Transaction)
 	assert.Equal(t, receipt, result.Receipt)
@@ -756,19 +744,16 @@ func TestHandleTransactionStatus_Lost_Retries(t *testing.T) {
 	)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:       5,
-		ActualRetryCount: 0,
-		MaxGasPrice:      100.0,
-		MaxTipCap:        50.0,
+		Retry: RetryConfig{MaxAttempts: 5},
+		Gas:   GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
 
-	assert.False(t, result.ShouldReturn)
-	assert.True(t, result.ShouldRetry)
+	assert.Equal(t, ActionRetry, result.Action)
 	// Lost tx should retry with the same nonce and bumped gas
-	require.NotNil(t, execCtx.RetryNonce)
-	assert.Equal(t, big.NewInt(5), execCtx.RetryNonce)
+	require.NotNil(t, execCtx.State.Nonce)
+	assert.Equal(t, big.NewInt(5), execCtx.State.Nonce)
 }
 
 func TestHandleTransactionStatus_Slow_BumpsGas(t *testing.T) {
@@ -785,18 +770,15 @@ func TestHandleTransactionStatus_Slow_BumpsGas(t *testing.T) {
 	)
 
 	execCtx := &TxExecutionContext{
-		From:        testAddr1,
-		Network:     networks.EthereumMainnet,
-		MaxGasPrice: 100.0,
-		MaxTipCap:   50.0,
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Gas:    GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "slow"}, tx, execCtx)
 
-	assert.False(t, result.ShouldReturn)
-	assert.True(t, result.ShouldRetry)
-	assert.Greater(t, execCtx.RetryGasPrice, 20.0) // Should be bumped
-	assert.Greater(t, execCtx.RetryTipCap, 2.0)    // Should be bumped
+	assert.Equal(t, ActionRetry, result.Action)
+	assert.Greater(t, execCtx.State.GasPrice, 20.0) // Should be bumped
+	assert.Greater(t, execCtx.State.TipCap, 2.0)    // Should be bumped
 }
 
 func TestHandleTransactionStatus_Slow_HitsLimit(t *testing.T) {
@@ -813,16 +795,13 @@ func TestHandleTransactionStatus_Slow_HitsLimit(t *testing.T) {
 	)
 
 	execCtx := &TxExecutionContext{
-		From:        testAddr1,
-		Network:     networks.EthereumMainnet,
-		MaxGasPrice: 22.0, // Low limit
-		MaxTipCap:   50.0,
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 50.0},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "slow"}, tx, execCtx)
 
-	assert.True(t, result.ShouldReturn)
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.True(t, errors.Is(result.Error, ErrGasPriceLimitReached))
 }
 
@@ -834,18 +813,16 @@ func TestHandleGasEstimationFailure_NoOldTxs_Retries(t *testing.T) {
 	setup := newTestSetup(t)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:       5,
-		ActualRetryCount: 0,
-		OldTxs:           make(map[string]*types.Transaction),
-		Network:          networks.EthereumMainnet,
+		Retry:  RetryConfig{MaxAttempts: 5},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	err := errors.Join(ErrEstimateGasFailed, errors.New("execution reverted"))
 	result := setup.WM.handleGasEstimationFailure(execCtx, nil, err)
 
-	assert.False(t, result.ShouldReturn)
-	assert.True(t, result.ShouldRetry)
-	assert.Equal(t, 1, execCtx.ActualRetryCount)
+	assert.Equal(t, ActionRetry, result.Action)
+	assert.Equal(t, 1, execCtx.State.AttemptCount)
 }
 
 func TestHandleGasEstimationFailure_OldTxMined_ReturnsIt(t *testing.T) {
@@ -862,18 +839,17 @@ func TestHandleGasEstimationFailure_OldTxMined_ReturnsIt(t *testing.T) {
 	}
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		OldTxs: map[string]*types.Transaction{
+		Retry: RetryConfig{MaxAttempts: 5},
+		State: TxRetryState{OldTxs: map[string]*types.Transaction{
 			oldTx.Hash().Hex(): oldTx,
-		},
-		Network: networks.EthereumMainnet,
+		}},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	err := errors.Join(ErrEstimateGasFailed, errors.New("execution reverted"))
 	result := setup.WM.handleGasEstimationFailure(execCtx, nil, err)
 
-	assert.True(t, result.ShouldReturn)
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Equal(t, oldTx, result.Transaction)
 }
 
@@ -881,17 +857,15 @@ func TestHandleGasEstimationFailure_ExceedsRetries(t *testing.T) {
 	setup := newTestSetup(t)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:       2,
-		ActualRetryCount: 2, // Already at limit
-		OldTxs:           make(map[string]*types.Transaction),
-		Network:          networks.EthereumMainnet,
+		Retry:  RetryConfig{MaxAttempts: 2},
+		State:  TxRetryState{AttemptCount: 2, OldTxs: make(map[string]*types.Transaction)},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	err := errors.Join(ErrEstimateGasFailed, errors.New("execution reverted"))
 	result := setup.WM.handleGasEstimationFailure(execCtx, nil, err)
 
-	assert.True(t, result.ShouldReturn)
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.True(t, errors.Is(result.Error, ErrEnsureTxOutOfRetries))
 }
 
@@ -913,17 +887,17 @@ func TestHandleGasEstimationFailure_TxMinedHook_Called(t *testing.T) {
 	var receivedReceipt *types.Receipt
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		OldTxs: map[string]*types.Transaction{
+		Retry: RetryConfig{MaxAttempts: 5},
+		State: TxRetryState{OldTxs: map[string]*types.Transaction{
 			oldTx.Hash().Hex(): oldTx,
-		},
-		Network: networks.EthereumMainnet,
-		TxMinedHook: func(tx *types.Transaction, r *types.Receipt) error {
+		}},
+		Params: TxParams{Network: networks.EthereumMainnet},
+		Hooks: TxHooks{TxMined: func(tx *types.Transaction, r *types.Receipt) error {
 			hookCalled = true
 			receivedTx = tx
 			receivedReceipt = r
 			return nil
-		},
+		}},
 	}
 
 	err := errors.Join(ErrEstimateGasFailed, errors.New("execution reverted"))
@@ -932,7 +906,7 @@ func TestHandleGasEstimationFailure_TxMinedHook_Called(t *testing.T) {
 	assert.True(t, hookCalled, "TxMinedHook should be called when old tx is mined")
 	assert.Equal(t, oldTx, receivedTx)
 	assert.Equal(t, oldReceipt, receivedReceipt)
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Equal(t, oldTx, result.Transaction)
 }
 
@@ -949,24 +923,15 @@ func TestExecuteTransactionAttempt_SimulationFails_ReturnsError(t *testing.T) {
 	}
 
 	execCtx := &TxExecutionContext{
-		NumRetries:    5,
-		TxType:        2,
-		From:          testAddr1,
-		To:            testAddr2,
-		Value:         oneEth,
-		GasLimit:      21000,
-		RetryGasPrice: 20.0,
-		RetryTipCap:   2.0,
-		Data:          nil,
-		Network:       networks.EthereumMainnet,
-		OldTxs:        make(map[string]*types.Transaction),
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{TxType: 2, From: testAddr1, To: testAddr2, Value: oneEth, Network: networks.EthereumMainnet},
+		State:  TxRetryState{GasLimit: 21000, GasPrice: 20.0, TipCap: 2.0, OldTxs: make(map[string]*types.Transaction)},
 	}
 
 	result := setup.WM.executeTransactionAttempt(context.Background(), execCtx, nil)
 
 	// Should return error since simulation failed (not a revert)
-	assert.True(t, result.ShouldReturn)
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.True(t, errors.Is(result.Error, ErrSimulatedTxFailed))
 }
 
@@ -981,24 +946,16 @@ func TestExecuteTransactionAttempt_SimulationSucceeds_ContinuesToBroadcast(t *te
 	// Track if we get to the broadcast phase (signAndBroadcastTransaction)
 	// This will fail because we don't have a signed account, but that's OK for this test
 	execCtx := &TxExecutionContext{
-		NumRetries:    5,
-		TxType:        2,
-		From:          testAddr1,
-		To:            testAddr2,
-		Value:         oneEth,
-		GasLimit:      21000,
-		RetryGasPrice: 20.0,
-		RetryTipCap:   2.0,
-		Data:          nil,
-		Network:       networks.EthereumMainnet,
-		OldTxs:        make(map[string]*types.Transaction),
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{TxType: 2, From: testAddr1, To: testAddr2, Value: oneEth, Network: networks.EthereumMainnet},
+		State:  TxRetryState{GasLimit: 21000, GasPrice: 20.0, TipCap: 2.0, OldTxs: make(map[string]*types.Transaction)},
 	}
 
 	result := setup.WM.executeTransactionAttempt(context.Background(), execCtx, nil)
 
 	// The test should pass simulation and fail at signing (because we have no account)
 	// This confirms simulation was successful
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Contains(t, result.Error.Error(), "not registered")
 }
 
@@ -1017,12 +974,12 @@ func TestHandleTransactionStatus_TxMinedHook_Called(t *testing.T) {
 	var receivedReceipt *types.Receipt
 
 	execCtx := &TxExecutionContext{
-		TxMinedHook: func(tx *types.Transaction, r *types.Receipt) error {
+		Hooks: TxHooks{TxMined: func(tx *types.Transaction, r *types.Receipt) error {
 			hookCalled = true
 			receivedTx = tx
 			receivedReceipt = r
 			return nil
-		},
+		}},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "mined", Receipt: receipt}, tx, execCtx)
@@ -1030,7 +987,7 @@ func TestHandleTransactionStatus_TxMinedHook_Called(t *testing.T) {
 	assert.True(t, hookCalled)
 	assert.Equal(t, tx, receivedTx)
 	assert.Equal(t, receipt, receivedReceipt)
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Nil(t, result.Error)
 }
 
@@ -1043,14 +1000,14 @@ func TestHandleTransactionStatus_TxMinedHook_ReturnsError(t *testing.T) {
 	hookError := errors.New("hook failed")
 
 	execCtx := &TxExecutionContext{
-		TxMinedHook: func(tx *types.Transaction, r *types.Receipt) error {
+		Hooks: TxHooks{TxMined: func(tx *types.Transaction, r *types.Receipt) error {
 			return hookError
-		},
+		}},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "mined", Receipt: receipt}, tx, execCtx)
 
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Error(t, result.Error)
 	assert.Contains(t, result.Error.Error(), "hook error")
 }
@@ -1070,12 +1027,12 @@ func TestHandleMinedTx_TxMinedHook_Called_StatusDone(t *testing.T) {
 	var receivedReceipt *types.Receipt
 
 	execCtx := &TxExecutionContext{
-		TxMinedHook: func(tx *types.Transaction, r *types.Receipt) error {
+		Hooks: TxHooks{TxMined: func(tx *types.Transaction, r *types.Receipt) error {
 			hookCalled = true
 			receivedTx = tx
 			receivedReceipt = r
 			return nil
-		},
+		}},
 	}
 
 	result := setup.WM.handleMinedTx(tx, TxInfo{Status: "done", Receipt: receipt}, execCtx)
@@ -1083,7 +1040,7 @@ func TestHandleMinedTx_TxMinedHook_Called_StatusDone(t *testing.T) {
 	assert.True(t, hookCalled, "TxMinedHook should be called")
 	assert.Equal(t, tx, receivedTx)
 	assert.Equal(t, receipt, receivedReceipt)
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Nil(t, result.Error)
 }
 
@@ -1096,16 +1053,16 @@ func TestHandleMinedTx_TxMinedHook_Called_StatusMined(t *testing.T) {
 	hookCalled := false
 
 	execCtx := &TxExecutionContext{
-		TxMinedHook: func(tx *types.Transaction, r *types.Receipt) error {
+		Hooks: TxHooks{TxMined: func(tx *types.Transaction, r *types.Receipt) error {
 			hookCalled = true
 			return nil
-		},
+		}},
 	}
 
 	result := setup.WM.handleMinedTx(tx, TxInfo{Status: "mined", Receipt: receipt}, execCtx)
 
 	assert.True(t, hookCalled, "TxMinedHook should be called")
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Nil(t, result.Error)
 }
 
@@ -1118,16 +1075,16 @@ func TestHandleMinedTx_TxMinedHook_Called_StatusReverted(t *testing.T) {
 	hookCalled := false
 
 	execCtx := &TxExecutionContext{
-		TxMinedHook: func(tx *types.Transaction, r *types.Receipt) error {
+		Hooks: TxHooks{TxMined: func(tx *types.Transaction, r *types.Receipt) error {
 			hookCalled = true
 			return nil
-		},
+		}},
 	}
 
 	result := setup.WM.handleMinedTx(tx, TxInfo{Status: "reverted", Receipt: receipt}, execCtx)
 
 	assert.True(t, hookCalled, "TxMinedHook should be called")
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Nil(t, result.Error)
 }
 
@@ -1140,16 +1097,16 @@ func TestHandleMinedTx_TxMinedHook_Called_EmptyStatus_SuccessfulReceipt(t *testi
 	hookCalled := false
 
 	execCtx := &TxExecutionContext{
-		TxMinedHook: func(tx *types.Transaction, r *types.Receipt) error {
+		Hooks: TxHooks{TxMined: func(tx *types.Transaction, r *types.Receipt) error {
 			hookCalled = true
 			return nil
-		},
+		}},
 	}
 
 	result := setup.WM.handleMinedTx(tx, TxInfo{Status: "", Receipt: receipt}, execCtx)
 
 	assert.True(t, hookCalled, "TxMinedHook should be called")
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Nil(t, result.Error)
 }
 
@@ -1162,16 +1119,16 @@ func TestHandleMinedTx_TxMinedHook_Called_EmptyStatus_RevertedReceipt(t *testing
 	hookCalled := false
 
 	execCtx := &TxExecutionContext{
-		TxMinedHook: func(tx *types.Transaction, r *types.Receipt) error {
+		Hooks: TxHooks{TxMined: func(tx *types.Transaction, r *types.Receipt) error {
 			hookCalled = true
 			return nil
-		},
+		}},
 	}
 
 	result := setup.WM.handleMinedTx(tx, TxInfo{Status: "", Receipt: receipt}, execCtx)
 
 	assert.True(t, hookCalled, "TxMinedHook should be called")
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Nil(t, result.Error)
 }
 
@@ -1184,14 +1141,14 @@ func TestHandleMinedTx_TxMinedHook_ReturnsError(t *testing.T) {
 	hookError := errors.New("hook failed")
 
 	execCtx := &TxExecutionContext{
-		TxMinedHook: func(tx *types.Transaction, r *types.Receipt) error {
+		Hooks: TxHooks{TxMined: func(tx *types.Transaction, r *types.Receipt) error {
 			return hookError
-		},
+		}},
 	}
 
 	result := setup.WM.handleMinedTx(tx, TxInfo{Status: "done", Receipt: receipt}, execCtx)
 
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Error(t, result.Error)
 	assert.Contains(t, result.Error.Error(), "tx mined hook error")
 }
@@ -1202,13 +1159,11 @@ func TestHandleMinedTx_NoHook_StillReturnsSuccess(t *testing.T) {
 	tx := newTestTx(5, testAddr2, oneEth)
 	receipt := newSuccessReceipt(tx)
 
-	execCtx := &TxExecutionContext{
-		TxMinedHook: nil,
-	}
+	execCtx := &TxExecutionContext{}
 
 	result := setup.WM.handleMinedTx(tx, TxInfo{Status: "done", Receipt: receipt}, execCtx)
 
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Nil(t, result.Error)
 	assert.Equal(t, tx, result.Transaction)
 	assert.Equal(t, receipt, result.Receipt)
@@ -1547,19 +1502,17 @@ func TestSignAndBroadcast_ReleasesNonce_WhenBeforeHookFails(t *testing.T) {
 	tx := newTestTx(5, testAddr2, oneEth)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		From:       testAddr1,
-		To:         testAddr2,
-		Network:    networks.EthereumMainnet,
-		OldTxs:     make(map[string]*types.Transaction),
-		BeforeSignAndBroadcastHook: func(tx *types.Transaction, err error) error {
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{From: testAddr1, To: testAddr2, Network: networks.EthereumMainnet},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
+		Hooks: TxHooks{BeforeSignAndBroadcast: func(tx *types.Transaction, err error) error {
 			return errors.New("hook says no")
-		},
+		}},
 	}
 
 	result := setup.WM.signAndBroadcastTransaction(context.Background(), tx, execCtx)
 
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Error(t, result.Error)
 	assert.Contains(t, result.Error.Error(), "hook")
 
@@ -1598,17 +1551,15 @@ func TestSignAndBroadcastTransaction_SyncBroadcast_TxMinedHook_Called(t *testing
 	tx := newTestTxWithChainID(5, testAddr2, oneEth, chainIDArbitrum)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		From:       fromAddr,
-		To:         testAddr2,
-		Network:    networks.ArbitrumMainnet,
-		OldTxs:     make(map[string]*types.Transaction),
-		TxMinedHook: func(tx *types.Transaction, r *types.Receipt) error {
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{From: fromAddr, To: testAddr2, Network: networks.ArbitrumMainnet},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
+		Hooks: TxHooks{TxMined: func(tx *types.Transaction, r *types.Receipt) error {
 			hookCalled = true
 			receivedTx = tx
 			receivedReceipt = r
 			return nil
-		},
+		}},
 	}
 
 	result := setup.WM.signAndBroadcastTransaction(context.Background(), tx, execCtx)
@@ -1616,7 +1567,7 @@ func TestSignAndBroadcastTransaction_SyncBroadcast_TxMinedHook_Called(t *testing
 	assert.True(t, hookCalled, "TxMinedHook should be called when sync broadcast returns receipt")
 	assert.NotNil(t, receivedTx)
 	assert.Equal(t, expectedReceipt, receivedReceipt)
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Nil(t, result.Error)
 }
 
@@ -1679,28 +1630,20 @@ func TestSimulation_NonRevertError_ReturnsErrorWithoutHook(t *testing.T) {
 
 	hookCalled := false
 	execCtx := &TxExecutionContext{
-		NumRetries:    5,
-		TxType:        2,
-		From:          testAddr1,
-		To:            testAddr2,
-		Value:         oneEth,
-		GasLimit:      21000,
-		RetryGasPrice: 20.0,
-		RetryTipCap:   2.0,
-		Network:       networks.EthereumMainnet,
-		OldTxs:        make(map[string]*types.Transaction),
-		SimulationFailedHook: func(tx *types.Transaction, revertData []byte, abiError *abi.Error, revertParams any, err error) (bool, error) {
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{TxType: 2, From: testAddr1, To: testAddr2, Value: oneEth, Network: networks.EthereumMainnet},
+		State:  TxRetryState{GasLimit: 21000, GasPrice: 20.0, TipCap: 2.0, OldTxs: make(map[string]*types.Transaction)},
+		Hooks: TxHooks{SimulationFailed: func(tx *types.Transaction, revertData []byte, abiError *abi.Error, revertParams any, err error) (bool, error) {
 			hookCalled = true
 			return false, nil
-		},
+		}},
 	}
 
 	result := setup.WM.executeTransactionAttempt(context.Background(), execCtx, nil)
 
 	// Hook should NOT be called for non-revert errors
 	assert.False(t, hookCalled, "simulation hook should NOT be called for non-revert errors")
-	assert.True(t, result.ShouldReturn)
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Error(t, result.Error)
 	assert.True(t, errors.Is(result.Error, ErrSimulatedTxFailed))
 }
@@ -1917,8 +1860,7 @@ func TestEnsureTx_SlowTxTriggersGasBump(t *testing.T) {
 	// The full integration with monitor is tested separately
 
 	ctx := &TxExecutionContext{
-		MaxGasPrice: 100.0,
-		MaxTipCap:   50.0,
+		Gas: GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0},
 	}
 
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
@@ -1930,8 +1872,8 @@ func TestEnsureTx_SlowTxTriggersGasBump(t *testing.T) {
 	adjusted := ctx.AdjustGasPricesForSlowTx(tx)
 
 	assert.True(t, adjusted, "should be able to adjust gas prices")
-	assert.Greater(t, ctx.RetryGasPrice, 20.0, "gas price should be bumped above 20")
-	assert.Greater(t, ctx.RetryTipCap, 2.0, "tip cap should be bumped above 2")
+	assert.Greater(t, ctx.State.GasPrice, 20.0, "gas price should be bumped above 20")
+	assert.Greater(t, ctx.State.TipCap, 2.0, "tip cap should be bumped above 2")
 }
 
 func TestEnsureTx_MaxRetriesExceeded(t *testing.T) {
@@ -1975,8 +1917,7 @@ func TestEnsureTx_GasPriceLimitReached_Unit(t *testing.T) {
 	// Unit test: verify that AdjustGasPricesForSlowTx returns false when limit would be exceeded
 
 	ctx := &TxExecutionContext{
-		MaxGasPrice: 22.0, // Low limit - 20 * 1.2 = 24 would exceed
-		MaxTipCap:   50.0,
+		Gas: GasBounds{MaxGasPrice: 22.0, MaxTipCap: 50.0},
 	}
 
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
@@ -2315,35 +2256,32 @@ func TestHandleNonceIsLowError_TxStatusCheckFails_RetriesOrExceeds(t *testing.T)
 
 	t.Run("retries when under limit", func(t *testing.T) {
 		execCtx := &TxExecutionContext{
-			NumRetries: 5,
-			OldTxs: map[string]*types.Transaction{
+			Retry: RetryConfig{MaxAttempts: 5},
+			State: TxRetryState{OldTxs: map[string]*types.Transaction{
 				oldTx.Hash().Hex(): oldTx,
-			},
-			Network: networks.EthereumMainnet,
+			}},
+			Params: TxParams{Network: networks.EthereumMainnet},
 		}
 
 		result := setup.WM.handleNonceIsLowError(newTx, execCtx)
 
-		assert.True(t, result.ShouldRetry)
-		assert.False(t, result.ShouldReturn)
+		assert.Equal(t, ActionRetry, result.Action)
 		assert.Nil(t, result.Error)
 	})
 
 	t.Run("exceeds retries", func(t *testing.T) {
 		execCtx := &TxExecutionContext{
-			NumRetries:       3,
-			ActualRetryCount: 3, // Already at max
-			OldTxs: map[string]*types.Transaction{
+			Retry: RetryConfig{MaxAttempts: 3},
+			State: TxRetryState{AttemptCount: 3, OldTxs: map[string]*types.Transaction{
 				oldTx.Hash().Hex(): oldTx,
-			},
-			Network: networks.EthereumMainnet,
+			}},
+			Params: TxParams{Network: networks.EthereumMainnet},
 		}
 
 		result := setup.WM.handleNonceIsLowError(newTx, execCtx)
 
 		// Should return with error after exceeding retries
-		assert.False(t, result.ShouldRetry)
-		assert.True(t, result.ShouldReturn)
+		assert.Equal(t, ActionReturn, result.Action)
 		assert.Error(t, result.Error)
 	})
 }
@@ -2360,19 +2298,18 @@ func TestHandleNonceIsLowError_NoPendingTxs_Retries(t *testing.T) {
 	newTx := newTestTx(6, testAddr2, oneEth)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		OldTxs: map[string]*types.Transaction{
+		Retry: RetryConfig{MaxAttempts: 5},
+		State: TxRetryState{OldTxs: map[string]*types.Transaction{
 			oldTx.Hash().Hex(): oldTx,
-		},
-		Network: networks.EthereumMainnet,
+		}},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	result := setup.WM.handleNonceIsLowError(newTx, execCtx)
 
-	// Should retry with new nonce (RetryNonce = nil)
-	assert.True(t, result.ShouldRetry)
-	assert.False(t, result.ShouldReturn)
-	assert.Nil(t, execCtx.RetryNonce)
+	// Should retry with new nonce (Nonce = nil)
+	assert.Equal(t, ActionRetry, result.Action)
+	assert.Nil(t, execCtx.State.Nonce)
 }
 
 func TestHandleNonceIsLowError_RevertedTxFound_Returns(t *testing.T) {
@@ -2391,18 +2328,17 @@ func TestHandleNonceIsLowError_RevertedTxFound_Returns(t *testing.T) {
 	newTx := newTestTx(6, testAddr2, oneEth)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		OldTxs: map[string]*types.Transaction{
+		Retry: RetryConfig{MaxAttempts: 5},
+		State: TxRetryState{OldTxs: map[string]*types.Transaction{
 			oldTx.Hash().Hex(): oldTx,
-		},
-		Network: networks.EthereumMainnet,
+		}},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	result := setup.WM.handleNonceIsLowError(newTx, execCtx)
 
 	// Should return the reverted tx
-	assert.True(t, result.ShouldReturn)
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Equal(t, oldTx, result.Transaction)
 }
 
@@ -2412,16 +2348,15 @@ func TestHandleNonceIsLowError_NoOldTxs_Retries(t *testing.T) {
 	newTx := newTestTx(6, testAddr2, oneEth)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		OldTxs:     make(map[string]*types.Transaction), // Empty
-		Network:    networks.EthereumMainnet,
+		Retry:  RetryConfig{MaxAttempts: 5},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	result := setup.WM.handleNonceIsLowError(newTx, execCtx)
 
 	// Should retry
-	assert.True(t, result.ShouldRetry)
-	assert.False(t, result.ShouldReturn)
+	assert.Equal(t, ActionRetry, result.Action)
 }
 
 func TestHandleNonceIsLowError_ExceedsRetries_NoPendingTxs(t *testing.T) {
@@ -2435,18 +2370,16 @@ func TestHandleNonceIsLowError_ExceedsRetries_NoPendingTxs(t *testing.T) {
 	newTx := newTestTx(6, testAddr2, oneEth)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:       2,
-		ActualRetryCount: 2, // At max
-		OldTxs: map[string]*types.Transaction{
+		Retry: RetryConfig{MaxAttempts: 2},
+		State: TxRetryState{AttemptCount: 2, OldTxs: map[string]*types.Transaction{
 			oldTx.Hash().Hex(): oldTx,
-		},
-		Network: networks.EthereumMainnet,
+		}},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	result := setup.WM.handleNonceIsLowError(newTx, execCtx)
 
-	assert.False(t, result.ShouldRetry)
-	assert.True(t, result.ShouldReturn)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.Error(t, result.Error)
 }
 
@@ -2537,23 +2470,22 @@ func TestHandleNonceIsLowError_StatusDoneButTxNotInMap_Continues(t *testing.T) {
 	newTx := newTestTx(6, testAddr2, oneEth)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		OldTxs: map[string]*types.Transaction{
+		Retry: RetryConfig{MaxAttempts: 5},
+		State: TxRetryState{OldTxs: map[string]*types.Transaction{
 			// Only differentTx in the map, but it's "pending"
 			differentTx.Hash().Hex(): differentTx,
-		},
-		Network: networks.EthereumMainnet,
+		}},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	result := setup.WM.handleNonceIsLowError(newTx, execCtx)
 
 	// Should retry since no completed tx was found
-	assert.True(t, result.ShouldRetry)
-	assert.False(t, result.ShouldReturn)
+	assert.Equal(t, ActionRetry, result.Action)
 
 	// Make oldTx hash not in map to verify the edge case
 	// Verify OldTxs doesn't have the oldTx
-	_, exists := execCtx.OldTxs[oldTx.Hash().Hex()]
+	_, exists := execCtx.State.OldTxs[oldTx.Hash().Hex()]
 	assert.False(t, exists)
 }
 
@@ -2575,19 +2507,18 @@ func TestHandleNonceIsLowError_HashMismatch_Continues(t *testing.T) {
 	newTx := newTestTx(6, testAddr2, oneEth)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		OldTxs: map[string]*types.Transaction{
+		Retry: RetryConfig{MaxAttempts: 5},
+		State: TxRetryState{OldTxs: map[string]*types.Transaction{
 			// Different tx hash stored
 			anotherTx.Hash().Hex(): anotherTx,
-		},
-		Network: networks.EthereumMainnet,
+		}},
+		Params: TxParams{Network: networks.EthereumMainnet},
 	}
 
 	result := setup.WM.handleNonceIsLowError(newTx, execCtx)
 
 	// Should retry since the matching hash is not in OldTxs
-	assert.True(t, result.ShouldRetry)
-	assert.False(t, result.ShouldReturn)
+	assert.Equal(t, ActionRetry, result.Action)
 }
 
 // ============================================================
@@ -2611,11 +2542,9 @@ func TestSyncBroadcast_SucceedsWithinTimeout_ReturnsReceiptImmediately(t *testin
 	tx := newTestTxWithChainID(0, testAddr2, oneEth, chainIDArbitrum)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 3,
-		From:       setup.FromAddr, // Use actual account address
-		To:         testAddr2,
-		Network:    mockNetwork,
-		OldTxs:     make(map[string]*types.Transaction),
+		Retry:  RetryConfig{MaxAttempts: 3},
+		Params: TxParams{From: setup.FromAddr, To: testAddr2, Network: mockNetwork},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
 	}
 
 	result := setup.WM.signAndBroadcastTransaction(context.Background(), tx, execCtx)
@@ -2623,8 +2552,7 @@ func TestSyncBroadcast_SucceedsWithinTimeout_ReturnsReceiptImmediately(t *testin
 	// Should have receipt and should return immediately (not fall back to monitor)
 	require.NotNil(t, result.Receipt, "Should get receipt immediately from sync broadcast")
 	assert.Equal(t, types.ReceiptStatusSuccessful, result.Receipt.Status)
-	assert.True(t, result.ShouldReturn, "Should return immediately with sync broadcast success")
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionReturn, result.Action, "Should return immediately with sync broadcast success")
 
 	// Verify BroadcastTxSync was called (not BroadcastTx)
 	assert.Len(t, setup.Broadcaster.BroadcastTxSyncCalls, 1)
@@ -2642,18 +2570,15 @@ func TestSyncBroadcast_Fails_ReturnsForRetry(t *testing.T) {
 	tx := newTestTxWithChainID(0, testAddr2, oneEth, chainIDArbitrum)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 3,
-		From:       setup.FromAddr,
-		To:         testAddr2,
-		Network:    mockNetwork,
-		OldTxs:     make(map[string]*types.Transaction),
+		Retry:  RetryConfig{MaxAttempts: 3},
+		Params: TxParams{From: setup.FromAddr, To: testAddr2, Network: mockNetwork},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
 	}
 
 	result := setup.WM.signAndBroadcastTransaction(context.Background(), tx, execCtx)
 
 	// Should indicate retry is needed
-	assert.True(t, result.ShouldRetry, "Should retry after broadcast failure")
-	assert.False(t, result.ShouldReturn)
+	assert.Equal(t, ActionRetry, result.Action, "Should retry after broadcast failure")
 	assert.Nil(t, result.Receipt)
 }
 
@@ -2672,11 +2597,9 @@ func TestSyncBroadcast_ContextCancelled_ReturnsError(t *testing.T) {
 	tx := newTestTxWithChainID(0, testAddr2, oneEth, chainIDArbitrum)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 3,
-		From:       setup.FromAddr,
-		To:         testAddr2,
-		Network:    mockNetwork,
-		OldTxs:     make(map[string]*types.Transaction),
+		Retry:  RetryConfig{MaxAttempts: 3},
+		Params: TxParams{From: setup.FromAddr, To: testAddr2, Network: mockNetwork},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -2685,7 +2608,7 @@ func TestSyncBroadcast_ContextCancelled_ReturnsError(t *testing.T) {
 	result := setup.WM.signAndBroadcastTransaction(ctx, tx, execCtx)
 
 	// Should return with context error
-	require.True(t, result.ShouldReturn, "Should return when context is cancelled")
+	require.Equal(t, ActionReturn, result.Action, "Should return when context is cancelled")
 	require.Error(t, result.Error)
 	assert.ErrorIs(t, result.Error, context.DeadlineExceeded)
 }
@@ -2718,11 +2641,9 @@ func TestSyncBroadcast_Timeout_FallsBackToAsyncMonitoring(t *testing.T) {
 	tx := newTestTxWithChainID(0, testAddr2, oneEth, chainIDArbitrum)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 5,
-		From:       setup.FromAddr,
-		To:         testAddr2,
-		Network:    mockNetwork,
-		OldTxs:     make(map[string]*types.Transaction),
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{From: setup.FromAddr, To: testAddr2, Network: mockNetwork},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2733,12 +2654,10 @@ func TestSyncBroadcast_Timeout_FallsBackToAsyncMonitoring(t *testing.T) {
 	// After timeout, should return with:
 	// - Transaction set (it was signed)
 	// - No receipt (timed out before getting one)
-	// - ShouldReturn = false (so monitor flow kicks in)
-	// - ShouldRetry = false
+	// - Action = ActionContinueToMonitor (so monitor flow kicks in)
 	assert.NotNil(t, result.Transaction, "Should have signed transaction")
 	assert.Nil(t, result.Receipt, "Should not have receipt after timeout")
-	assert.False(t, result.ShouldReturn, "Should not return immediately - needs to go to monitor flow")
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionContinueToMonitor, result.Action, "Should not return immediately - needs to go to monitor flow")
 	assert.Nil(t, result.Error, "Timeout is not an error - it's a fallback to async monitoring")
 }
 
@@ -2758,11 +2677,9 @@ func TestSyncBroadcast_ReturnsRevertedReceipt_HandledCorrectly(t *testing.T) {
 	tx := newTestTxWithChainID(0, testAddr2, oneEth, chainIDArbitrum)
 
 	execCtx := &TxExecutionContext{
-		NumRetries: 3,
-		From:       setup.FromAddr,
-		To:         testAddr2,
-		Network:    mockNetwork,
-		OldTxs:     make(map[string]*types.Transaction),
+		Retry:  RetryConfig{MaxAttempts: 3},
+		Params: TxParams{From: setup.FromAddr, To: testAddr2, Network: mockNetwork},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
 	}
 
 	result := setup.WM.signAndBroadcastTransaction(context.Background(), tx, execCtx)
@@ -2770,13 +2687,13 @@ func TestSyncBroadcast_ReturnsRevertedReceipt_HandledCorrectly(t *testing.T) {
 	// Should return with the reverted receipt (not an error - tx was mined)
 	require.NotNil(t, result.Receipt)
 	assert.Equal(t, types.ReceiptStatusFailed, result.Receipt.Status, "Should return the reverted receipt")
-	assert.True(t, result.ShouldReturn, "Should return with reverted receipt")
+	assert.Equal(t, ActionReturn, result.Action, "Should return with reverted receipt")
 	assert.Nil(t, result.Error, "Reverted tx is not an error - it's a valid outcome")
 }
 
 func TestSyncBroadcast_Timeout_TriggersMonitorFlow(t *testing.T) {
 	// This test verifies that when sync broadcast times out:
-	// 1. The function returns with ShouldReturn=false (triggering monitor flow)
+	// 1. The function returns with Action=ActionContinueToMonitor (triggering monitor flow)
 	// 2. The monitor is subsequently called
 
 	// Override timeout for faster testing
@@ -2822,15 +2739,9 @@ func TestSyncBroadcast_Timeout_TriggersMonitorFlow(t *testing.T) {
 	require.NoError(t, err)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:      5,
-		From:            setup.FromAddr,
-		To:              testAddr2,
-		Network:         mockNetwork,
-		TxType:          2,
-		Value:           oneEth,
-		GasLimit:        21000,
-		TxCheckInterval: 10 * time.Millisecond,
-		OldTxs:          make(map[string]*types.Transaction),
+		Retry:  RetryConfig{MaxAttempts: 5, TxCheckInterval: 10 * time.Millisecond},
+		Params: TxParams{From: setup.FromAddr, To: testAddr2, Network: mockNetwork, TxType: 2, Value: oneEth},
+		State:  TxRetryState{GasLimit: 21000, OldTxs: make(map[string]*types.Transaction)},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -2840,7 +2751,7 @@ func TestSyncBroadcast_Timeout_TriggersMonitorFlow(t *testing.T) {
 	result1 := setup.WM.signAndBroadcastTransaction(ctx, initialTx, execCtx)
 	require.NotNil(t, result1.Transaction, "Should have transaction after timeout")
 	require.Nil(t, result1.Receipt, "Should not have receipt after timeout")
-	require.False(t, result1.ShouldReturn, "Should go to monitor flow, not return immediately")
+	require.Equal(t, ActionContinueToMonitor, result1.Action, "Should go to monitor flow, not return immediately")
 
 	// Simulate what ensureTxWithHooksContextInternal does after signAndBroadcast returns with no receipt
 	// It should call MonitorTxContext
@@ -2882,25 +2793,18 @@ func TestNonceLeak_NonRevertSimulationFailure_ShouldReleaseNonce(t *testing.T) {
 		return nil, fmt.Errorf("network connection timeout")
 	}
 
-	// First attempt: RetryNonce is nil, so BuildTx acquires nonce internally
+	// First attempt: Nonce is nil, so BuildTx acquires nonce internally
 	execCtx := &TxExecutionContext{
-		NumRetries:    5,
-		TxType:        2,
-		From:          testAddr1,
-		To:            testAddr2,
-		Value:         oneEth,
-		GasLimit:      21000,
-		RetryGasPrice: 20.0,
-		RetryTipCap:   2.0,
-		Network:       networks.EthereumMainnet,
-		OldTxs:        make(map[string]*types.Transaction),
-		// RetryNonce is nil — simulates the first attempt in executeTransactionLoop
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{TxType: 2, From: testAddr1, To: testAddr2, Value: oneEth, Network: networks.EthereumMainnet},
+		State:  TxRetryState{GasLimit: 21000, GasPrice: 20.0, TipCap: 2.0, OldTxs: make(map[string]*types.Transaction)},
+		// State.Nonce is nil — simulates the first attempt in executeTransactionLoop
 	}
 
 	result := setup.WM.executeTransactionAttempt(context.Background(), execCtx, nil)
 
 	// Confirm it returned an error (simulation failed)
-	require.True(t, result.ShouldReturn)
+	require.Equal(t, ActionReturn, result.Action)
 	require.Error(t, result.Error)
 	assert.True(t, errors.Is(result.Error, ErrSimulatedTxFailed))
 
@@ -2932,21 +2836,14 @@ func TestNonceLeak_NonRevertSimulationFailure_CompoundsOverMultipleCalls(t *test
 	// Simulate 3 consecutive failed attempts via executeTransactionAttempt
 	for i := 0; i < 3; i++ {
 		execCtx := &TxExecutionContext{
-			NumRetries:    5,
-			TxType:        2,
-			From:          testAddr1,
-			To:            testAddr2,
-			Value:         oneEth,
-			GasLimit:      21000,
-			RetryGasPrice: 20.0,
-			RetryTipCap:   2.0,
-			Network:       networks.EthereumMainnet,
-			OldTxs:        make(map[string]*types.Transaction),
-			// RetryNonce is nil — each call acquires a new nonce internally
+			Retry:  RetryConfig{MaxAttempts: 5},
+			Params: TxParams{TxType: 2, From: testAddr1, To: testAddr2, Value: oneEth, Network: networks.EthereumMainnet},
+			State:  TxRetryState{GasLimit: 21000, GasPrice: 20.0, TipCap: 2.0, OldTxs: make(map[string]*types.Transaction)},
+			// State.Nonce is nil — each call acquires a new nonce internally
 		}
 
 		result := setup.WM.executeTransactionAttempt(context.Background(), execCtx, nil)
-		require.True(t, result.ShouldReturn, "attempt %d should return", i)
+		require.Equal(t, ActionReturn, result.Action, "attempt %d should return", i)
 		require.Error(t, result.Error, "attempt %d should error", i)
 	}
 
@@ -3028,28 +2925,25 @@ func TestHandleTransactionStatus_Lost_RetriesWithSameNonce(t *testing.T) {
 	)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:       5,
-		ActualRetryCount: 0,
-		MaxGasPrice:      100.0,
-		MaxTipCap:        50.0,
+		Retry: RetryConfig{MaxAttempts: 5},
+		Gas:   GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
 
-	assert.False(t, result.ShouldReturn)
-	assert.True(t, result.ShouldRetry)
+	assert.Equal(t, ActionRetry, result.Action)
 
-	// The key assertion: RetryNonce should be set to the SAME nonce (5),
+	// The key assertion: Nonce should be set to the SAME nonce (5),
 	// not nil (which would cause a new nonce to be acquired).
-	require.NotNil(t, execCtx.RetryNonce,
-		"RetryNonce should be set to the lost tx's nonce, not nil")
-	assert.Equal(t, big.NewInt(5), execCtx.RetryNonce,
-		"RetryNonce should be the same nonce as the lost tx")
+	require.NotNil(t, execCtx.State.Nonce,
+		"Nonce should be set to the lost tx's nonce, not nil")
+	assert.Equal(t, big.NewInt(5), execCtx.State.Nonce,
+		"Nonce should be the same nonce as the lost tx")
 
 	// Gas should be bumped (same behavior as slow tx)
-	assert.Greater(t, execCtx.RetryGasPrice, 20.0,
+	assert.Greater(t, execCtx.State.GasPrice, 20.0,
 		"Gas price should be bumped for lost tx retry")
-	assert.Greater(t, execCtx.RetryTipCap, 2.0,
+	assert.Greater(t, execCtx.State.TipCap, 2.0,
 		"Tip cap should be bumped for lost tx retry")
 }
 
@@ -3071,19 +2965,15 @@ func TestHandleTransactionStatus_Lost_HitsGasLimit(t *testing.T) {
 	)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:       5,
-		ActualRetryCount: 0,
-		From:             testAddr1,
-		Network:          networks.EthereumMainnet,
-		MaxGasPrice:      22.0, // Low limit — bumping 20 gwei by 10% = 22, which hits limit
-		MaxTipCap:        50.0,
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 50.0},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
 
-	assert.True(t, result.ShouldReturn,
+	assert.Equal(t, ActionReturn, result.Action,
 		"Should return when gas limit reached for non-blocking lost tx")
-	assert.False(t, result.ShouldRetry)
 	assert.True(t, errors.Is(result.Error, ErrGasPriceLimitReached))
 }
 
@@ -3160,26 +3050,23 @@ func TestHandleBroadcastError_ReplacementUnderpriced_BumpsGas(t *testing.T) {
 	)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:  5,
-		From:        testAddr1,
-		Network:     networks.EthereumMainnet,
-		MaxGasPrice: 200.0, // High limit — plenty of room
-		MaxTipCap:   100.0,
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Gas:    GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0},
 	}
 
 	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
 
-	assert.True(t, result.ShouldRetry, "Should retry after underpriced rejection")
-	assert.False(t, result.ShouldReturn)
+	assert.Equal(t, ActionRetry, result.Action, "Should retry after underpriced rejection")
 	assert.Nil(t, result.Error)
 
 	// Critical: nonce must be preserved (same nonce, not nil)
-	assert.NotNil(t, execCtx.RetryNonce, "RetryNonce should be set to keep the same nonce")
-	assert.Equal(t, uint64(5), execCtx.RetryNonce.Uint64(), "Should keep the same nonce")
+	assert.NotNil(t, execCtx.State.Nonce, "Nonce should be set to keep the same nonce")
+	assert.Equal(t, uint64(5), execCtx.State.Nonce.Uint64(), "Should keep the same nonce")
 
 	// Gas should be bumped
-	assert.Greater(t, execCtx.RetryGasPrice, float64(0), "Gas price should be bumped")
-	assert.Greater(t, execCtx.RetryTipCap, float64(0), "Tip cap should be bumped")
+	assert.Greater(t, execCtx.State.GasPrice, float64(0), "Gas price should be bumped")
+	assert.Greater(t, execCtx.State.TipCap, float64(0), "Tip cap should be bumped")
 }
 
 // TestHandleBroadcastError_ReplacementUnderpriced_HitsGasLimit tests that when a
@@ -3194,23 +3081,20 @@ func TestHandleBroadcastError_ReplacementUnderpriced_HitsGasLimit(t *testing.T) 
 	)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:  5,
-		From:        testAddr1,
-		Network:     networks.EthereumMainnet,
-		MaxGasPrice: 22.0, // Low limit — 20 * 1.2 = 24 would exceed
-		MaxTipCap:   2.5,  // Low limit — 2 * 1.1 = 2.2, within limit but gas price blocks
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 2.5},
 	}
 
 	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
 
-	assert.False(t, result.ShouldRetry, "Should not retry when gas limit reached")
-	assert.True(t, result.ShouldReturn, "Should return when gas limit reached")
+	assert.Equal(t, ActionReturn, result.Action, "Should return when gas limit reached")
 	assert.True(t, errors.Is(result.Error, ErrGasPriceLimitReached),
 		"Error should be ErrGasPriceLimitReached")
 
 	// Nonce should still be preserved even on failure (for the returned tx)
-	assert.NotNil(t, execCtx.RetryNonce)
-	assert.Equal(t, uint64(5), execCtx.RetryNonce.Uint64())
+	assert.NotNil(t, execCtx.State.Nonce)
+	assert.Equal(t, uint64(5), execCtx.State.Nonce.Uint64())
 }
 
 // TestHandleBroadcastError_ReplacementUnderpriced_DoesNotOrphanTx tests the specific
@@ -3227,21 +3111,19 @@ func TestHandleBroadcastError_ReplacementUnderpriced_DoesNotOrphanTx(t *testing.
 	)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:  5,
-		From:        testAddr1,
-		Network:     networks.EthereumMainnet,
-		MaxGasPrice: 200.0,
-		MaxTipCap:   100.0,
-		OldTxs:      map[string]*types.Transaction{}, // No old txs mined
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Gas:    GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0},
+		State:  TxRetryState{OldTxs: map[string]*types.Transaction{}},
 	}
 
 	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
 
-	// The original bug: handleNonceIsLowError would set RetryNonce = nil here,
-	// causing a new nonce to be acquired. The fix ensures RetryNonce is kept.
-	assert.True(t, result.ShouldRetry)
-	assert.NotNil(t, execCtx.RetryNonce, "RetryNonce must NOT be nil — must keep the same nonce")
-	assert.Equal(t, uint64(5), execCtx.RetryNonce.Uint64())
+	// The original bug: handleNonceIsLowError would set Nonce = nil here,
+	// causing a new nonce to be acquired. The fix ensures Nonce is kept.
+	assert.Equal(t, ActionRetry, result.Action)
+	assert.NotNil(t, execCtx.State.Nonce, "Nonce must NOT be nil — must keep the same nonce")
+	assert.Equal(t, uint64(5), execCtx.State.Nonce.Uint64())
 }
 
 // ============================================================
@@ -3266,17 +3148,14 @@ func TestHandleTransactionStatus_Lost_HitsGasLimit_RespectsLimit(t *testing.T) {
 	)
 
 	execCtx := &TxExecutionContext{
-		NumRetries:  5,
-		From:        testAddr1,
-		Network:     networks.EthereumMainnet,
-		MaxGasPrice: 22.0, // Low limit — gas bumping will exceed this
-		MaxTipCap:   2.5,
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 2.5},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
 
-	assert.True(t, result.ShouldReturn)
-	assert.False(t, result.ShouldRetry)
+	assert.Equal(t, ActionReturn, result.Action)
 	assert.True(t, errors.Is(result.Error, ErrGasPriceLimitReached))
 }
 
@@ -3301,18 +3180,15 @@ func TestHandleTransactionStatus_Slow_BlockingNonce_BumpsGas(t *testing.T) {
 	)
 
 	execCtx := &TxExecutionContext{
-		From:        testAddr1,
-		Network:     networks.EthereumMainnet,
-		MaxGasPrice: 100.0,
-		MaxTipCap:   50.0,
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Gas:    GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "slow"}, tx, execCtx)
 
-	assert.False(t, result.ShouldReturn)
-	assert.True(t, result.ShouldRetry)
-	assert.Greater(t, execCtx.RetryGasPrice, 20.0, "Gas price should be bumped for blocking slow tx")
-	assert.Greater(t, execCtx.RetryTipCap, 2.0, "Tip cap should be bumped for blocking slow tx")
+	assert.Equal(t, ActionRetry, result.Action)
+	assert.Greater(t, execCtx.State.GasPrice, 20.0, "Gas price should be bumped for blocking slow tx")
+	assert.Greater(t, execCtx.State.TipCap, 2.0, "Tip cap should be bumped for blocking slow tx")
 }
 
 // TestHandleTransactionStatus_Slow_NonBlockingNonce_JustWaits tests that a slow tx
@@ -3332,21 +3208,18 @@ func TestHandleTransactionStatus_Slow_NonBlockingNonce_JustWaits(t *testing.T) {
 	)
 
 	execCtx := &TxExecutionContext{
-		From:        testAddr1,
-		Network:     networks.EthereumMainnet,
-		MaxGasPrice: 100.0,
-		MaxTipCap:   50.0,
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Gas:    GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "slow"}, tx, execCtx)
 
 	// Should retry (keep waiting) but NOT bump gas
-	assert.False(t, result.ShouldReturn)
-	assert.True(t, result.ShouldRetry)
-	assert.Equal(t, 0.0, execCtx.RetryGasPrice, "Gas price should NOT be bumped for non-blocking slow tx")
-	assert.Equal(t, 0.0, execCtx.RetryTipCap, "Tip cap should NOT be bumped for non-blocking slow tx")
-	assert.Nil(t, execCtx.RetryNonce, "RetryNonce should remain nil — keep monitoring the same tx")
-	assert.Equal(t, tx, execCtx.InitialTx, "InitialTx should be set so the loop re-monitors the same tx instead of building a new one")
+	assert.Equal(t, ActionRetry, result.Action)
+	assert.Equal(t, 0.0, execCtx.State.GasPrice, "Gas price should NOT be bumped for non-blocking slow tx")
+	assert.Equal(t, 0.0, execCtx.State.TipCap, "Tip cap should NOT be bumped for non-blocking slow tx")
+	assert.Nil(t, execCtx.State.Nonce, "Nonce should remain nil — keep monitoring the same tx")
+	assert.Equal(t, tx, execCtx.State.ResumeWith, "ResumeWith should be set so the loop re-monitors the same tx instead of building a new one")
 }
 
 // ============================================================

@@ -15,18 +15,34 @@ const (
 	DefaultSlowTxTimeout   = 5 * time.Second // Time before considering a tx "slow"
 
 	// Default gas adjustment values (can be overridden via ManagerDefaults)
-	DefaultGasPriceIncreasePercent = 1.2 // 20% increase when tx is slow
-	DefaultTipCapIncreasePercent   = 1.1 // 10% increase when tx is slow
-	MaxCapMultiplier               = 5.0 // Multiplier for default max gas price/tip cap when not set
+	DefaultGasPriceBumpFactor = 1.2 // 20% increase when tx is slow
+	DefaultTipCapBumpFactor   = 1.1 // 10% increase when tx is slow
+	MaxCapMultiplier          = 5.0 // Multiplier for default max gas price/tip cap when not set
+
+	// Deprecated: Use DefaultGasPriceBumpFactor instead.
+	DefaultGasPriceIncreasePercent = DefaultGasPriceBumpFactor
+	// Deprecated: Use DefaultTipCapBumpFactor instead.
+	DefaultTipCapIncreasePercent = DefaultTipCapBumpFactor
 )
 
-// TxExecutionResult represents the outcome of a transaction execution step
+// LoopAction represents what the transaction execution loop should do next.
+type LoopAction int
+
+const (
+	// ActionContinueToMonitor proceeds to the monitoring phase of the loop.
+	ActionContinueToMonitor LoopAction = iota
+	// ActionRetry goes back to the top of the loop for a new attempt.
+	ActionRetry
+	// ActionReturn exits the loop entirely, returning the result to the caller.
+	ActionReturn
+)
+
+// TxExecutionResult represents the outcome of a transaction execution step.
 type TxExecutionResult struct {
-	Transaction  *types.Transaction
-	Receipt      *types.Receipt
-	ShouldRetry  bool
-	ShouldReturn bool
-	Error        error
+	Transaction *types.Transaction
+	Receipt     *types.Receipt
+	Action      LoopAction
+	Error       error
 }
 
 // ManagerDefaults holds default configuration values that are inherited by TxRequest
@@ -38,15 +54,15 @@ type ManagerDefaults struct {
 	SlowTxTimeout   time.Duration // Time before considering a tx "slow" during monitoring
 
 	// Gas configuration
-	ExtraGasLimit   uint64
-	ExtraGasPrice   float64
-	ExtraTipCapGwei float64
-	MaxGasPrice     float64
-	MaxTipCap       float64
+	ExtraGasLimit uint64
+	ExtraGasPrice float64
+	ExtraTipCap   float64
+	MaxGasPrice   float64
+	MaxTipCap     float64
 
 	// Gas bumping configuration (for slow tx retry)
-	GasPriceIncreasePercent float64 // Multiplier for gas price when tx is slow (e.g., 1.2 = 20% increase)
-	TipCapIncreasePercent   float64 // Multiplier for tip cap when tx is slow (e.g., 1.1 = 10% increase)
+	GasPriceBumpFactor float64 // Multiplier for gas price when tx is slow (e.g., 1.2 = 20% increase)
+	TipCapBumpFactor   float64 // Multiplier for tip cap when tx is slow (e.g., 1.1 = 10% increase)
 
 	// Default network (if not specified in request)
 	Network networks.Network

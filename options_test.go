@@ -64,7 +64,7 @@ func TestWithDefaultExtraTipCap(t *testing.T) {
 	wm := NewWalletManager(WithDefaultExtraTipCap(2.0))
 
 	defaults := wm.Defaults()
-	assert.Equal(t, 2.0, defaults.ExtraTipCapGwei)
+	assert.Equal(t, 2.0, defaults.ExtraTipCap)
 }
 
 func TestWithDefaultMaxGasPrice(t *testing.T) {
@@ -102,7 +102,7 @@ func TestWithDefaults_AllAtOnce(t *testing.T) {
 		TxCheckInterval: 2 * time.Second,
 		ExtraGasLimit:   10000,
 		ExtraGasPrice:   3.0,
-		ExtraTipCapGwei: 1.5,
+		ExtraTipCap: 1.5,
 		MaxGasPrice:     200.0,
 		MaxTipCap:       20.0,
 		Network:         networks.BSCMainnet,
@@ -117,7 +117,7 @@ func TestWithDefaults_AllAtOnce(t *testing.T) {
 	assert.Equal(t, defaults.TxCheckInterval, retrieved.TxCheckInterval)
 	assert.Equal(t, defaults.ExtraGasLimit, retrieved.ExtraGasLimit)
 	assert.Equal(t, defaults.ExtraGasPrice, retrieved.ExtraGasPrice)
-	assert.Equal(t, defaults.ExtraTipCapGwei, retrieved.ExtraTipCapGwei)
+	assert.Equal(t, defaults.ExtraTipCap, retrieved.ExtraTipCap)
 	assert.Equal(t, defaults.MaxGasPrice, retrieved.MaxGasPrice)
 	assert.Equal(t, defaults.MaxTipCap, retrieved.MaxTipCap)
 	assert.Equal(t, defaults.Network, retrieved.Network)

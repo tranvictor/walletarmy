@@ -69,7 +69,7 @@ func (wm *WalletManager) R() *TxRequest {
 		txType:          defaults.TxType,
 		extraGasLimit:   defaults.ExtraGasLimit,
 		extraGasPrice:   defaults.ExtraGasPrice,
-		extraTipCapGwei: defaults.ExtraTipCapGwei,
+		extraTipCapGwei: defaults.ExtraTipCap,
 		maxGasPrice:     defaults.MaxGasPrice,
 		maxTipCap:       defaults.MaxTipCap,
 	}
@@ -309,28 +309,66 @@ func (r *TxRequest) executeWithIdempotency(ctx context.Context) (*types.Transact
 	return tx, receipt, txErr
 }
 
-// executeInternal performs the actual transaction execution
+// executeInternal builds TxExecutionContext directly and runs the execution loop.
 func (r *TxRequest) executeInternal(ctx context.Context) (*types.Transaction, *types.Receipt, error) {
-	return r.wm.EnsureTxWithHooksContext(
-		ctx,
-		r.numRetries,
-		r.sleepDuration,
-		r.txCheckInterval,
-		r.txType,
-		r.from,
-		r.to,
-		r.value,
-		r.gasLimit, r.extraGasLimit,
-		r.gasPrice, r.extraGasPrice,
-		r.tipCapGwei, r.extraTipCapGwei,
-		r.maxGasPrice, r.maxTipCap,
-		r.data,
-		r.network,
-		r.beforeSignAndBroadcastHook,
-		r.afterSignAndBroadcastHook,
-		r.abis,
-		r.gasEstimationFailedHook,
-		r.simulationFailedHook,
-		r.txMinedHook,
+	// Build the execution context directly from TxRequest fields
+	execCtx, err := NewTxExecutionContext(
+		TxParams{
+			TxType:  r.txType,
+			From:    r.from,
+			To:      r.to,
+			Value:   r.value,
+			Data:    r.data,
+			Network: r.network,
+		},
+		RetryConfig{
+			MaxAttempts:     r.numRetries,
+			SleepDuration:   r.sleepDuration,
+			TxCheckInterval: r.txCheckInterval,
+			SlowTxTimeout:   DefaultSlowTxTimeout,
+		},
+		GasBounds{
+			ExtraGasLimit:      r.extraGasLimit,
+			ExtraGasPrice:      r.extraGasPrice,
+			ExtraTipCap:        r.extraTipCapGwei,
+			MaxGasPrice:        r.maxGasPrice,
+			MaxTipCap:          r.maxTipCap,
+			GasPriceBumpFactor: DefaultGasPriceBumpFactor,
+			TipCapBumpFactor:   DefaultTipCapBumpFactor,
+		},
+		TxHooks{
+			BeforeSignAndBroadcast: r.beforeSignAndBroadcastHook,
+			AfterSignAndBroadcast:  r.afterSignAndBroadcastHook,
+			GasEstimationFailed:    r.gasEstimationFailedHook,
+			SimulationFailed:       r.simulationFailedHook,
+			TxMined:                r.txMinedHook,
+			ABIs:                   r.abis,
+		},
+		r.gasPrice,
+		r.tipCapGwei,
 	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Store the initial gas limit in state (may be overridden by hooks)
+	execCtx.State.GasLimit = r.gasLimit
+
+	// Apply manager defaults for gas bumping configuration
+	defaults := r.wm.Defaults()
+	if defaults.SlowTxTimeout > 0 {
+		execCtx.Retry.SlowTxTimeout = defaults.SlowTxTimeout
+	}
+	if defaults.GasPriceBumpFactor > 0 {
+		execCtx.Gas.GasPriceBumpFactor = defaults.GasPriceBumpFactor
+	}
+	if defaults.TipCapBumpFactor > 0 {
+		execCtx.Gas.TipCapBumpFactor = defaults.TipCapBumpFactor
+	}
+
+	// Create error decoder
+	errDecoder := r.wm.createErrorDecoder(execCtx.Hooks.ABIs)
+
+	// Run the execution loop directly
+	return r.wm.executeTransactionLoop(ctx, execCtx, errDecoder)
 }
