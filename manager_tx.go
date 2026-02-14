@@ -203,6 +203,15 @@ func (wm *WalletManager) MonitorTx(tx *types.Transaction, network networks.Netwo
 
 // MonitorTxContext is a context-aware version of MonitorTx that supports cancellation.
 // When the context is cancelled, the monitoring goroutine will exit and close the channel.
+//
+// Status mapping:
+//   - The external TxMonitor returns raw statuses ("done", "reverted", "lost").
+//     These are mapped to TxStatusMined, TxStatusReverted, TxStatusLost respectively.
+//   - TxStatusSlow is NOT from the monitor. It is generated internally when the
+//     monitor does not return a terminal status within SlowTxTimeout.
+//   - TxStatusCancelled is generated when the caller's context is cancelled.
+//   - Any unrecognized status from the monitor is treated as "still pending" and
+//     the slow timeout is allowed to fire.
 func (wm *WalletManager) MonitorTxContext(ctx context.Context, tx *types.Transaction, network networks.Network, txCheckInterval time.Duration) <-chan TxInfo {
 	txMonitor := wm.getTxMonitor(network)
 	statusChan := make(chan TxInfo, 1) // Buffered to avoid goroutine leak on context cancellation
@@ -216,36 +225,55 @@ func (wm *WalletManager) MonitorTxContext(ctx context.Context, tx *types.Transac
 
 	go func() {
 		defer close(statusChan)
-		select {
-		case <-ctx.Done():
-			statusChan <- TxInfo{
-				Status:  TxStatusCancelled,
-				Receipt: nil,
-			}
-		case status := <-monitorChan:
-			switch status.Status {
-			case "done":
+		timer := time.NewTimer(slowTimeout)
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
 				statusChan <- TxInfo{
-					Status:  TxStatusMined,
-					Receipt: status.Receipt,
-				}
-			case "reverted":
-				statusChan <- TxInfo{
-					Status:  TxStatusReverted,
-					Receipt: status.Receipt,
-				}
-			case "lost":
-				statusChan <- TxInfo{
-					Status:  TxStatusLost,
+					Status:  TxStatusCancelled,
 					Receipt: nil,
 				}
-			default:
-				// ignore other statuses
-			}
-		case <-time.After(slowTimeout):
-			statusChan <- TxInfo{
-				Status:  TxStatusSlow,
-				Receipt: nil,
+				return
+			case status, ok := <-monitorChan:
+				if !ok {
+					// Monitor channel closed without a terminal status.
+					// Disable it and let the slow timeout fire.
+					monitorChan = nil
+					continue
+				}
+				switch status.Status {
+				case "done":
+					statusChan <- TxInfo{
+						Status:  TxStatusMined,
+						Receipt: status.Receipt,
+					}
+					return
+				case "reverted":
+					statusChan <- TxInfo{
+						Status:  TxStatusReverted,
+						Receipt: status.Receipt,
+					}
+					return
+				case "lost":
+					statusChan <- TxInfo{
+						Status:  TxStatusLost,
+						Receipt: nil,
+					}
+					return
+				default:
+					// Unrecognized status from monitor — treat as "still pending".
+					// Disable the monitor channel and let the slow timeout fire.
+					monitorChan = nil
+					continue
+				}
+			case <-timer.C:
+				statusChan <- TxInfo{
+					Status:  TxStatusSlow,
+					Receipt: nil,
+				}
+				return
 			}
 		}
 	}()

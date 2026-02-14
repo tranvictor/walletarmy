@@ -5,6 +5,7 @@ A robust, production-ready Go library for managing Ethereum wallets and executin
 ## Features
 
 - **Multi-wallet Management**: Manage multiple wallets across multiple networks simultaneously
+- **Hardware Wallet Support**: Sign transactions with Ledger, Trezor, keystore files, or raw private keys via the jarvis account system
 - **Automatic Nonce Management**: Race-safe nonce acquisition with automatic release on failure
 - **Smart Gas Handling**: Automatic gas estimation, price suggestions, and dynamic gas bumping for slow transactions
 - **Retry Logic**: Configurable retry mechanism with exponential backoff for failed transactions
@@ -109,26 +110,55 @@ tx, receipt, err := wm.R().
 
 ### Adding Wallets at Runtime
 
-WalletArmy supports adding wallets dynamically. You can add as many wallets as needed:
+WalletArmy supports adding wallets dynamically. Accounts are created via the [jarvis account package](https://github.com/tranvictor/jarvis/tree/master/util/account), which supports multiple signing backends — private keys, keystore files, and hardware wallets (Ledger, Trezor). The signing backend is transparent to WalletArmy; once registered, all accounts sign transactions the same way.
 
 ```go
+import "github.com/tranvictor/jarvis/util/account"
+
 wm := walletarmy.NewWalletManager()
 
-// Method 1: From private key string
-privateKey1 := "abc123..." // hex string without 0x prefix
-acc1, err := account.NewPrivateKeyAccount(privateKey1)
+// Method 1: From private key string (hex without 0x prefix)
+acc, err := account.NewPrivateKeyAccount("abc123...")
 if err != nil {
     panic(err)
 }
-wm.SetAccount(acc1)
+wm.SetAccount(acc)
 
-// Method 2: Add multiple wallets
-privateKeys := []string{
-    "privatekey1...",
-    "privatekey2...",
-    "privatekey3...",
+// Method 2: From an encrypted keystore file
+acc, err := account.NewKeystoreAccount("/path/to/keystore.json", "passphrase")
+if err != nil {
+    panic(err)
 }
+wm.SetAccount(acc)
 
+// Method 3: Hardware wallet — Ledger
+// The derivation path follows BIP-44 (e.g., "m/44'/60'/0'/0/0")
+// The address must match what the Ledger derives at that path
+acc, err := account.NewLedgerAccount("m/44'/60'/0'/0/0", "0xYourLedgerAddress")
+if err != nil {
+    panic(err)
+}
+wm.SetAccount(acc)
+
+// Method 4: Hardware wallet — Trezor
+acc, err := account.NewTrezorAccount("m/44'/60'/0'/0/0", "0xYourTrezorAddress")
+if err != nil {
+    panic(err)
+}
+wm.SetAccount(acc)
+
+// Method 5: Using jarvis wallet store (auto-detects signing backend)
+// This looks up the account in jarvis's local wallet store and unlocks it.
+// Works with any backend that jarvis knows about (keystore, Ledger, Trezor).
+walletAddress := common.HexToAddress("0x...")
+acc, err := wm.UnlockAccount(walletAddress)
+if err != nil {
+    panic(err)
+}
+// Account is automatically registered — no need to call SetAccount
+
+// Add multiple wallets in bulk
+privateKeys := []string{"key1...", "key2...", "key3..."}
 for _, pk := range privateKeys {
     acc, err := account.NewPrivateKeyAccount(pk)
     if err != nil {
@@ -137,20 +167,16 @@ for _, pk := range privateKeys {
     wm.SetAccount(acc)
 }
 
-// Method 3: Using jarvis wallet store (if configured)
-walletAddress := common.HexToAddress("0x...")
-acc, err := wm.UnlockAccount(walletAddress)
-if err != nil {
-    panic(err)
-}
-// Account is automatically registered
-
 // Access a registered account later
 acc = wm.Account(walletAddress)
 if acc == nil {
     fmt.Println("Account not found")
 }
 ```
+
+> **Note**: All account types expose the same `SignTx(tx, chainID)` method. WalletArmy does not
+> need to know the signing backend — it just calls `SignTx` and the jarvis account handles the rest
+> (including USB communication for hardware wallets).
 
 ### Working with Networks
 
@@ -844,9 +870,11 @@ For example, if the chain has mined up to nonce 36, then nonce 37 is **blocking*
 
 ### Why Only Bump the Blocking Nonce?
 
-Since gas bumping is applied **one nonce at a time** (only the blocking nonce), you should set your gas protection limits (`MaxGasPrice`, `MaxTipCap`) aggressively enough to resolve stuck transactions. There is no automatic 2x override — the limits you configure are the limits WalletArmy will respect.
+Since gas bumping is applied **one nonce at a time** (only the blocking nonce), you should set your gas protection limits (`MaxGasPrice`, `MaxTipCap`) aggressively enough to resolve stuck transactions.
 
 ### Slow Transaction Handling
+
+> **Note**: "Slow" is a walletarmy-internal concept, not a status from the node or transaction monitor. WalletArmy generates `TxStatusSlow` when a broadcasted transaction is not mined within `SlowTxTimeout` (default: 5s). The external TxMonitor only reports terminal statuses like "done", "reverted", and "lost".
 
 When a transaction is detected as **slow** (not confirmed within `SlowTxTimeout`):
 
@@ -892,11 +920,12 @@ wm := walletarmy.NewWalletManager(
     walletarmy.WithDefaultMaxGasPrice(100.0), // gwei
     walletarmy.WithDefaultMaxTipCap(10.0),    // gwei
 
-    // Gas bumping rate when tx is slow/lost
+    // Gas bumping rate when a blocking tx is slow/lost
     walletarmy.WithDefaultGasPriceIncreasePercent(1.2), // 20% increase per bump
     walletarmy.WithDefaultTipCapIncreasePercent(1.1),   // 10% increase per bump
 
-    // How long to wait before considering a tx "slow"
+    // How long to wait before walletarmy considers a broadcasted tx "slow"
+    // (this is a walletarmy-internal timeout, not from the node/monitor)
     walletarmy.WithDefaultSlowTxTimeout(5*time.Second),
 )
 ```

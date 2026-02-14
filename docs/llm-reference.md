@@ -48,6 +48,50 @@ Condensed API reference for LLM consumption. For narrative docs see `README.md`;
 | `TxStore` | `persistence.go` | Track in-flight transactions across restarts |
 | `idempotency.Store` | `idempotency/idempotency.go` | Prevent duplicate submissions |
 
+## Networks
+
+WalletArmy uses `networks.Network` from `github.com/tranvictor/jarvis/networks` directly
+(not a local interface) because the default adapter layer passes the full object to jarvis
+utilities (`util.EthReader`, `util.EthBroadcaster`, `txanalyzer`).
+
+**Methods walletarmy calls on a Network:**
+- `GetChainID() uint64` — primary key for all per-network maps
+- `GetName() string` — logging, nonce tracker
+- `IsSyncTxSupported() bool` — decides sync vs async broadcast
+
+**Built-in networks:** `networks.EthereumMainnet`, `networks.BSCMainnet`, `networks.Polygon`,
+`networks.Arbitrum`, `networks.Optimism`, `networks.Avalanche`, `networks.Fantom`, etc.
+
+**Lookup:** `networks.GetNetwork(name)`, `networks.GetNetworkByID(chainID)`
+
+**Custom network constructors** (from `github.com/tranvictor/jarvis/networks`):
+```go
+// Standard EVM (Ethereum, BSC, Polygon, etc.)
+networks.NewGenericNetwork(networks.GenericNetworkConfig{
+    Name, ChainID, NativeTokenSymbol, NativeTokenDecimal, BlockTime,
+    NodeVariableName, DefaultNodes, BlockExplorerAPIKeyVariableName,
+    BlockExplorerAPIURL, MultiCallContractAddress,
+})
+
+// Optimism-based L2s (OP Stack, Base, custom OP chains)
+networks.NewGenericOptimismNetwork(networks.GenericOptimismNetworkConfig{
+    // Same fields as above, plus:
+    SyncTxSupported bool  // true if the L2 supports eth_sendRawTransactionSync
+})
+
+// Arbitrum-based L2s
+networks.NewGenericArbitrumNetwork(networks.GenericArbitrumNetworkConfig{...})
+```
+
+**Network Resolver** — needed for crash recovery and raw `BroadcastTx` calls (which only
+have chain ID, not the network object). For custom networks, provide a resolver:
+```go
+walletarmy.WithNetworkResolver(func(chainID uint64) (networks.Network, error) {
+    if chainID == 12345 { return myCustomNetwork, nil }
+    return networks.GetNetworkByID(chainID) // fallback
+})
+```
+
 ## Factory Types
 
 | Type | Signature |
@@ -73,15 +117,15 @@ func NewWalletManager(opts ...WalletManagerOption) *WalletManager
 | `WithDefaultNumRetries` | `int` | `9` | Retry attempts |
 | `WithDefaultSleepDuration` | `time.Duration` | `5s` | Sleep between retries |
 | `WithDefaultTxCheckInterval` | `time.Duration` | `5s` | Tx status polling interval |
-| `WithDefaultSlowTxTimeout` | `time.Duration` | `5s` | Time before tx is "slow" |
+| `WithDefaultSlowTxTimeout` | `time.Duration` | `5s` | Walletarmy-internal timeout: time before a broadcasted tx is considered "slow" (not from monitor) |
 | `WithDefaultExtraGasLimit` | `uint64` | `0` | Added to gas estimate |
 | `WithDefaultExtraGasPrice` | `float64` | `0` | Added to suggested gas price (gwei) |
 | `WithDefaultExtraTipCap` | `float64` | `0` | Added to suggested tip cap (gwei) |
 | `WithDefaultMaxGasPrice` | `float64` | `0` (auto: 5x suggested) | Gas price ceiling (gwei) |
 | `WithDefaultMaxTipCap` | `float64` | `0` (auto: 5x suggested) | Tip cap ceiling (gwei) |
 | `WithDefaultTxType` | `uint8` | `0` (legacy) | Tx type: 0=legacy, 2=EIP-1559 |
-| `WithDefaultGasPriceIncreasePercent` | `float64` | `1.2` | Multiplier on slow tx (1.2 = +20%) |
-| `WithDefaultTipCapIncreasePercent` | `float64` | `1.1` | Multiplier on slow tx (1.1 = +10%) |
+| `WithDefaultGasPriceIncreasePercent` | `float64` | `1.2` | Multiplier on slow/lost blocking tx (1.2 = +20%) |
+| `WithDefaultTipCapIncreasePercent` | `float64` | `1.1` | Multiplier on slow/lost blocking tx (1.1 = +10%) |
 | `WithDefaults` | `ManagerDefaults` | — | Set all defaults at once |
 | `WithIdempotencyStore` | `idempotency.Store` | `nil` | Custom idempotency store |
 | `WithDefaultIdempotencyStore` | `time.Duration` | `nil` | In-memory idempotency store with TTL |
@@ -135,11 +179,28 @@ Created via `wm.R()`. All `Set*` methods return `*TxRequest` for chaining.
 
 ### Account Management
 
+Accounts come from the jarvis account package (`github.com/tranvictor/jarvis/util/account`).
+WalletArmy uses `*account.Account` directly (not a local interface) because jarvis accounts
+transparently support multiple signing backends: private keys, keystore files, Ledger, and Trezor
+hardware wallets. All account types expose the same `SignTx(tx, chainID)` method.
+
+**Account constructors** (from `github.com/tranvictor/jarvis/util/account`):
+```go
+account.NewPrivateKeyAccount(hexKeyWithout0x string) (*Account, error)
+account.NewKeystoreAccount(file string, password string) (*Account, error)
+account.NewLedgerAccount(derivationPath string, address string) (*Account, error)
+account.NewTrezorAccount(derivationPath string, address string) (*Account, error)
+```
+
+**WalletManager methods:**
 ```go
 func (wm *WalletManager) SetAccount(acc *account.Account)
 func (wm *WalletManager) UnlockAccount(addr common.Address) (*account.Account, error)
 func (wm *WalletManager) Account(wallet common.Address) *account.Account
 ```
+
+`UnlockAccount` looks up the address in the jarvis wallet store and auto-detects the signing
+backend (keystore, Ledger, Trezor). The unlocked account is automatically registered via `SetAccount`.
 
 ### Configuration
 
@@ -264,15 +325,26 @@ const (
 
 ## TxInfoStatus Values
 
+Statuses have two origins:
+
+**From the external TxMonitor** (node/mempool state):
 ```go
-TxStatusMined     = "mined"
-TxStatusReverted  = "reverted"
-TxStatusLost      = "lost"
-TxStatusSlow      = "slow"
-TxStatusCancelled = "cancelled"
+TxStatusMined     = "mined"     // mapped from monitor "done"
+TxStatusReverted  = "reverted"  // mapped from monitor "reverted"
+TxStatusLost      = "lost"      // mapped from monitor "lost"
 TxStatusPending   = "pending"
-TxStatusDone      = "done"
+TxStatusDone      = "done"      // raw monitor status (mapped to TxStatusMined internally)
 ```
+
+**Generated internally by walletarmy** (NOT from the monitor):
+```go
+TxStatusSlow      = "slow"      // fired by MonitorTxContext when tx is not mined within SlowTxTimeout
+TxStatusCancelled = "cancelled" // fired by MonitorTxContext when caller's context is cancelled
+```
+
+> **Important**: `TxStatusSlow` is a walletarmy-level timeout signal, not a status reported by
+> any node or TxMonitor implementation. Custom TxMonitor implementations should NOT return "slow" —
+> it will be treated as an unrecognized status and the slow timeout will fire independently.
 
 ## PendingTxStatus Values
 

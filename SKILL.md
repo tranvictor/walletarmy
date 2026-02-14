@@ -4,9 +4,10 @@
 
 Use walletarmy when the user wants to:
 - Manage Ethereum wallets and send transactions from Go code
+- Sign transactions with private keys, keystore files, or hardware wallets (Ledger, Trezor)
 - Handle nonce management, gas estimation, retries, and monitoring automatically
 - Build resilient transaction pipelines with hooks, idempotency, and circuit breakers
-- Support multiple EVM networks (Ethereum, Polygon, Arbitrum, Optimism, etc.)
+- Support multiple EVM networks (Ethereum, Polygon, Arbitrum, Optimism, custom chains)
 - Recover in-flight transactions after a crash or restart
 
 ## Installation
@@ -21,8 +22,8 @@ go get github.com/tranvictor/walletarmy
 import (
     "github.com/tranvictor/walletarmy"                // main package
     "github.com/tranvictor/walletarmy/idempotency"    // idempotency store
-    "github.com/tranvictor/jarvis/networks"            // network constants
-    "github.com/tranvictor/jarvis/util/account"        // account/key management
+    "github.com/tranvictor/jarvis/networks"            // network constants + custom network constructors
+    "github.com/tranvictor/jarvis/util/account"        // account management (private key, keystore, Ledger, Trezor)
     "github.com/ethereum/go-ethereum/common"           // common.Address
     "github.com/ethereum/go-ethereum/core/types"       // types.Transaction, types.Receipt
     "github.com/ethereum/go-ethereum/accounts/abi"     // abi.ABI for hooks
@@ -35,12 +36,10 @@ import (
 package main
 
 import (
-    "crypto/ecdsa"
     "fmt"
     "math/big"
 
     "github.com/ethereum/go-ethereum/common"
-    "github.com/ethereum/go-ethereum/crypto"
     "github.com/tranvictor/jarvis/networks"
     "github.com/tranvictor/jarvis/util/account"
     "github.com/tranvictor/walletarmy"
@@ -53,8 +52,7 @@ func main() {
     )
 
     // 2. Register a wallet (from private key)
-    privateKey, _ := crypto.HexToECDSA("your_hex_private_key_without_0x")
-    acc := account.NewKeyedAccount(privateKey)
+    acc, _ := account.NewPrivateKeyAccount("your_hex_private_key_without_0x")
     wm.SetAccount(acc)
 
     // 3. Send ETH using the builder pattern
@@ -163,6 +161,30 @@ tx, receipt, err := wm.R().
     Execute()
 ```
 
+### Account Creation (Multiple Backends)
+
+Accounts come from `github.com/tranvictor/jarvis/util/account`. All account types expose the
+same `SignTx(tx, chainID)` method — WalletArmy doesn't need to know the signing backend.
+
+```go
+import "github.com/tranvictor/jarvis/util/account"
+
+// Private key (hex without 0x prefix)
+acc, _ := account.NewPrivateKeyAccount("abc123...")
+
+// Encrypted keystore file
+acc, _ := account.NewKeystoreAccount("/path/to/keystore.json", "passphrase")
+
+// Hardware wallets (derivation path + expected address)
+acc, _ := account.NewLedgerAccount("m/44'/60'/0'/0/0", "0xYourLedgerAddr")
+acc, _ := account.NewTrezorAccount("m/44'/60'/0'/0/0", "0xYourTrezorAddr")
+
+// Jarvis wallet store (auto-detects backend)
+acc, _ := wm.UnlockAccount(common.HexToAddress("0x..."))
+
+wm.SetAccount(acc) // register any account type
+```
+
 ### Multi-Network Setup
 
 ```go
@@ -182,6 +204,43 @@ wm.R().SetFrom(wallet).SetTo(to).SetValue(amount).
 // Override for Arbitrum
 wm.R().SetFrom(wallet).SetTo(to).SetValue(amount).
     SetNetwork(networks.ArbitrumMainnet).Execute()
+```
+
+### Custom Network
+
+For private chains or unsupported L2s, create a custom network using jarvis constructors:
+
+```go
+import "github.com/tranvictor/jarvis/networks"
+
+// Standard EVM chain
+customNet := networks.NewGenericNetwork(networks.GenericNetworkConfig{
+    Name: "my-chain", ChainID: 12345,
+    NativeTokenSymbol: "ETH", NativeTokenDecimal: 18, BlockTime: 2,
+    DefaultNodes: map[string]string{"default": "https://rpc.my-chain.io"},
+})
+
+// Optimism-based L2 (supports sync tx)
+customL2 := networks.NewGenericOptimismNetwork(networks.GenericOptimismNetworkConfig{
+    Name: "my-op-l2", ChainID: 67890,
+    NativeTokenSymbol: "ETH", NativeTokenDecimal: 18, BlockTime: 1,
+    DefaultNodes: map[string]string{"default": "https://rpc.my-op-l2.io"},
+    SyncTxSupported: true,
+})
+
+// Arbitrum-based L2
+customArb := networks.NewGenericArbitrumNetwork(networks.GenericArbitrumNetworkConfig{...})
+
+// Register a resolver so WalletArmy can look up your custom network by chain ID
+// (needed for crash recovery and raw BroadcastTx calls)
+wm := walletarmy.NewWalletManager(
+    walletarmy.WithNetworkResolver(func(chainID uint64) (networks.Network, error) {
+        if chainID == 12345 { return customNet, nil }
+        return networks.GetNetworkByID(chainID) // fallback to built-in
+    }),
+)
+
+wm.R().SetFrom(wallet).SetTo(to).SetValue(amount).SetNetwork(customNet).Execute()
 ```
 
 ### Hooks — Before/After Broadcast
@@ -247,8 +306,8 @@ wm := walletarmy.NewWalletManager(
     walletarmy.WithDefaultMaxGasPrice(0),        // 0 = auto (5x suggested)
     walletarmy.WithDefaultMaxTipCap(0),           // 0 = auto (5x suggested)
     walletarmy.WithDefaultTxType(0),              // 0 = legacy, 2 = EIP-1559
-    walletarmy.WithDefaultGasPriceIncreasePercent(1.2), // 20% bump on slow tx
-    walletarmy.WithDefaultTipCapIncreasePercent(1.1),   // 10% bump on slow tx
+    walletarmy.WithDefaultGasPriceIncreasePercent(1.2), // 20% bump on slow/lost blocking tx
+    walletarmy.WithDefaultTipCapIncreasePercent(1.1),   // 10% bump on slow/lost blocking tx
 
     // Or set all defaults at once
     walletarmy.WithDefaults(walletarmy.ManagerDefaults{...}),
@@ -282,7 +341,7 @@ wm := walletarmy.NewWalletManager(
 5. **Gas price protection** — `SetMaxGasPrice` / `SetMaxTipCap` prevent runaway costs. When 0, defaults to 5x the suggested price.
 6. **Circuit breaker** — if an RPC node fails repeatedly, the circuit opens and returns `ErrCircuitBreakerOpen`. It auto-recovers.
 7. **Idempotency requires a store** — `SetIdempotencyKey` is a no-op without `WithDefaultIdempotencyStore` or `WithIdempotencyStore`.
-8. **Slow tx handling** — when a tx is "slow" (not mined within `SlowTxTimeout`), gas is automatically bumped by `GasPriceIncreasePercent`.
+8. **Slow tx handling** — "slow" is a walletarmy-internal concept (not from the node/monitor): when a broadcasted tx is not mined within `SlowTxTimeout`, walletarmy generates a `TxStatusSlow` signal. Gas is only bumped if the tx's nonce is the blocking nonce (next nonce the chain expects). Non-blocking slow txs just keep waiting.
 9. **Thread safety** — `WalletManager` is safe for concurrent use from multiple goroutines. Each `R()` call creates an independent request.
 10. **`GasEstimationFailedHook` requires ABIs** — it won't fire unless you set `SetAbis(...)` on the request.
 

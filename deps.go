@@ -35,18 +35,34 @@ type EthReader interface {
 }
 
 // TxInfoStatus represents the status of a transaction in the monitoring/execution flow.
+//
+// Statuses are categorized by origin:
+//
+// From the external TxMonitor (node/mempool state):
+//   - TxStatusMined, TxStatusReverted, TxStatusLost, TxStatusPending, TxStatusDone
+//
+// Generated internally by walletarmy (NOT from the monitor):
+//   - TxStatusSlow: fired when a broadcasted tx is not mined within SlowTxTimeout.
+//     This is a walletarmy-level timeout, not a status reported by any node or monitor.
+//   - TxStatusCancelled: fired when the caller's context is cancelled.
 type TxInfoStatus string
 
 const (
-	// TxStatusMined indicates the transaction was mined successfully
+	// TxStatusMined indicates the transaction was mined successfully.
+	// Origin: mapped from TxMonitor "done" status.
 	TxStatusMined TxInfoStatus = "mined"
-	// TxStatusReverted indicates the transaction was mined but execution reverted
+	// TxStatusReverted indicates the transaction was mined but execution reverted.
+	// Origin: mapped from TxMonitor "reverted" status.
 	TxStatusReverted TxInfoStatus = "reverted"
-	// TxStatusLost indicates the transaction was dropped from the mempool
+	// TxStatusLost indicates the transaction was dropped from the mempool.
+	// Origin: mapped from TxMonitor "lost" status.
 	TxStatusLost TxInfoStatus = "lost"
-	// TxStatusSlow indicates the transaction is taking too long to be mined
+	// TxStatusSlow indicates the transaction has not been mined within SlowTxTimeout.
+	// Origin: generated internally by MonitorTxContext via time.After(SlowTxTimeout).
+	// This is NOT a status from the TxMonitor — it is a walletarmy-level timeout signal.
 	TxStatusSlow TxInfoStatus = "slow"
-	// TxStatusCancelled indicates the monitoring was cancelled via context
+	// TxStatusCancelled indicates the monitoring was cancelled via context.
+	// Origin: generated internally by MonitorTxContext when ctx.Done() fires.
 	TxStatusCancelled TxInfoStatus = "cancelled"
 	// TxStatusPending indicates the transaction is still pending
 	TxStatusPending TxInfoStatus = "pending"
