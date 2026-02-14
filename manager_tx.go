@@ -926,6 +926,12 @@ func (wm *WalletManager) signAndBroadcastTransaction(ctx context.Context, tx *ty
 
 // handleBroadcastError processes various broadcast errors and determines retry strategy
 func (wm *WalletManager) handleBroadcastError(broadcastErr BroadcastError, tx *types.Transaction, execCtx *TxExecutionContext) *TxExecutionResult {
+	// Special case: replacement tx underpriced — original tx is still pending,
+	// but the replacement gas price wasn't high enough. Bump gas and retry.
+	if broadcastErr == ErrReplacementUnderpriced {
+		return wm.handleReplacementUnderpricedError(tx, execCtx)
+	}
+
 	// Special case: nonce is low requires checking if transaction is already mined
 	if broadcastErr == ErrNonceIsLow {
 		return wm.handleNonceIsLowError(tx, execCtx)
@@ -967,6 +973,39 @@ func (wm *WalletManager) handleBroadcastError(broadcastErr BroadcastError, tx *t
 		ShouldRetry:  true,
 		ShouldReturn: false,
 		Error:        nil,
+	}
+}
+
+// handleReplacementUnderpricedError handles the case where a replacement transaction
+// was rejected because its gas price wasn't high enough to replace the pending tx.
+// Unlike "nonce too low" (where the nonce is already mined), here the original tx is
+// still pending in the mempool. We keep the same nonce and bump gas further.
+func (wm *WalletManager) handleReplacementUnderpricedError(tx *types.Transaction, execCtx *TxExecutionContext) *TxExecutionResult {
+	logger.WithFields(logger.Fields{
+		"tx_hash":   tx.Hash().Hex(),
+		"nonce":     tx.Nonce(),
+		"gas_price": tx.GasPrice().String(),
+		"tip_cap":   tx.GasTipCap().String(),
+	}).Info("Replacement transaction underpriced, bumping gas and retrying with same nonce")
+
+	// Keep the same nonce — the original tx is still valid and pending
+	execCtx.RetryNonce = big.NewInt(int64(tx.Nonce()))
+
+	if execCtx.AdjustGasPricesForSlowTx(tx) {
+		return &TxExecutionResult{
+			Transaction:  nil,
+			ShouldRetry:  true,
+			ShouldReturn: false,
+			Error:        nil,
+		}
+	}
+
+	// Gas limits reached — cannot bump further
+	return &TxExecutionResult{
+		Transaction:  tx,
+		ShouldRetry:  false,
+		ShouldReturn: true,
+		Error:        errors.Join(ErrGasPriceLimitReached, fmt.Errorf("replacement underpriced and gas limits reached, maxGasPrice: %f, maxTipCap: %f", execCtx.MaxGasPrice, execCtx.MaxTipCap)),
 	}
 }
 

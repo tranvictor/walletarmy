@@ -3056,6 +3056,106 @@ func TestEnsureTx_LostTx_RetriesWithSameNonce(t *testing.T) {
 }
 
 // ============================================================
+// Replacement Underpriced — Separate from Nonce Too Low
+// ============================================================
+
+// TestHandleBroadcastError_ReplacementUnderpriced_BumpsGas tests that when a
+// replacement tx is rejected as underpriced, we keep the same nonce and bump gas.
+func TestHandleBroadcastError_ReplacementUnderpriced_BumpsGas(t *testing.T) {
+	setup := newTestSetup(t)
+
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(1),
+	)
+
+	execCtx := &TxExecutionContext{
+		NumRetries:  5,
+		From:        testAddr1,
+		Network:     networks.EthereumMainnet,
+		MaxGasPrice: 200.0, // High limit — plenty of room
+		MaxTipCap:   100.0,
+	}
+
+	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
+
+	assert.True(t, result.ShouldRetry, "Should retry after underpriced rejection")
+	assert.False(t, result.ShouldReturn)
+	assert.Nil(t, result.Error)
+
+	// Critical: nonce must be preserved (same nonce, not nil)
+	assert.NotNil(t, execCtx.RetryNonce, "RetryNonce should be set to keep the same nonce")
+	assert.Equal(t, uint64(5), execCtx.RetryNonce.Uint64(), "Should keep the same nonce")
+
+	// Gas should be bumped
+	assert.Greater(t, execCtx.RetryGasPrice, float64(0), "Gas price should be bumped")
+	assert.Greater(t, execCtx.RetryTipCap, float64(0), "Tip cap should be bumped")
+}
+
+// TestHandleBroadcastError_ReplacementUnderpriced_HitsGasLimit tests that when a
+// replacement tx is underpriced but gas limits are reached, we stop retrying.
+func TestHandleBroadcastError_ReplacementUnderpriced_HitsGasLimit(t *testing.T) {
+	setup := newTestSetup(t)
+
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(1),
+	)
+
+	execCtx := &TxExecutionContext{
+		NumRetries:  5,
+		From:        testAddr1,
+		Network:     networks.EthereumMainnet,
+		MaxGasPrice: 22.0, // Low limit — 20 * 1.2 = 24 would exceed
+		MaxTipCap:   2.5,  // Low limit — 2 * 1.1 = 2.2, within limit but gas price blocks
+	}
+
+	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
+
+	assert.False(t, result.ShouldRetry, "Should not retry when gas limit reached")
+	assert.True(t, result.ShouldReturn, "Should return when gas limit reached")
+	assert.True(t, errors.Is(result.Error, ErrGasPriceLimitReached),
+		"Error should be ErrGasPriceLimitReached")
+
+	// Nonce should still be preserved even on failure (for the returned tx)
+	assert.NotNil(t, execCtx.RetryNonce)
+	assert.Equal(t, uint64(5), execCtx.RetryNonce.Uint64())
+}
+
+// TestHandleBroadcastError_ReplacementUnderpriced_DoesNotOrphanTx tests the specific
+// bug scenario: previously "underpriced" was classified as ErrNonceIsLow, which
+// when no old tx was mined, cleared RetryNonce (= nil) and acquired a new nonce,
+// orphaning the original pending tx. With the fix, underpriced keeps the same nonce.
+func TestHandleBroadcastError_ReplacementUnderpriced_DoesNotOrphanTx(t *testing.T) {
+	setup := newTestSetup(t)
+
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(1),
+	)
+
+	execCtx := &TxExecutionContext{
+		NumRetries:  5,
+		From:        testAddr1,
+		Network:     networks.EthereumMainnet,
+		MaxGasPrice: 200.0,
+		MaxTipCap:   100.0,
+		OldTxs:      map[string]*types.Transaction{}, // No old txs mined
+	}
+
+	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
+
+	// The original bug: handleNonceIsLowError would set RetryNonce = nil here,
+	// causing a new nonce to be acquired. The fix ensures RetryNonce is kept.
+	assert.True(t, result.ShouldRetry)
+	assert.NotNil(t, execCtx.RetryNonce, "RetryNonce must NOT be nil — must keep the same nonce")
+	assert.Equal(t, uint64(5), execCtx.RetryNonce.Uint64())
+}
+
+// ============================================================
 // Blocking Nonce Tests — Lost Tx with Gas Limit Reached
 // ============================================================
 
