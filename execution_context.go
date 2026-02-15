@@ -85,7 +85,19 @@ func NewTxExecutionContext(
 	initialGasPrice float64,
 	initialTipCap float64,
 ) (*TxExecutionContext, error) {
-	// Validate inputs
+	// Validate required fields
+	if params.From == (common.Address{}) {
+		return nil, ErrFromAddressZero
+	}
+	if params.Network == nil {
+		return nil, ErrNetworkNil
+	}
+
+	// Sanitize optional fields.
+	// When called via WalletManager entry points (EnsureTxWithHooksContext,
+	// TxRequest.executeInternal, ResumePendingTransaction), these are already
+	// resolved from ManagerDefaults. The fallbacks here are a safety net for
+	// direct callers of NewTxExecutionContext.
 	if retry.MaxAttempts < 0 {
 		retry.MaxAttempts = 0
 	}
@@ -95,31 +107,18 @@ func NewTxExecutionContext(
 	if retry.TxCheckInterval <= 0 {
 		retry.TxCheckInterval = DefaultTxCheckInterval
 	}
-
-	// Validate addresses
-	if params.From == (common.Address{}) {
-		return nil, ErrFromAddressZero
+	if retry.SlowTxTimeout <= 0 {
+		retry.SlowTxTimeout = DefaultSlowTxTimeout
 	}
-
-	// Validate network
-	if params.Network == nil {
-		return nil, ErrNetworkNil
-	}
-
-	// Initialize value if nil
 	if params.Value == nil {
 		params.Value = big.NewInt(0)
 	}
-
-	// Set default maxGasPrice and maxTipCap if they are 0 (to avoid infinite loop)
 	if gas.MaxGasPrice == 0 {
 		gas.MaxGasPrice = initialGasPrice * MaxCapMultiplier
 	}
 	if gas.MaxTipCap == 0 {
 		gas.MaxTipCap = initialTipCap * MaxCapMultiplier
 	}
-
-	// Set default bump factors
 	if gas.GasPriceBumpFactor == 0 {
 		gas.GasPriceBumpFactor = DefaultGasPriceBumpFactor
 	}
@@ -148,41 +147,29 @@ func (ctx *TxExecutionContext) BumpGasForSlowTx(tx *types.Transaction) bool {
 		return false
 	}
 
-	// Use configured factors, fall back to defaults if not set
-	gasPriceBump := ctx.Gas.GasPriceBumpFactor
-	if gasPriceBump == 0 {
-		gasPriceBump = DefaultGasPriceBumpFactor
-	}
-	tipCapBump := ctx.Gas.TipCapBumpFactor
-	if tipCapBump == 0 {
-		tipCapBump = DefaultTipCapBumpFactor
-	}
+	// Gas.GasPriceBumpFactor and Gas.TipCapBumpFactor are guaranteed non-zero
+	// by NewTxExecutionContext (which fills package defaults for direct callers)
+	// and by applyDefaultsResolution (for WalletManager entry points).
 
-	// Increase gas price by configured factor
+	// Compute new values first, validate both, then commit atomically.
+	// This avoids partial State mutation if only one limit is exceeded.
 	currentGasPrice := jarviscommon.BigToFloat(tx.GasPrice(), 9)
-	newGasPrice := currentGasPrice * gasPriceBump
+	newGasPrice := currentGasPrice * ctx.Gas.GasPriceBumpFactor
 
-	// Check if new gas price would exceed the caller-defined maximum
-	if ctx.Gas.MaxGasPrice > 0 && newGasPrice > ctx.Gas.MaxGasPrice {
-		// Gas price would exceed limit - stop trying
-		return false
-	}
-
-	ctx.State.GasPrice = newGasPrice
-
-	// Increase tip cap by configured factor
 	currentTipCap := jarviscommon.BigToFloat(tx.GasTipCap(), 9)
-	newTipCap := currentTipCap * tipCapBump
+	newTipCap := currentTipCap * ctx.Gas.TipCapBumpFactor
 
-	// Check if new tip cap would exceed the caller-defined maximum
+	// Check both limits before committing any state changes
+	if ctx.Gas.MaxGasPrice > 0 && newGasPrice > ctx.Gas.MaxGasPrice {
+		return false
+	}
 	if ctx.Gas.MaxTipCap > 0 && newTipCap > ctx.Gas.MaxTipCap {
-		// Tip cap would exceed limit - stop trying
 		return false
 	}
 
+	// Both within limits — commit all state changes together
+	ctx.State.GasPrice = newGasPrice
 	ctx.State.TipCap = newTipCap
-
-	// Keep the same nonce
 	ctx.State.Nonce = big.NewInt(int64(tx.Nonce()))
 
 	return true

@@ -83,7 +83,10 @@ func (wm *WalletManager) BuildTx(
 		gasPriceToUse = tipCapGweiToUse
 	}
 
-	// Success - clear acquiredNonce so defer doesn't release it
+	// Success — transfer nonce ownership to the caller.
+	// From this point the caller is responsible for either broadcasting a tx
+	// that uses this nonce (which registers it via registerBroadcastedTx) or
+	// calling ReleaseNonce explicitly if the tx is never broadcast.
 	acquiredNonce = false
 
 	return jarviscommon.BuildExactTx(
@@ -226,11 +229,8 @@ func (wm *WalletManager) MonitorTxContext(ctx context.Context, tx *types.Transac
 	statusChan := make(chan TxInfo, 1) // Buffered to avoid goroutine leak on context cancellation
 	monitorChan := txMonitor.MakeWaitChannelWithInterval(tx.Hash().Hex(), txCheckInterval)
 
-	// Get slow timeout from defaults, fall back to constant if not set
+	// Defaults are guaranteed resolved — no fallback needed.
 	slowTimeout := wm.Defaults().SlowTxTimeout
-	if slowTimeout <= 0 {
-		slowTimeout = DefaultSlowTxTimeout
-	}
 
 	go func() {
 		defer close(statusChan)
@@ -421,7 +421,9 @@ func (wm *WalletManager) EnsureTxWithHooksContext(
 	simulationFailedHook SimulationFailedHook,
 	txMinedHook TxMinedHook,
 ) (tx *types.Transaction, receipt *types.Receipt, err error) {
-	// Create execution context using structured sub-types
+	// Use resolved manager defaults — guaranteed non-zero by applyDefaultsResolution.
+	defaults := wm.Defaults()
+
 	execCtx, err := NewTxExecutionContext(
 		TxParams{
 			TxType:  txType,
@@ -435,7 +437,7 @@ func (wm *WalletManager) EnsureTxWithHooksContext(
 			MaxAttempts:     numRetries,
 			SleepDuration:   sleepDuration,
 			TxCheckInterval: txCheckInterval,
-			SlowTxTimeout:   DefaultSlowTxTimeout,
+			SlowTxTimeout:   defaults.SlowTxTimeout,
 		},
 		GasBounds{
 			ExtraGasLimit:      extraGasLimit,
@@ -443,8 +445,8 @@ func (wm *WalletManager) EnsureTxWithHooksContext(
 			ExtraTipCap:        extraTipCapGwei,
 			MaxGasPrice:        maxGasPrice,
 			MaxTipCap:          maxTipCap,
-			GasPriceBumpFactor: DefaultGasPriceBumpFactor,
-			TipCapBumpFactor:   DefaultTipCapBumpFactor,
+			GasPriceBumpFactor: defaults.GasPriceBumpFactor,
+			TipCapBumpFactor:   defaults.TipCapBumpFactor,
 		},
 		TxHooks{
 			BeforeSignAndBroadcast: beforeSignAndBroadcastHook,
@@ -464,18 +466,6 @@ func (wm *WalletManager) EnsureTxWithHooksContext(
 	// Store the initial gas limit in state (may be overridden by hooks)
 	execCtx.State.GasLimit = gasLimit
 
-	// Apply manager defaults for gas bumping configuration
-	defaults := wm.Defaults()
-	if defaults.SlowTxTimeout > 0 {
-		execCtx.Retry.SlowTxTimeout = defaults.SlowTxTimeout
-	}
-	if defaults.GasPriceBumpFactor > 0 {
-		execCtx.Gas.GasPriceBumpFactor = defaults.GasPriceBumpFactor
-	}
-	if defaults.TipCapBumpFactor > 0 {
-		execCtx.Gas.TipCapBumpFactor = defaults.TipCapBumpFactor
-	}
-
 	// Create error decoder
 	errDecoder := wm.createErrorDecoder(execCtx.Hooks.ABIs)
 
@@ -491,10 +481,17 @@ func (wm *WalletManager) executeTransactionLoop(
 	execCtx *TxExecutionContext,
 	errDecoder *ErrorDecoder,
 ) (tx *types.Transaction, receipt *types.Receipt, err error) {
-	// Cleanup function to release nonce if we exit with an error and no tx was broadcast
+	// Safety-net nonce release.
+	//
+	// Nonce ownership flows: BuildTx acquires → caller owns → broadcast registers it.
+	// If we exit the loop with an error before any tx was broadcast (OldTxs empty),
+	// the nonce in State.Nonce is still reserved and must be released.
+	//
+	// Individual handlers (handleEthCallRevertFailure, signAndBroadcastTransaction, etc.)
+	// release the nonce explicitly on their own exit paths. This defer is a last-resort
+	// guard for any path that might set State.Nonce but forget to release it.
 	defer func() {
 		if err != nil && len(execCtx.State.OldTxs) == 0 && execCtx.State.Nonce != nil {
-			// We have a reserved nonce but no tx was ever broadcast - release it
 			wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, execCtx.State.Nonce.Uint64())
 		}
 	}()
@@ -597,14 +594,21 @@ func (wm *WalletManager) executeTransactionAttempt(ctx context.Context, execCtx 
 		return wm.handleGasEstimationFailure(execCtx, errDecoder, err)
 	}
 
-	// If builtTx is nil, skip this iteration
-	if builtTx == nil {
+	// Any other BuildTx error (nonce acquisition, gas setting, etc.) — fail fast
+	if err != nil {
 		return &TxExecutionResult{
-			Action: ActionRetry,
+			Action: ActionReturn,
+			Error:  err,
 		}
 	}
 
-	// simulate the tx at pending state to see if it will be reverted
+	// Simulate the tx at pending state to see if it will be reverted.
+	//
+	// Nonce ownership: BuildTx succeeded, so the nonce embedded in builtTx is now
+	// our responsibility. Every exit path below must either:
+	//   (a) pass builtTx to signAndBroadcastTransaction (which handles release on failure), or
+	//   (b) call ReleaseNonce explicitly, or
+	//   (c) preserve it in State.Nonce for a retry (the loop defer acts as safety net).
 	r, readerErr := wm.Reader(execCtx.Params.Network)
 	if readerErr != nil {
 		// Release the nonce since the tx was never broadcast
@@ -693,7 +697,16 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 		}
 	}
 
-	// we need to persist a few calculated values here before retrying with the txs
+	// Increment retry count — without this, simulation reverts would retry forever
+	if result := execCtx.IncrementRetryAndCheck("simulation reverted"); result != nil {
+		wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, builtTx.Nonce())
+		return result
+	}
+
+	// Preserve the nonce and gas limit for the retry attempt.
+	// The nonce is NOT released here — ownership transfers to State.Nonce so the
+	// next iteration reuses the same nonce. If all retries are eventually exhausted,
+	// the safety-net defer in executeTransactionLoop releases it.
 	execCtx.State.Nonce = big.NewInt(int64(builtTx.Nonce()))
 	execCtx.State.GasLimit = builtTx.Gas()
 	// we could persist the error here but then later we need to set it to nil, setting this to the error if the user is supposed to handle such error
@@ -753,8 +766,13 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 	}
 
 	// Handle gas estimation failed hook
-	if errDecoder != nil && execCtx.Hooks.GasEstimationFailed != nil {
-		abiError, revertParams, revertMsgErr := errDecoder.Decode(err)
+	if execCtx.Hooks.GasEstimationFailed != nil {
+		var abiError *abi.Error
+		var revertParams any
+		var revertMsgErr error
+		if errDecoder != nil {
+			abiError, revertParams, revertMsgErr = errDecoder.Decode(err)
+		}
 		hookGasLimit, hookErr := execCtx.Hooks.GasEstimationFailed(nil, abiError, revertParams, revertMsgErr, err)
 		if hookErr != nil {
 			return &TxExecutionResult{
@@ -787,9 +805,12 @@ var SyncBroadcastTimeout = 5 * time.Second
 
 // signAndBroadcastTransaction handles the signing and broadcasting process
 func (wm *WalletManager) signAndBroadcastTransaction(ctx context.Context, tx *types.Transaction, execCtx *TxExecutionContext) *TxExecutionResult {
-	// Helper to release nonce when we fail before broadcast attempt
+	// Release nonce when we fail before any broadcast attempt.
+	// Called only on pre-broadcast exit paths (hook error, sign error, address
+	// mismatch). The OldTxs guard is defensive: it ensures we never release a
+	// nonce for a tx that was already tracked (shouldn't happen in practice
+	// since releaseNonce is only called before broadcast).
 	releaseNonce := func() {
-		// Only release if this tx is not in OldTxs (meaning it was never broadcast)
 		if _, exists := execCtx.State.OldTxs[tx.Hash().Hex()]; !exists {
 			wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, tx.Nonce())
 		}
@@ -836,16 +857,32 @@ func (wm *WalletManager) signAndBroadcastTransaction(ctx context.Context, tx *ty
 
 	// Broadcast transaction
 	if execCtx.Params.Network.IsSyncTxSupported() {
-		// Use timeout wrapper for sync broadcast to handle slow L2s
-		// If the broadcast takes too long, we fall back to async monitoring with gas bump support
+		// Use timeout wrapper for sync broadcast to handle slow L2s.
+		// If the broadcast takes too long, we fall back to async monitoring with gas bump support.
+		//
+		// Important: the goroutine calls the broadcaster directly (not BroadcastTxSync)
+		// to avoid registerBroadcastedTx running in the background after a timeout.
+		// If the goroutine completed after we had already bumped gas and broadcast a
+		// replacement tx, the stale registerBroadcastedTx would overwrite the newer
+		// pending nonce and tx tracking. Instead, we register the tx ourselves on the
+		// main goroutine in every path (success, timeout, error).
 		type syncResult struct {
 			receipt *types.Receipt
 			err     error
 		}
 		resultCh := make(chan syncResult, 1)
 
+		b, broadcasterErr := wm.Broadcaster(execCtx.Params.Network)
+		if broadcasterErr != nil {
+			releaseNonce()
+			return &TxExecutionResult{
+				Action: ActionReturn,
+				Error:  fmt.Errorf("couldn't get broadcaster: %w", broadcasterErr),
+			}
+		}
+
 		go func() {
-			r, e := wm.BroadcastTxSync(signedTx)
+			r, e := b.BroadcastTxSync(signedTx)
 			resultCh <- syncResult{r, e}
 		}()
 
@@ -858,12 +895,18 @@ func (wm *WalletManager) signAndBroadcastTransaction(ctx context.Context, tx *ty
 			if receipt != nil {
 				successful = true
 			}
+			// Register on the main goroutine now that we have the result
+			if successful {
+				_ = wm.registerBroadcastedTx(signedTx, execCtx.Params.Network)
+			}
 		case <-time.After(SyncBroadcastTimeout):
-			// Timeout: treat as slow tx, fall back to async monitoring
+			// Timeout: treat as slow tx, fall back to async monitoring.
 			// The tx was already sent to the network, so we mark it as successful
-			// but with no receipt, which triggers the monitor flow
+			// but with no receipt, which triggers the monitor flow.
+			// Register eagerly since the tx is in-flight on the network.
 			syncBroadcastTimedOut = true
 			successful = true
+			_ = wm.registerBroadcastedTx(signedTx, execCtx.Params.Network)
 			logger.WithFields(logger.Fields{
 				"tx_hash":         signedTx.Hash().Hex(),
 				"nonce":           signedTx.Nonce(),
@@ -881,6 +924,11 @@ func (wm *WalletManager) signAndBroadcastTransaction(ctx context.Context, tx *ty
 		_, successful, broadcastErr = wm.BroadcastTx(signedTx)
 	}
 
+	// Always record signed txs in OldTxs, even when broadcast reports failure.
+	// Nodes may silently accept the tx despite returning an error (network
+	// timeouts, partial propagation, etc.), so we must track every signed tx
+	// to detect if it gets mined later. This is checked by handleNonceIsLowError
+	// and handleGasEstimationFailure to avoid orphaning txs.
 	if signedTx != nil {
 		execCtx.State.OldTxs[signedTx.Hash().Hex()] = signedTx
 	}
@@ -1114,19 +1162,11 @@ func (wm *WalletManager) handleTransactionStatus(status TxInfo, signedTx *types.
 		// and higher gas, similar to the "slow" handler. Acquiring a new nonce would
 		// create a gap that can never be filled.
 		if execCtx.BumpGasForSlowTx(signedTx) {
-			gasPriceBump := execCtx.Gas.GasPriceBumpFactor
-			if gasPriceBump == 0 {
-				gasPriceBump = DefaultGasPriceBumpFactor
-			}
-			tipCapBump := execCtx.Gas.TipCapBumpFactor
-			if tipCapBump == 0 {
-				tipCapBump = DefaultTipCapBumpFactor
-			}
 			logger.WithFields(logger.Fields{
 				"tx_hash": signedTx.Hash().Hex(),
 				"nonce":   signedTx.Nonce(),
 			}).Info(fmt.Sprintf("Transaction lost, retrying with same nonce and increased gas price by %.0f%% and tip cap by %.0f%%...",
-				(gasPriceBump-1)*100, (tipCapBump-1)*100))
+				(execCtx.Gas.GasPriceBumpFactor-1)*100, (execCtx.Gas.TipCapBumpFactor-1)*100))
 
 			return &TxExecutionResult{
 				Action: ActionRetry,
@@ -1169,19 +1209,11 @@ func (wm *WalletManager) handleTransactionStatus(status TxInfo, signedTx *types.
 
 		// This nonce is blocking — bump gas to speed it up
 		if execCtx.BumpGasForSlowTx(signedTx) {
-			gasPriceBump := execCtx.Gas.GasPriceBumpFactor
-			if gasPriceBump == 0 {
-				gasPriceBump = DefaultGasPriceBumpFactor
-			}
-			tipCapBump := execCtx.Gas.TipCapBumpFactor
-			if tipCapBump == 0 {
-				tipCapBump = DefaultTipCapBumpFactor
-			}
 			logger.WithFields(logger.Fields{
 				"tx_hash": signedTx.Hash().Hex(),
 				"nonce":   signedTx.Nonce(),
 			}).Info(fmt.Sprintf("Transaction slow and blocking, increasing gas price by %.0f%% and tip cap by %.0f%%...",
-				(gasPriceBump-1)*100, (tipCapBump-1)*100))
+				(execCtx.Gas.GasPriceBumpFactor-1)*100, (execCtx.Gas.TipCapBumpFactor-1)*100))
 
 			return &TxExecutionResult{
 				Action: ActionRetry,
@@ -1203,7 +1235,17 @@ func (wm *WalletManager) handleTransactionStatus(status TxInfo, signedTx *types.
 		}
 
 	default:
-		// Unknown status, treat as retry
+		// Unknown status — treat as transient but count against MaxAttempts
+		// to prevent infinite loops if the monitor keeps returning unexpected values.
+		logger.WithFields(logger.Fields{
+			"tx_hash": signedTx.Hash().Hex(),
+			"nonce":   signedTx.Nonce(),
+			"status":  status.Status,
+		}).Warn("Unknown transaction status from monitor, retrying")
+
+		if result := execCtx.IncrementRetryAndCheck(fmt.Sprintf("unknown monitor status: %s", status.Status)); result != nil {
+			return result
+		}
 		return &TxExecutionResult{
 			Action: ActionRetry,
 		}
@@ -1300,9 +1342,12 @@ func (wm *WalletManager) ResumePendingTransaction(
 		opts.MaxTipCap = tipCap * MaxCapMultiplier
 	}
 
-	// Create execution context pre-populated with the existing transaction
+	// Use resolved manager defaults — guaranteed non-zero by applyDefaultsResolution.
+	defaults := wm.Defaults()
+
+	// Create execution context pre-populated with the existing transaction.
 	// State.ResumeWith is set so the loop skips executeTransactionAttempt on first iteration
-	// and goes straight to monitoring
+	// and goes straight to monitoring.
 	execCtx := &TxExecutionContext{
 		Params: TxParams{
 			TxType:  uint8(tx.Type()),
@@ -1316,12 +1361,13 @@ func (wm *WalletManager) ResumePendingTransaction(
 			MaxAttempts:     opts.NumRetries,
 			SleepDuration:   opts.SleepDuration,
 			TxCheckInterval: opts.TxCheckInterval,
+			SlowTxTimeout:   defaults.SlowTxTimeout,
 		},
 		Gas: GasBounds{
 			MaxGasPrice:        opts.MaxGasPrice,
 			MaxTipCap:          opts.MaxTipCap,
-			GasPriceBumpFactor: DefaultGasPriceBumpFactor,
-			TipCapBumpFactor:   DefaultTipCapBumpFactor,
+			GasPriceBumpFactor: defaults.GasPriceBumpFactor,
+			TipCapBumpFactor:   defaults.TipCapBumpFactor,
 		},
 		Hooks: TxHooks{
 			TxMined: opts.TxMinedHook,

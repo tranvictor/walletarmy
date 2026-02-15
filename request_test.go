@@ -25,15 +25,17 @@ func mockGasEstimationFailedHook(tx *types.Transaction, abiError *abi.Error, rev
 }
 
 func TestWalletManager_R(t *testing.T) {
-	wm := &WalletManager{}
+	wm := NewWalletManager()
 
 	req := wm.R()
 
 	assert.NotNil(t, req)
 	assert.Equal(t, wm, req.wm)
 	assert.Equal(t, big.NewInt(0), req.value)
-	assert.Equal(t, 0, req.numRetries)
-	assert.Equal(t, time.Duration(0), req.sleepDuration)
+	// Defaults are resolved by applyDefaultsResolution
+	assert.Equal(t, DefaultNumRetries, req.numRetries)
+	assert.Equal(t, DefaultSleepDuration, req.sleepDuration)
+	assert.Equal(t, DefaultTxCheckInterval, req.txCheckInterval)
 	assert.Equal(t, uint8(0), req.txType)
 	assert.Equal(t, common.Address{}, req.from)
 	assert.Equal(t, common.Address{}, req.to)

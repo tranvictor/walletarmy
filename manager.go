@@ -122,21 +122,58 @@ func NewWalletManager(opts ...WalletManagerOption) *WalletManager {
 		wm.networkResolver = DefaultNetworkResolver
 	}
 
+	// Resolve ManagerDefaults: fill any zero-value fields with package-level
+	// constants so that downstream code can use defaults directly without
+	// its own fallback logic. This is the single place where "if zero, use
+	// package default" resolution happens.
+	wm.applyDefaultsResolution()
+
 	return wm
 }
 
-// Defaults returns the current default configuration
+// applyDefaultsResolution fills zero-value ManagerDefaults fields with package-level
+// constants. Called once at construction and again after SetDefaults, so downstream
+// code never needs its own "if zero, use default" logic.
+func (wm *WalletManager) applyDefaultsResolution() {
+	d := &wm.defaults
+	if d.NumRetries <= 0 {
+		d.NumRetries = DefaultNumRetries
+	}
+	if d.SleepDuration <= 0 {
+		d.SleepDuration = DefaultSleepDuration
+	}
+	if d.TxCheckInterval <= 0 {
+		d.TxCheckInterval = DefaultTxCheckInterval
+	}
+	if d.SlowTxTimeout <= 0 {
+		d.SlowTxTimeout = DefaultSlowTxTimeout
+	}
+	if d.GasPriceBumpFactor <= 0 {
+		d.GasPriceBumpFactor = DefaultGasPriceBumpFactor
+	}
+	if d.TipCapBumpFactor <= 0 {
+		d.TipCapBumpFactor = DefaultTipCapBumpFactor
+	}
+	if d.Network == nil {
+		d.Network = networks.EthereumMainnet
+	}
+}
+
+// Defaults returns the current default configuration.
+// All fields are guaranteed to be non-zero (resolved at construction time).
 func (wm *WalletManager) Defaults() ManagerDefaults {
 	wm.defaultsMu.RLock()
 	defer wm.defaultsMu.RUnlock()
 	return wm.defaults
 }
 
-// SetDefaults updates the default configuration
+// SetDefaults updates the default configuration.
+// Zero-value fields are filled with package-level constants automatically.
 func (wm *WalletManager) SetDefaults(defaults ManagerDefaults) {
 	wm.defaultsMu.Lock()
 	defer wm.defaultsMu.Unlock()
 	wm.defaults = defaults
+	wm.applyDefaultsResolution()
 }
 
 // IdempotencyStore returns the configured idempotency store, or nil if not configured

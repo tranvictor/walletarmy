@@ -13,10 +13,12 @@ import (
 func TestTxExecutionContext_BumpGasForSlowTx(t *testing.T) {
 	ctx := &TxExecutionContext{
 		Gas: GasBounds{
-			ExtraGasPrice: 10.0,
-			ExtraTipCap:   5.0,
-			MaxGasPrice:   0, // No limit
-			MaxTipCap:     0, // No limit
+			ExtraGasPrice:      10.0,
+			ExtraTipCap:        5.0,
+			MaxGasPrice:        0, // No limit
+			MaxTipCap:          0, // No limit
+			GasPriceBumpFactor: DefaultGasPriceBumpFactor,
+			TipCapBumpFactor:   DefaultTipCapBumpFactor,
 		},
 	}
 
@@ -62,10 +64,12 @@ func TestTxExecutionContext_BumpGasForSlowTx(t *testing.T) {
 	// Test with gas price limit that allows adjustment
 	ctxWithLimit := &TxExecutionContext{
 		Gas: GasBounds{
-			ExtraGasPrice: 10.0,
-			ExtraTipCap:   5.0,
-			MaxGasPrice:   130.0, // Set a limit higher than adjusted price (120)
-			MaxTipCap:     0,     // No tip cap limit
+			ExtraGasPrice:      10.0,
+			ExtraTipCap:        5.0,
+			MaxGasPrice:        130.0, // Set a limit higher than adjusted price (120)
+			MaxTipCap:          0,     // No tip cap limit
+			GasPriceBumpFactor: DefaultGasPriceBumpFactor,
+			TipCapBumpFactor:   DefaultTipCapBumpFactor,
 		},
 	}
 
@@ -77,10 +81,12 @@ func TestTxExecutionContext_BumpGasForSlowTx(t *testing.T) {
 	// This should fail due to gas price limit reached
 	ctxWithLowLimit := &TxExecutionContext{
 		Gas: GasBounds{
-			ExtraGasPrice: 10.0,
-			ExtraTipCap:   5.0,
-			MaxGasPrice:   115.0, // Lower than 120 (100 * 1.2)
-			MaxTipCap:     0,     // No tip cap limit
+			ExtraGasPrice:      10.0,
+			ExtraTipCap:        5.0,
+			MaxGasPrice:        115.0, // Lower than 120 (100 * 1.2)
+			MaxTipCap:          0,     // No tip cap limit
+			GasPriceBumpFactor: DefaultGasPriceBumpFactor,
+			TipCapBumpFactor:   DefaultTipCapBumpFactor,
 		},
 	}
 
@@ -94,8 +100,10 @@ func TestTxExecutionContext_BumpGasForSlowTx(t *testing.T) {
 func TestTxExecutionContext_AdjustGasPricesForSlowTx(t *testing.T) {
 	ctx := &TxExecutionContext{
 		Gas: GasBounds{
-			MaxGasPrice: 0,
-			MaxTipCap:   0,
+			MaxGasPrice:        0,
+			MaxTipCap:          0,
+			GasPriceBumpFactor: DefaultGasPriceBumpFactor,
+			TipCapBumpFactor:   DefaultTipCapBumpFactor,
 		},
 	}
 

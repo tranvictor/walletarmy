@@ -50,19 +50,14 @@ type TxRequest struct {
 // R creates a new transaction request (similar to go-resty's R() method).
 // The request inherits default configuration from the WalletManager.
 func (wm *WalletManager) R() *TxRequest {
-	// Use Defaults() to safely read with lock
+	// Use Defaults() to safely read with lock.
+	// All fields are guaranteed non-zero by applyDefaultsResolution.
 	defaults := wm.Defaults()
-
-	// Determine default network
-	network := defaults.Network
-	if network == nil {
-		network = networks.EthereumMainnet
-	}
 
 	return &TxRequest{
 		wm:              wm,
 		value:           big.NewInt(0),
-		network:         network,
+		network:         defaults.Network,
 		numRetries:      defaults.NumRetries,
 		sleepDuration:   defaults.SleepDuration,
 		txCheckInterval: defaults.TxCheckInterval,
@@ -311,7 +306,9 @@ func (r *TxRequest) executeWithIdempotency(ctx context.Context) (*types.Transact
 
 // executeInternal builds TxExecutionContext directly and runs the execution loop.
 func (r *TxRequest) executeInternal(ctx context.Context) (*types.Transaction, *types.Receipt, error) {
-	// Build the execution context directly from TxRequest fields
+	// Use resolved manager defaults — guaranteed non-zero by applyDefaultsResolution.
+	defaults := r.wm.Defaults()
+
 	execCtx, err := NewTxExecutionContext(
 		TxParams{
 			TxType:  r.txType,
@@ -325,7 +322,7 @@ func (r *TxRequest) executeInternal(ctx context.Context) (*types.Transaction, *t
 			MaxAttempts:     r.numRetries,
 			SleepDuration:   r.sleepDuration,
 			TxCheckInterval: r.txCheckInterval,
-			SlowTxTimeout:   DefaultSlowTxTimeout,
+			SlowTxTimeout:   defaults.SlowTxTimeout,
 		},
 		GasBounds{
 			ExtraGasLimit:      r.extraGasLimit,
@@ -333,8 +330,8 @@ func (r *TxRequest) executeInternal(ctx context.Context) (*types.Transaction, *t
 			ExtraTipCap:        r.extraTipCapGwei,
 			MaxGasPrice:        r.maxGasPrice,
 			MaxTipCap:          r.maxTipCap,
-			GasPriceBumpFactor: DefaultGasPriceBumpFactor,
-			TipCapBumpFactor:   DefaultTipCapBumpFactor,
+			GasPriceBumpFactor: defaults.GasPriceBumpFactor,
+			TipCapBumpFactor:   defaults.TipCapBumpFactor,
 		},
 		TxHooks{
 			BeforeSignAndBroadcast: r.beforeSignAndBroadcastHook,
@@ -353,18 +350,6 @@ func (r *TxRequest) executeInternal(ctx context.Context) (*types.Transaction, *t
 
 	// Store the initial gas limit in state (may be overridden by hooks)
 	execCtx.State.GasLimit = r.gasLimit
-
-	// Apply manager defaults for gas bumping configuration
-	defaults := r.wm.Defaults()
-	if defaults.SlowTxTimeout > 0 {
-		execCtx.Retry.SlowTxTimeout = defaults.SlowTxTimeout
-	}
-	if defaults.GasPriceBumpFactor > 0 {
-		execCtx.Gas.GasPriceBumpFactor = defaults.GasPriceBumpFactor
-	}
-	if defaults.TipCapBumpFactor > 0 {
-		execCtx.Gas.TipCapBumpFactor = defaults.TipCapBumpFactor
-	}
 
 	// Create error decoder
 	errDecoder := r.wm.createErrorDecoder(execCtx.Hooks.ABIs)

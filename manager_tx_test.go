@@ -403,7 +403,7 @@ func (m *closingMonitor) MakeWaitChannelWithInterval(hash string, interval time.
 
 func TestTxExecutionContext_AdjustGasPricesForSlowTx_Success(t *testing.T) {
 	ctx := &TxExecutionContext{
-		Gas: GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0},
+		Gas: GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
@@ -427,7 +427,7 @@ func TestTxExecutionContext_AdjustGasPricesForSlowTx_Success(t *testing.T) {
 
 func TestTxExecutionContext_AdjustGasPricesForSlowTx_HitsGasPriceLimit(t *testing.T) {
 	ctx := &TxExecutionContext{
-		Gas: GasBounds{MaxGasPrice: 22.0, MaxTipCap: 100.0},
+		Gas: GasBounds{MaxGasPrice: 22.0, MaxTipCap: 100.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
@@ -443,7 +443,7 @@ func TestTxExecutionContext_AdjustGasPricesForSlowTx_HitsGasPriceLimit(t *testin
 
 func TestTxExecutionContext_AdjustGasPricesForSlowTx_HitsTipCapLimit(t *testing.T) {
 	ctx := &TxExecutionContext{
-		Gas: GasBounds{MaxGasPrice: 200.0, MaxTipCap: 2.1},
+		Gas: GasBounds{MaxGasPrice: 200.0, MaxTipCap: 2.1, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
@@ -745,7 +745,7 @@ func TestHandleTransactionStatus_Lost_Retries(t *testing.T) {
 
 	execCtx := &TxExecutionContext{
 		Retry: RetryConfig{MaxAttempts: 5},
-		Gas:   GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0},
+		Gas:   GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
@@ -771,7 +771,7 @@ func TestHandleTransactionStatus_Slow_BumpsGas(t *testing.T) {
 
 	execCtx := &TxExecutionContext{
 		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
-		Gas:    GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0},
+		Gas:    GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "slow"}, tx, execCtx)
@@ -796,7 +796,7 @@ func TestHandleTransactionStatus_Slow_HitsLimit(t *testing.T) {
 
 	execCtx := &TxExecutionContext{
 		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
-		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 50.0},
+		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 50.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "slow"}, tx, execCtx)
@@ -1860,7 +1860,7 @@ func TestEnsureTx_SlowTxTriggersGasBump(t *testing.T) {
 	// The full integration with monitor is tested separately
 
 	ctx := &TxExecutionContext{
-		Gas: GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0},
+		Gas: GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
@@ -1917,7 +1917,7 @@ func TestEnsureTx_GasPriceLimitReached_Unit(t *testing.T) {
 	// Unit test: verify that AdjustGasPricesForSlowTx returns false when limit would be exceeded
 
 	ctx := &TxExecutionContext{
-		Gas: GasBounds{MaxGasPrice: 22.0, MaxTipCap: 50.0},
+		Gas: GasBounds{MaxGasPrice: 22.0, MaxTipCap: 50.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
@@ -2926,7 +2926,7 @@ func TestHandleTransactionStatus_Lost_RetriesWithSameNonce(t *testing.T) {
 
 	execCtx := &TxExecutionContext{
 		Retry: RetryConfig{MaxAttempts: 5},
-		Gas:   GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0},
+		Gas:   GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
@@ -2967,7 +2967,7 @@ func TestHandleTransactionStatus_Lost_HitsGasLimit(t *testing.T) {
 	execCtx := &TxExecutionContext{
 		Retry:  RetryConfig{MaxAttempts: 5},
 		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
-		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 50.0},
+		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 50.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
@@ -3052,7 +3052,7 @@ func TestHandleBroadcastError_ReplacementUnderpriced_BumpsGas(t *testing.T) {
 	execCtx := &TxExecutionContext{
 		Retry:  RetryConfig{MaxAttempts: 5},
 		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
-		Gas:    GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0},
+		Gas:    GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
@@ -3083,7 +3083,7 @@ func TestHandleBroadcastError_ReplacementUnderpriced_HitsGasLimit(t *testing.T) 
 	execCtx := &TxExecutionContext{
 		Retry:  RetryConfig{MaxAttempts: 5},
 		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
-		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 2.5},
+		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 2.5, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
@@ -3113,7 +3113,7 @@ func TestHandleBroadcastError_ReplacementUnderpriced_DoesNotOrphanTx(t *testing.
 	execCtx := &TxExecutionContext{
 		Retry:  RetryConfig{MaxAttempts: 5},
 		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
-		Gas:    GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0},
+		Gas:    GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 		State:  TxRetryState{OldTxs: map[string]*types.Transaction{}},
 	}
 
@@ -3150,7 +3150,7 @@ func TestHandleTransactionStatus_Lost_HitsGasLimit_RespectsLimit(t *testing.T) {
 	execCtx := &TxExecutionContext{
 		Retry:  RetryConfig{MaxAttempts: 5},
 		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
-		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 2.5},
+		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 2.5, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "lost"}, tx, execCtx)
@@ -3181,7 +3181,7 @@ func TestHandleTransactionStatus_Slow_BlockingNonce_BumpsGas(t *testing.T) {
 
 	execCtx := &TxExecutionContext{
 		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
-		Gas:    GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0},
+		Gas:    GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "slow"}, tx, execCtx)
@@ -3209,7 +3209,7 @@ func TestHandleTransactionStatus_Slow_NonBlockingNonce_JustWaits(t *testing.T) {
 
 	execCtx := &TxExecutionContext{
 		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
-		Gas:    GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0},
+		Gas:    GasBounds{MaxGasPrice: 100.0, MaxTipCap: 50.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
 	}
 
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "slow"}, tx, execCtx)
