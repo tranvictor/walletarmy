@@ -96,6 +96,7 @@ walletarmy/                  # Root package — all public API lives here
 - `TxRequest` uses method chaining — every `Set` method returns `*TxRequest`
 - New fields need: struct field + `Set` method + initialization in `R()` (if default applies)
 - Execution goes through `Execute()` → `ExecuteContext()` → `executeInternal()`
+- `SetSkipSimulation(true)` bypasses the `eth_call` simulation before broadcast; caller should also set `SetGasLimit()` when using this
 
 ### Thread Safety
 

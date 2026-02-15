@@ -15,12 +15,19 @@ import (
 
 // TxParams holds immutable transaction parameters (set once, never mutated).
 type TxParams struct {
-	TxType  uint8
-	From    common.Address
-	To      common.Address
-	Value   *big.Int
-	Data    []byte
-	Network networks.Network
+	TxType         uint8
+	From           common.Address
+	To             common.Address
+	Value          *big.Int
+	Data           []byte
+	Network        networks.Network
+	// SkipSimulation, when true, skips the eth_call simulation that normally runs
+	// after BuildTx succeeds but before signing and broadcasting. This allows
+	// forcing a transaction through even when the simulation indicates it would
+	// revert. The caller should typically also provide a manual gas limit
+	// (via TxRequest.SetGasLimit or the GasLimit field in TxRetryState), since
+	// gas estimation may fail for the same reason the simulation would revert.
+	SkipSimulation bool
 }
 
 // RetryConfig holds immutable retry/timing configuration.

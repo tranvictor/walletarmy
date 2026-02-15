@@ -43,6 +43,9 @@ type TxRequest struct {
 	txMinedHook                TxMinedHook
 	abis                       []abi.ABI
 
+	// Skip eth_call simulation before broadcasting
+	skipSimulation bool
+
 	// Idempotency key for preventing duplicate transactions
 	idempotencyKey string
 }
@@ -213,6 +216,16 @@ func (r *TxRequest) SetTxMinedHook(hook TxMinedHook) *TxRequest {
 	return r
 }
 
+// SetSkipSimulation skips the eth_call simulation that runs before signing and broadcasting.
+// When set to true, the transaction will be signed and broadcast even if it would revert.
+// This is useful when you know the simulation will fail but want to force the transaction through.
+// Note: you likely also need to set a manual gas limit via SetGasLimit, since gas estimation
+// may fail for the same reason the simulation would revert.
+func (r *TxRequest) SetSkipSimulation(skip bool) *TxRequest {
+	r.skipSimulation = skip
+	return r
+}
+
 // SetIdempotencyKey sets a unique key to prevent duplicate transaction submissions.
 // If the same key is used again, the previous transaction result will be returned
 // instead of submitting a new transaction.
@@ -311,12 +324,13 @@ func (r *TxRequest) executeInternal(ctx context.Context) (*types.Transaction, *t
 
 	execCtx, err := NewTxExecutionContext(
 		TxParams{
-			TxType:  r.txType,
-			From:    r.from,
-			To:      r.to,
-			Value:   r.value,
-			Data:    r.data,
-			Network: r.network,
+			TxType:         r.txType,
+			From:           r.from,
+			To:             r.to,
+			Value:          r.value,
+			Data:           r.data,
+			Network:        r.network,
+			SkipSimulation: r.skipSimulation,
 		},
 		RetryConfig{
 			MaxAttempts:     r.numRetries,

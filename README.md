@@ -610,6 +610,26 @@ tx, receipt, err := wm.R().
     Execute()
 ```
 
+### Forcing Transactions Through (Skip Simulation)
+
+By default, WalletArmy runs an `eth_call` simulation after building a transaction but before signing and broadcasting. If the simulation shows the transaction would revert, execution stops (or retries, if a `SimulationFailedHook` requests it).
+
+To bypass this check and force-broadcast regardless of simulation results, use `SetSkipSimulation(true)`. This is useful when you know the simulation will fail but still want the transaction submitted — for example, transactions that depend on state changes within the same block, or contracts with view-only revert guards that don't apply during actual execution.
+
+When skipping simulation, you should also provide a manual gas limit via `SetGasLimit()`, since gas estimation may fail for the same reason the simulation would revert.
+
+```go
+tx, receipt, err := wm.R().
+    SetFrom(wallet).
+    SetTo(contractAddress).
+    SetData(calldata).
+    SetGasLimit(500000).         // Required — estimation likely fails too
+    SetSkipSimulation(true).     // Bypass eth_call simulation
+    Execute()
+```
+
+> **Warning**: Skipping simulation removes a safety net. The transaction will be broadcast even if it would revert on-chain, consuming gas. Use this only when you understand why the simulation fails and are confident the transaction should proceed.
+
 ## Hooks
 
 Hooks allow you to inject custom logic at various stages of transaction execution:

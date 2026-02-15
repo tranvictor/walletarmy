@@ -603,42 +603,46 @@ func (wm *WalletManager) executeTransactionAttempt(ctx context.Context, execCtx 
 	}
 
 	// Simulate the tx at pending state to see if it will be reverted.
+	// When SkipSimulation is true (set via TxRequest.SetSkipSimulation), this
+	// entire block is bypassed and we proceed directly to sign-and-broadcast.
 	//
 	// Nonce ownership: BuildTx succeeded, so the nonce embedded in builtTx is now
 	// our responsibility. Every exit path below must either:
 	//   (a) pass builtTx to signAndBroadcastTransaction (which handles release on failure), or
 	//   (b) call ReleaseNonce explicitly, or
 	//   (c) preserve it in State.Nonce for a retry (the loop defer acts as safety net).
-	r, readerErr := wm.Reader(execCtx.Params.Network)
-	if readerErr != nil {
-		// Release the nonce since the tx was never broadcast
-		wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, builtTx.Nonce())
-		return &TxExecutionResult{
-			Action: ActionReturn,
-			Error:  errors.Join(ErrSimulatedTxFailed, fmt.Errorf("couldn't get reader for simulation: %w", readerErr)),
-		}
-	}
-	_, err = r.EthCall(execCtx.Params.From.Hex(), execCtx.Params.To.Hex(), execCtx.Params.Data, nil) // nil overrides = use current state
-	if err != nil {
-		revertData, isRevert := ethclient.RevertErrorData(err)
-		if isRevert {
-			return wm.handleEthCallRevertFailure(execCtx, errDecoder, builtTx, revertData, err)
-		} else {
+	if !execCtx.Params.SkipSimulation {
+		r, readerErr := wm.Reader(execCtx.Params.Network)
+		if readerErr != nil {
 			// Release the nonce since the tx was never broadcast
 			wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, builtTx.Nonce())
-			err = errors.Join(ErrSimulatedTxFailed, fmt.Errorf("couldn't simulate tx at pending state. Detail: %w", err))
-			logger.WithFields(logger.Fields{
-				"tx_hash":         builtTx.Hash().Hex(),
-				"nonce":           builtTx.Nonce(),
-				"gas_price":       builtTx.GasPrice().String(),
-				"tip_cap":         builtTx.GasTipCap().String(),
-				"max_fee_per_gas": builtTx.GasFeeCap().String(),
-				"used_sync_tx":    execCtx.Params.Network.IsSyncTxSupported(),
-				"error":           err,
-			}).Debug("Tx simulation failed but not a revert error")
 			return &TxExecutionResult{
 				Action: ActionReturn,
-				Error:  err,
+				Error:  errors.Join(ErrSimulatedTxFailed, fmt.Errorf("couldn't get reader for simulation: %w", readerErr)),
+			}
+		}
+		_, err = r.EthCall(execCtx.Params.From.Hex(), execCtx.Params.To.Hex(), execCtx.Params.Data, nil) // nil overrides = use current state
+		if err != nil {
+			revertData, isRevert := ethclient.RevertErrorData(err)
+			if isRevert {
+				return wm.handleEthCallRevertFailure(execCtx, errDecoder, builtTx, revertData, err)
+			} else {
+				// Release the nonce since the tx was never broadcast
+				wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, builtTx.Nonce())
+				err = errors.Join(ErrSimulatedTxFailed, fmt.Errorf("couldn't simulate tx at pending state. Detail: %w", err))
+				logger.WithFields(logger.Fields{
+					"tx_hash":         builtTx.Hash().Hex(),
+					"nonce":           builtTx.Nonce(),
+					"gas_price":       builtTx.GasPrice().String(),
+					"tip_cap":         builtTx.GasTipCap().String(),
+					"max_fee_per_gas": builtTx.GasFeeCap().String(),
+					"used_sync_tx":    execCtx.Params.Network.IsSyncTxSupported(),
+					"error":           err,
+				}).Debug("Tx simulation failed but not a revert error")
+				return &TxExecutionResult{
+					Action: ActionReturn,
+					Error:  err,
+				}
 			}
 		}
 	}
