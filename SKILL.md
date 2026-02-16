@@ -7,7 +7,7 @@ Use walletarmy when the user wants to:
 - Sign transactions with private keys, keystore files, or hardware wallets (Ledger, Trezor)
 - Handle nonce management, gas estimation, retries, and monitoring automatically
 - Build resilient transaction pipelines with hooks, idempotency, and circuit breakers
-- Support multiple EVM networks (Ethereum, Polygon, Arbitrum, Optimism, custom chains)
+- Support multiple EVM networks (Ethereum, Matic/Polygon, Arbitrum, Optimism, custom chains)
 - Recover in-flight transactions after a crash or restart
 
 ## Installation
@@ -197,9 +197,9 @@ wm := walletarmy.NewWalletManager(
 // Use default network (Ethereum)
 wm.R().SetFrom(wallet).SetTo(to).SetValue(amount).Execute()
 
-// Override for Polygon
+// Override for Matic/Polygon
 wm.R().SetFrom(wallet).SetTo(to).SetValue(amount).
-    SetNetwork(networks.PolygonMainnet).Execute()
+    SetNetwork(networks.Matic).Execute()
 
 // Override for Arbitrum
 wm.R().SetFrom(wallet).SetTo(to).SetValue(amount).
@@ -213,8 +213,8 @@ For private chains or unsupported L2s, create a custom network using jarvis cons
 ```go
 import "github.com/tranvictor/jarvis/networks"
 
-// Standard EVM chain
-customNet := networks.NewGenericNetwork(networks.GenericNetworkConfig{
+// Standard EVM chain (Etherscan-compatible block explorer)
+customNet := networks.NewGenericEtherscanNetwork(networks.GenericEtherscanNetworkConfig{
     Name: "my-chain", ChainID: 12345,
     NativeTokenSymbol: "ETH", NativeTokenDecimal: 18, BlockTime: 2,
     DefaultNodes: map[string]string{"default": "https://rpc.my-chain.io"},
@@ -227,9 +227,6 @@ customL2 := networks.NewGenericOptimismNetwork(networks.GenericOptimismNetworkCo
     DefaultNodes: map[string]string{"default": "https://rpc.my-op-l2.io"},
     SyncTxSupported: true,
 })
-
-// Arbitrum-based L2
-customArb := networks.NewGenericArbitrumNetwork(networks.GenericArbitrumNetworkConfig{...})
 
 // Register a resolver so WalletArmy can look up your custom network by chain ID
 // (needed for crash recovery and raw BroadcastTx calls)
@@ -284,7 +281,7 @@ fmt.Printf("Recovered %d txs, %d mined, %d dropped\n",
 ```go
 // Circuit breakers are automatic per-network. Check stats:
 stats := wm.GetCircuitBreakerStats(networks.EthereumMainnet)
-fmt.Printf("State: %s, Failures: %d\n", stats.State, stats.Failures)
+fmt.Printf("State: %s, Failures: %d\n", stats.State, stats.ConsecutiveFailures)
 
 // Manual reset if needed:
 wm.ResetCircuitBreaker(networks.EthereumMainnet)
