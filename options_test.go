@@ -53,6 +53,13 @@ func TestWithDefaultExtraGasLimit(t *testing.T) {
 	assert.Equal(t, uint64(50000), defaults.ExtraGasLimit)
 }
 
+func TestWithDefaultGasLimitBufferPercent(t *testing.T) {
+	wm := NewWalletManager(WithDefaultGasLimitBufferPercent(200))
+
+	defaults := wm.Defaults()
+	assert.Equal(t, uint64(200), defaults.GasLimitBufferPercent)
+}
+
 func TestWithDefaultExtraGasPrice(t *testing.T) {
 	wm := NewWalletManager(WithDefaultExtraGasPrice(5.5))
 
@@ -97,16 +104,17 @@ func TestWithDefaultTxType(t *testing.T) {
 
 func TestWithDefaults_AllAtOnce(t *testing.T) {
 	defaults := ManagerDefaults{
-		NumRetries:      5,
-		SleepDuration:   10 * time.Second,
-		TxCheckInterval: 2 * time.Second,
-		ExtraGasLimit:   10000,
-		ExtraGasPrice:   3.0,
-		ExtraTipCap: 1.5,
-		MaxGasPrice:     200.0,
-		MaxTipCap:       20.0,
-		Network:         networks.BSCMainnet,
-		TxType:          2,
+		NumRetries:            5,
+		SleepDuration:         10 * time.Second,
+		TxCheckInterval:       2 * time.Second,
+		ExtraGasLimit:         10000,
+		GasLimitBufferPercent: 200,
+		ExtraGasPrice:         3.0,
+		ExtraTipCap:           1.5,
+		MaxGasPrice:           200.0,
+		MaxTipCap:             20.0,
+		Network:               networks.BSCMainnet,
+		TxType:                2,
 	}
 
 	wm := NewWalletManager(WithDefaults(defaults))
@@ -116,6 +124,7 @@ func TestWithDefaults_AllAtOnce(t *testing.T) {
 	assert.Equal(t, defaults.SleepDuration, retrieved.SleepDuration)
 	assert.Equal(t, defaults.TxCheckInterval, retrieved.TxCheckInterval)
 	assert.Equal(t, defaults.ExtraGasLimit, retrieved.ExtraGasLimit)
+	assert.Equal(t, defaults.GasLimitBufferPercent, retrieved.GasLimitBufferPercent)
 	assert.Equal(t, defaults.ExtraGasPrice, retrieved.ExtraGasPrice)
 	assert.Equal(t, defaults.ExtraTipCap, retrieved.ExtraTipCap)
 	assert.Equal(t, defaults.MaxGasPrice, retrieved.MaxGasPrice)

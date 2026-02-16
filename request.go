@@ -24,8 +24,9 @@ type TxRequest struct {
 	txType          uint8
 	from, to        common.Address
 	value           *big.Int
-	gasLimit        uint64
-	extraGasLimit   uint64
+	gasLimit              uint64
+	extraGasLimit         uint64
+	gasLimitBufferPercent uint64
 	gasPrice        float64
 	extraGasPrice   float64
 	tipCapGwei      float64
@@ -65,8 +66,9 @@ func (wm *WalletManager) R() *TxRequest {
 		sleepDuration:   defaults.SleepDuration,
 		txCheckInterval: defaults.TxCheckInterval,
 		txType:          defaults.TxType,
-		extraGasLimit:   defaults.ExtraGasLimit,
-		extraGasPrice:   defaults.ExtraGasPrice,
+		extraGasLimit:         defaults.ExtraGasLimit,
+		gasLimitBufferPercent: defaults.GasLimitBufferPercent,
+		extraGasPrice:         defaults.ExtraGasPrice,
 		extraTipCapGwei: defaults.ExtraTipCap,
 		maxGasPrice:     defaults.MaxGasPrice,
 		maxTipCap:       defaults.MaxTipCap,
@@ -126,6 +128,15 @@ func (r *TxRequest) SetGasLimit(gasLimit uint64) *TxRequest {
 // SetExtraGasLimit sets the extra gas limit
 func (r *TxRequest) SetExtraGasLimit(extraGasLimit uint64) *TxRequest {
 	r.extraGasLimit = extraGasLimit
+	return r
+}
+
+// SetGasLimitBufferPercent sets a percentage multiplier for the estimated gas limit.
+// The value represents a percentage where 100 = 1x (no change), 200 = 2x, 220 = 2.2x.
+// This is only applied when gas is estimated (gasLimit is not explicitly set).
+// A value of 0 means no buffer is applied.
+func (r *TxRequest) SetGasLimitBufferPercent(percent uint64) *TxRequest {
+	r.gasLimitBufferPercent = percent
 	return r
 }
 
@@ -339,8 +350,9 @@ func (r *TxRequest) executeInternal(ctx context.Context) (*types.Transaction, *t
 			SlowTxTimeout:   defaults.SlowTxTimeout,
 		},
 		GasBounds{
-			ExtraGasLimit:      r.extraGasLimit,
-			ExtraGasPrice:      r.extraGasPrice,
+			ExtraGasLimit:         r.extraGasLimit,
+			GasLimitBufferPercent: r.gasLimitBufferPercent,
+			ExtraGasPrice:         r.extraGasPrice,
 			ExtraTipCap:        r.extraTipCapGwei,
 			MaxGasPrice:        r.maxGasPrice,
 			MaxTipCap:          r.maxTipCap,

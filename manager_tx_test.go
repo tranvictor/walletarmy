@@ -42,6 +42,7 @@ func TestBuildTx_EstimatesGas_WhenZero(t *testing.T) {
 		oneEth,
 		0,  // gasLimit = 0, should trigger estimation
 		0,  // extraGasLimit
+		0,  // gasLimitBufferPercent
 		20, // gasPrice
 		0,  // extraGasPrice
 		2,  // tipCapGwei
@@ -74,6 +75,7 @@ func TestBuildTx_UsesProvidedGasLimit(t *testing.T) {
 		oneEth,
 		21000, // gasLimit provided
 		1000,  // extraGasLimit
+		0,     // gasLimitBufferPercent
 		20,
 		0,
 		2,
@@ -86,6 +88,143 @@ func TestBuildTx_UsesProvidedGasLimit(t *testing.T) {
 	require.NotNil(t, tx)
 	assert.False(t, estimateCalled, "EstimateExactGas should NOT have been called")
 	assert.Equal(t, uint64(22000), tx.Gas()) // 21000 + 1000 extra
+}
+
+func TestBuildTx_GasLimitBufferPercent_DoublesEstimate(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.EstimateExactGasFn = func(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error) {
+		return 50000, nil
+	}
+
+	tx, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		big.NewInt(5), oneEth,
+		0,   // gasLimit = 0, triggers estimation
+		0,   // extraGasLimit
+		200, // gasLimitBufferPercent = 200 means 2x
+		20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	assert.Equal(t, uint64(100000), tx.Gas(), "gas should be 50000 * 200 / 100 = 100000")
+}
+
+func TestBuildTx_GasLimitBufferPercent_220_Adds120Percent(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.EstimateExactGasFn = func(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error) {
+		return 100000, nil
+	}
+
+	tx, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		big.NewInt(5), oneEth,
+		0,   // gasLimit = 0, triggers estimation
+		0,   // extraGasLimit
+		220, // gasLimitBufferPercent = 220 means 2.2x
+		20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	assert.Equal(t, uint64(220000), tx.Gas(), "gas should be 100000 * 220 / 100 = 220000")
+}
+
+func TestBuildTx_GasLimitBufferPercent_ZeroMeansNoBuffer(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.EstimateExactGasFn = func(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error) {
+		return 50000, nil
+	}
+
+	tx, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		big.NewInt(5), oneEth,
+		0, // gasLimit = 0, triggers estimation
+		0, // extraGasLimit
+		0, // gasLimitBufferPercent = 0 means no buffer
+		20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	assert.Equal(t, uint64(50000), tx.Gas(), "gas should be unchanged at 50000 when buffer is 0")
+}
+
+func TestBuildTx_GasLimitBufferPercent_100MeansNoChange(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.EstimateExactGasFn = func(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error) {
+		return 50000, nil
+	}
+
+	tx, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		big.NewInt(5), oneEth,
+		0,   // gasLimit = 0, triggers estimation
+		0,   // extraGasLimit
+		100, // gasLimitBufferPercent = 100 means 1x (no change)
+		20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	assert.Equal(t, uint64(50000), tx.Gas(), "gas should be unchanged at 50000 when buffer is 100")
+}
+
+func TestBuildTx_GasLimitBufferPercent_NotAppliedToExplicitGasLimit(t *testing.T) {
+	setup := newTestSetup(t)
+
+	estimateCalled := false
+	setup.Reader.EstimateExactGasFn = func(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error) {
+		estimateCalled = true
+		return 50000, nil
+	}
+
+	tx, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		big.NewInt(5), oneEth,
+		21000, // gasLimit explicitly set
+		0,     // extraGasLimit
+		200,   // gasLimitBufferPercent = 200, but should be ignored
+		20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	assert.False(t, estimateCalled, "EstimateExactGas should NOT have been called")
+	assert.Equal(t, uint64(21000), tx.Gas(), "gas should be 21000, buffer should not apply to explicit gas limit")
+}
+
+func TestBuildTx_GasLimitBufferPercent_CombinesWithExtraGasLimit(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.EstimateExactGasFn = func(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error) {
+		return 50000, nil
+	}
+
+	tx, err := setup.WM.BuildTx(
+		2, testAddr1, testAddr2,
+		big.NewInt(5), oneEth,
+		0,    // gasLimit = 0, triggers estimation
+		5000, // extraGasLimit
+		200,  // gasLimitBufferPercent = 200 means 2x
+		20, 0, 2, 0, nil,
+		networks.EthereumMainnet,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	// Buffer applied first: 50000 * 200 / 100 = 100000
+	// Then extra added: 100000 + 5000 = 105000
+	assert.Equal(t, uint64(105000), tx.Gas(), "gas should be (50000 * 200 / 100) + 5000 = 105000")
 }
 
 func TestBuildTx_AcquiresNonce_WhenNil(t *testing.T) {
@@ -103,6 +242,7 @@ func TestBuildTx_AcquiresNonce_WhenNil(t *testing.T) {
 		oneEth,
 		21000,
 		0,
+		0, // gasLimitBufferPercent
 		20,
 		0,
 		2,
@@ -135,6 +275,7 @@ func TestBuildTx_GetsGasSettings_WhenZero(t *testing.T) {
 		oneEth,
 		21000,
 		0,
+		0, // gasLimitBufferPercent
 		0, // gasPrice = 0, should get from network
 		0,
 		0, // tipCapGwei = 0, should get from network
@@ -164,6 +305,7 @@ func TestBuildTx_ReturnsError_WhenGasEstimationFails(t *testing.T) {
 		oneEth,
 		0, // gasLimit = 0, triggers estimation
 		0,
+		0, // gasLimitBufferPercent
 		20,
 		0,
 		2,
@@ -192,6 +334,7 @@ func TestBuildTx_ReturnsError_WhenNonceAcquisitionFails(t *testing.T) {
 		oneEth,
 		21000,
 		0,
+		0, // gasLimitBufferPercent
 		20,
 		0,
 		2,
@@ -527,6 +670,7 @@ func TestBuildTx_ConcurrentNonceAcquisition(t *testing.T) {
 				oneEth,
 				21000,
 				0,
+				0, // gasLimitBufferPercent
 				20,
 				0,
 				2,
@@ -1263,7 +1407,7 @@ func TestBuildTx_ReleasesNonce_WhenGasEstimationFails(t *testing.T) {
 		2, testAddr1, testAddr2,
 		nil, // nonce = nil, will acquire nonce 5
 		oneEth,
-		0, 0, 20, 0, 2, 0, nil,
+		0, 0, 0, 20, 0, 2, 0, nil,
 		networks.EthereumMainnet,
 	)
 	require.Error(t, err)
@@ -1277,7 +1421,7 @@ func TestBuildTx_ReleasesNonce_WhenGasEstimationFails(t *testing.T) {
 		2, testAddr1, testAddr2,
 		nil, // Should get nonce 5 again since it was released
 		oneEth,
-		0, 0, 20, 0, 2, 0, nil,
+		0, 0, 0, 20, 0, 2, 0, nil,
 		networks.EthereumMainnet,
 	)
 
@@ -1295,7 +1439,7 @@ func TestBuildTx_DoesNotReleaseNonce_WhenSuccess(t *testing.T) {
 	tx1, err := setup.WM.BuildTx(
 		2, testAddr1, testAddr2,
 		nil, oneEth,
-		21000, 0, 20, 0, 2, 0, nil,
+		21000, 0, 0, 20, 0, 2, 0, nil,
 		networks.EthereumMainnet,
 	)
 	require.NoError(t, err)
@@ -1305,7 +1449,7 @@ func TestBuildTx_DoesNotReleaseNonce_WhenSuccess(t *testing.T) {
 	tx2, err := setup.WM.BuildTx(
 		2, testAddr1, testAddr2,
 		nil, oneEth,
-		21000, 0, 20, 0, 2, 0, nil,
+		21000, 0, 0, 20, 0, 2, 0, nil,
 		networks.EthereumMainnet,
 	)
 	require.NoError(t, err)
@@ -1322,7 +1466,7 @@ func TestReleaseNonce_AllowsNonceReuse(t *testing.T) {
 	tx1, err := setup.WM.BuildTx(
 		2, testAddr1, testAddr2,
 		nil, oneEth,
-		21000, 0, 20, 0, 2, 0, nil,
+		21000, 0, 0, 20, 0, 2, 0, nil,
 		networks.EthereumMainnet,
 	)
 	require.NoError(t, err)
@@ -1332,7 +1476,7 @@ func TestReleaseNonce_AllowsNonceReuse(t *testing.T) {
 	tx2, err := setup.WM.BuildTx(
 		2, testAddr1, testAddr2,
 		nil, oneEth,
-		21000, 0, 20, 0, 2, 0, nil,
+		21000, 0, 0, 20, 0, 2, 0, nil,
 		networks.EthereumMainnet,
 	)
 	require.NoError(t, err)
@@ -1345,7 +1489,7 @@ func TestReleaseNonce_AllowsNonceReuse(t *testing.T) {
 	tx3, err := setup.WM.BuildTx(
 		2, testAddr1, testAddr2,
 		nil, oneEth,
-		21000, 0, 20, 0, 2, 0, nil,
+		21000, 0, 0, 20, 0, 2, 0, nil,
 		networks.EthereumMainnet,
 	)
 	require.NoError(t, err)
@@ -1359,11 +1503,11 @@ func TestReleaseNonce_OnlyReleasesTip(t *testing.T) {
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
 
 	// Acquire nonces 5, 6, 7
-	_, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	_, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
-	_, err = setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	_, err = setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
-	_, err = setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	_, err = setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 
 	// Try to release nonce 6 (not the tip - tip is 7)
@@ -1373,7 +1517,7 @@ func TestReleaseNonce_OnlyReleasesTip(t *testing.T) {
 	tx, err := setup.WM.BuildTx(
 		2, testAddr1, testAddr2,
 		nil, oneEth,
-		21000, 0, 20, 0, 2, 0, nil,
+		21000, 0, 0, 20, 0, 2, 0, nil,
 		networks.EthereumMainnet,
 	)
 	require.NoError(t, err)
@@ -1397,12 +1541,12 @@ func TestReleaseNonce_MultipleWalletsIndependent(t *testing.T) {
 	}
 
 	// Acquire nonce for wallet 1
-	tx1, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	tx1, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(10), tx1.Nonce())
 
 	// Acquire nonce for wallet 2
-	tx2, err := setup.WM.BuildTx(2, testAddr3, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	tx2, err := setup.WM.BuildTx(2, testAddr3, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(20), tx2.Nonce())
 
@@ -1410,12 +1554,12 @@ func TestReleaseNonce_MultipleWalletsIndependent(t *testing.T) {
 	setup.WM.ReleaseNonce(testAddr1, networks.EthereumMainnet, 10)
 
 	// Wallet 1 should get 10 again
-	tx3, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	tx3, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(10), tx3.Nonce())
 
 	// Wallet 2 should get 21 (not affected by wallet 1's release)
-	tx4, err := setup.WM.BuildTx(2, testAddr3, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	tx4, err := setup.WM.BuildTx(2, testAddr3, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(21), tx4.Nonce())
 }
@@ -1441,7 +1585,7 @@ func TestBuildTx_ReleasesNonce_WhenNonceAcquisitionFailsLater(t *testing.T) {
 	}
 
 	// First attempt - fails at gas estimation
-	_, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	_, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 0, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.Error(t, err)
 
 	// Second attempt with working gas estimation
@@ -1449,7 +1593,7 @@ func TestBuildTx_ReleasesNonce_WhenNonceAcquisitionFailsLater(t *testing.T) {
 		return 21000, nil
 	}
 
-	tx, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	tx, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 0, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 	// Should get nonce 5 again because the first attempt released it
 	assert.Equal(t, uint64(5), tx.Nonce())
@@ -1463,7 +1607,7 @@ func TestNonceRelease_SequentialReleaseAndAcquire(t *testing.T) {
 
 	// Acquire nonces 0-4
 	for i := 0; i < 5; i++ {
-		tx, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+		tx, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 		require.NoError(t, err)
 		assert.Equal(t, uint64(i), tx.Nonce())
 	}
@@ -1473,7 +1617,7 @@ func TestNonceRelease_SequentialReleaseAndAcquire(t *testing.T) {
 	setup.WM.ReleaseNonce(testAddr1, networks.EthereumMainnet, 4)
 
 	// Next acquire should get 4 again
-	tx, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	tx, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(4), tx.Nonce(), "should get 4 after release")
 
@@ -1484,7 +1628,7 @@ func TestNonceRelease_SequentialReleaseAndAcquire(t *testing.T) {
 	setup.WM.ReleaseNonce(testAddr1, networks.EthereumMainnet, 3)
 
 	// Next acquire should get 3
-	tx, err = setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	tx, err = setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(3), tx.Nonce(), "should get 3 after double release")
 }
@@ -1521,7 +1665,7 @@ func TestSignAndBroadcast_ReleasesNonce_WhenBeforeHookFails(t *testing.T) {
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
 
-	newTx, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	newTx, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(5), newTx.Nonce(), "nonce 5 should be available after release")
 }
@@ -1579,7 +1723,7 @@ func TestSimulation_ReleasesNonce_WhenHookSaysNoRetry(t *testing.T) {
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
 
 	// First, let's acquire nonce 5 manually to establish state
-	tx1, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	tx1, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(5), tx1.Nonce())
 
@@ -1587,7 +1731,7 @@ func TestSimulation_ReleasesNonce_WhenHookSaysNoRetry(t *testing.T) {
 	setup.WM.ReleaseNonce(testAddr1, networks.EthereumMainnet, 5)
 
 	// Next acquire should get 5 again (proving release worked)
-	tx2, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	tx2, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(5), tx2.Nonce(), "nonce 5 should be available after release")
 }
@@ -1605,14 +1749,14 @@ func TestSimulation_DoesNotReleaseNonce_WhenRetrying(t *testing.T) {
 	}
 
 	// First, acquire nonce 5
-	tx1, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	tx1, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(5), tx1.Nonce())
 
 	// Don't release it - simulating tx is still in-flight
 
 	// Next acquire should get 6 (nonce 5 is still reserved)
-	tx2, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
+	tx2, err := setup.WM.BuildTx(2, testAddr1, testAddr2, nil, oneEth, 21000, 0, 0, 20, 0, 2, 0, nil, networks.EthereumMainnet)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(6), tx2.Nonce(), "nonce 6 because 5 is still in use")
 }
@@ -1711,7 +1855,7 @@ func TestEnsureTx_FullSuccessPath(t *testing.T) {
 		fromAddr,    // from
 		testAddr2,   // to
 		oneEth,      // value
-		21000, 0,    // gasLimit, extraGasLimit
+		21000, 0, 0, // gasLimit, extraGasLimit, gasLimitBufferPercent
 		20.0, 0, // gasPrice, extraGasPrice
 		2.0, 0, // tipCapGwei, extraTipCapGwei
 		100.0, 50.0, // maxGasPrice, maxTipCap
@@ -1767,7 +1911,7 @@ func TestEnsureTx_TxMinedHook_Called(t *testing.T) {
 		ctx,
 		3, time.Millisecond, time.Millisecond,
 		2, fromAddr, testAddr2, oneEth,
-		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		21000, 0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
 		nil, networks.EthereumMainnet,
 		nil, nil, nil, nil, nil, txMinedHook,
 	)
@@ -1799,7 +1943,7 @@ func TestEnsureTx_BeforeSignAndBroadcastHook_StopsExecution(t *testing.T) {
 		ctx,
 		3, time.Millisecond, time.Millisecond,
 		2, fromAddr, testAddr2, oneEth,
-		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		21000, 0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
 		nil, networks.EthereumMainnet,
 		beforeHook, nil, nil, nil, nil, nil,
 	)
@@ -1844,7 +1988,7 @@ func TestEnsureTx_ContextCancellation_DuringExecution(t *testing.T) {
 		ctx,
 		3, time.Millisecond, time.Millisecond,
 		2, fromAddr, testAddr2, oneEth,
-		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		21000, 0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
 		nil, networks.BSCMainnet, // Use BSC which doesn't support sync tx
 		nil, nil, nil, nil, nil, nil,
 	)
@@ -1902,7 +2046,7 @@ func TestEnsureTx_MaxRetriesExceeded(t *testing.T) {
 		ctx,
 		2, time.Millisecond, time.Millisecond, // Only 2 retries
 		2, fromAddr, testAddr2, oneEth,
-		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		21000, 0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
 		nil, networks.EthereumMainnet,
 		nil, nil, nil, nil, nil, nil,
 	)
@@ -1958,7 +2102,7 @@ func TestEnsureTx_TxReverted_ReturnsWithReceipt(t *testing.T) {
 		ctx,
 		3, time.Millisecond, time.Millisecond,
 		2, fromAddr, testAddr2, oneEth,
-		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		21000, 0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
 		nil, networks.BSCMainnet,
 		nil, nil, nil, nil, nil, nil,
 	)
@@ -1999,7 +2143,7 @@ func TestEnsureTx_SyncTx_ReturnsImmediately(t *testing.T) {
 		ctx,
 		3, time.Millisecond, time.Millisecond,
 		2, fromAddr, testAddr2, oneEth,
-		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		21000, 0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
 		nil, networks.EthereumMainnet, // Would need a sync-supporting network
 		nil, nil, nil, nil, nil, nil,
 	)
@@ -2038,7 +2182,7 @@ func TestEnsureTx_LostTx_RetriesWithSameNonceAndBumpedGas(t *testing.T) {
 		ctx,
 		5, time.Millisecond, time.Millisecond,
 		2, fromAddr, testAddr2, oneEth,
-		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		21000, 0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
 		nil, networks.BSCMainnet,
 		nil, nil, nil, nil, nil, nil,
 	)
@@ -2086,7 +2230,7 @@ func TestEnsureTx_AfterSignAndBroadcastHook_CalledOnSuccess(t *testing.T) {
 		ctx,
 		3, time.Millisecond, time.Millisecond,
 		2, fromAddr, testAddr2, oneEth,
-		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		21000, 0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
 		nil, networks.EthereumMainnet,
 		nil, afterHook, nil, nil, nil, nil,
 	)
@@ -2129,7 +2273,7 @@ func TestEnsureTx_GasEstimationFails_RetriesUntilSuccess(t *testing.T) {
 		ctx,
 		5, time.Millisecond, time.Millisecond,
 		2, fromAddr, testAddr2, oneEth,
-		0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0, // gasLimit=0 triggers estimation
+		0, 0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0, // gasLimit=0, gasLimitBufferPercent=0 triggers estimation
 		nil, networks.EthereumMainnet,
 		nil, nil, nil, nil, nil, nil,
 	)
@@ -2730,7 +2874,7 @@ func TestSyncBroadcast_Timeout_TriggersMonitorFlow(t *testing.T) {
 		testAddr2,
 		nil, // nonce
 		oneEth,
-		21000, 0,
+		21000, 0, 0, // gasLimit, extraGasLimit, gasLimitBufferPercent
 		0, 0, // gas price (will use suggested)
 		0, 0, // tip cap (will use suggested)
 		nil, // data
@@ -2883,7 +3027,7 @@ func TestNonceLeak_NonRevertSimulationFailure_FullLoop_ShouldReleaseNonce(t *tes
 		testAddr1,
 		testAddr2,
 		oneEth,
-		21000, 0, // gasLimit, extraGasLimit
+		21000, 0, 0, // gasLimit, extraGasLimit, gasLimitBufferPercent
 		20, 0, // gasPrice, extraGasPrice
 		2, 0, // tipCapGwei, extraTipCapGwei
 		0, 0, // maxGasPrice, maxTipCap
@@ -3011,7 +3155,7 @@ func TestEnsureTx_LostTx_RetriesWithSameNonce(t *testing.T) {
 		ctx,
 		5, time.Millisecond, time.Millisecond,
 		2, fromAddr, testAddr2, oneEth,
-		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		21000, 0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
 		nil, networks.BSCMainnet,
 		nil, nil, nil, nil, nil, nil,
 	)
@@ -3338,7 +3482,7 @@ func TestEnsureTx_SlowTx_NonBlocking_WaitsThenBumpsWhenBlocking(t *testing.T) {
 		ctx,
 		5, time.Millisecond, time.Millisecond,
 		2, fromAddr, testAddr2, oneEth,
-		21000, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
+		21000, 0, 0, 20.0, 0, 2.0, 0, 100.0, 50.0,
 		nil, testNetwork,
 		nil, nil, nil, nil, nil, nil,
 	)
@@ -3730,7 +3874,7 @@ func TestBuildTx_GapDetection_FillsGapBeforeAdvancing(t *testing.T) {
 		testAddr1, testAddr2,
 		nil, // nonce = nil → auto-acquire
 		oneEth,
-		21000, 0,
+		21000, 0, 0, // gasLimit, extraGasLimit, gasLimitBufferPercent
 		20.0, 0,
 		2.0, 0,
 		nil,

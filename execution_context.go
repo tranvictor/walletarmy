@@ -40,13 +40,14 @@ type RetryConfig struct {
 
 // GasBounds holds immutable gas configuration and protection limits.
 type GasBounds struct {
-	ExtraGasLimit      uint64  // Extra gas limit added to estimates
-	ExtraGasPrice      float64 // Extra gas price added to suggestions (gwei)
-	ExtraTipCap        float64 // Extra tip cap added to suggestions (gwei)
-	MaxGasPrice        float64 // Maximum gas price protection limit (gwei)
-	MaxTipCap          float64 // Maximum tip cap protection limit (gwei)
-	GasPriceBumpFactor float64 // Multiplier for gas price when tx is slow (e.g., 1.2 = 20% increase)
-	TipCapBumpFactor   float64 // Multiplier for tip cap when tx is slow (e.g., 1.1 = 10% increase)
+	ExtraGasLimit        uint64  // Extra gas limit added to estimates
+	GasLimitBufferPercent uint64 // Percentage multiplier for estimated gas limit (e.g., 200 = 2x, 220 = 2.2x, 0 = no buffer)
+	ExtraGasPrice        float64 // Extra gas price added to suggestions (gwei)
+	ExtraTipCap          float64 // Extra tip cap added to suggestions (gwei)
+	MaxGasPrice          float64 // Maximum gas price protection limit (gwei)
+	MaxTipCap            float64 // Maximum tip cap protection limit (gwei)
+	GasPriceBumpFactor   float64 // Multiplier for gas price when tx is slow (e.g., 1.2 = 20% increase)
+	TipCapBumpFactor     float64 // Multiplier for tip cap when tx is slow (e.g., 1.1 = 10% increase)
 }
 
 // TxHooks holds all callback hooks (set once at construction).

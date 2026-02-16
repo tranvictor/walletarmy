@@ -147,6 +147,16 @@ func TestTxRequest_SetExtraGasLimit(t *testing.T) {
 	assert.Equal(t, uint64(5000), req.extraGasLimit)
 }
 
+func TestTxRequest_SetGasLimitBufferPercent(t *testing.T) {
+	wm := &WalletManager{}
+	req := wm.R()
+
+	result := req.SetGasLimitBufferPercent(200)
+
+	assert.Equal(t, req, result) // Should return self for chaining
+	assert.Equal(t, uint64(200), req.gasLimitBufferPercent)
+}
+
 func TestTxRequest_SetGasPrice(t *testing.T) {
 	wm := &WalletManager{}
 	req := wm.R()
@@ -397,6 +407,7 @@ func TestTxRequest_BuilderPatternChaining(t *testing.T) {
 		SetValue(value).
 		SetGasLimit(21000).
 		SetExtraGasLimit(1000).
+		SetGasLimitBufferPercent(200).
 		SetGasPrice(20.5).
 		SetExtraGasPrice(5.0).
 		SetTipCapGwei(2.0).
@@ -417,6 +428,7 @@ func TestTxRequest_BuilderPatternChaining(t *testing.T) {
 	assert.Equal(t, value, req.value)
 	assert.Equal(t, uint64(21000), req.gasLimit)
 	assert.Equal(t, uint64(1000), req.extraGasLimit)
+	assert.Equal(t, uint64(200), req.gasLimitBufferPercent)
 	assert.Equal(t, 20.5, req.gasPrice)
 	assert.Equal(t, 5.0, req.extraGasPrice)
 	assert.Equal(t, 2.0, req.tipCapGwei)
@@ -570,6 +582,7 @@ func TestTxRequest_InheritsDefaults(t *testing.T) {
 		WithDefaultSleepDuration(10*time.Second),
 		WithDefaultTxCheckInterval(3*time.Second),
 		WithDefaultExtraGasLimit(10000),
+		WithDefaultGasLimitBufferPercent(200),
 		WithDefaultExtraGasPrice(2.0),
 		WithDefaultExtraTipCap(1.0),
 		WithDefaultMaxGasPrice(500.0),
@@ -583,6 +596,7 @@ func TestTxRequest_InheritsDefaults(t *testing.T) {
 	assert.Equal(t, 10*time.Second, req.sleepDuration)
 	assert.Equal(t, 3*time.Second, req.txCheckInterval)
 	assert.Equal(t, uint64(10000), req.extraGasLimit)
+	assert.Equal(t, uint64(200), req.gasLimitBufferPercent)
 	assert.Equal(t, 2.0, req.extraGasPrice)
 	assert.Equal(t, 1.0, req.extraTipCapGwei)
 	assert.Equal(t, 500.0, req.maxGasPrice)

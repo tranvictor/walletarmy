@@ -23,6 +23,7 @@ func (wm *WalletManager) BuildTx(
 	value *big.Int,
 	gasLimit uint64,
 	extraGasLimit uint64,
+	gasLimitBufferPercent uint64,
 	gasPrice float64,
 	extraGasPrice float64,
 	tipCapGwei float64,
@@ -55,6 +56,11 @@ func (wm *WalletManager) BuildTx(
 
 		if err != nil {
 			return nil, errors.Join(ErrEstimateGasFailed, fmt.Errorf("couldn't estimate gas. The tx is meant to revert or network error. Detail: %w", err))
+		}
+
+		// Apply gas limit buffer if set (only for estimated gas, not explicit)
+		if gasLimitBufferPercent > 0 {
+			gasLimit = gasLimit * gasLimitBufferPercent / 100
 		}
 	}
 
@@ -337,7 +343,7 @@ func (wm *WalletManager) EnsureTxWithHooks(
 	txType uint8,
 	from, to common.Address,
 	value *big.Int,
-	gasLimit uint64, extraGasLimit uint64,
+	gasLimit uint64, extraGasLimit uint64, gasLimitBufferPercent uint64,
 	gasPrice float64, extraGasPrice float64,
 	tipCapGwei float64, extraTipCapGwei float64,
 	maxGasPrice float64, maxTipCap float64,
@@ -357,7 +363,7 @@ func (wm *WalletManager) EnsureTxWithHooks(
 		from,
 		to,
 		value,
-		gasLimit, extraGasLimit,
+		gasLimit, extraGasLimit, gasLimitBufferPercent,
 		gasPrice, extraGasPrice,
 		tipCapGwei, extraTipCapGwei,
 		maxGasPrice, maxTipCap,
@@ -408,7 +414,7 @@ func (wm *WalletManager) EnsureTxWithHooksContext(
 	txType uint8,
 	from, to common.Address,
 	value *big.Int,
-	gasLimit uint64, extraGasLimit uint64,
+	gasLimit uint64, extraGasLimit uint64, gasLimitBufferPercent uint64,
 	gasPrice float64, extraGasPrice float64,
 	tipCapGwei float64, extraTipCapGwei float64,
 	maxGasPrice float64, maxTipCap float64,
@@ -440,13 +446,14 @@ func (wm *WalletManager) EnsureTxWithHooksContext(
 			SlowTxTimeout:   defaults.SlowTxTimeout,
 		},
 		GasBounds{
-			ExtraGasLimit:      extraGasLimit,
-			ExtraGasPrice:      extraGasPrice,
-			ExtraTipCap:        extraTipCapGwei,
-			MaxGasPrice:        maxGasPrice,
-			MaxTipCap:          maxTipCap,
-			GasPriceBumpFactor: defaults.GasPriceBumpFactor,
-			TipCapBumpFactor:   defaults.TipCapBumpFactor,
+			ExtraGasLimit:         extraGasLimit,
+			GasLimitBufferPercent: gasLimitBufferPercent,
+			ExtraGasPrice:         extraGasPrice,
+			ExtraTipCap:           extraTipCapGwei,
+			MaxGasPrice:           maxGasPrice,
+			MaxTipCap:             maxTipCap,
+			GasPriceBumpFactor:    defaults.GasPriceBumpFactor,
+			TipCapBumpFactor:      defaults.TipCapBumpFactor,
 		},
 		TxHooks{
 			BeforeSignAndBroadcast: beforeSignAndBroadcastHook,
@@ -581,6 +588,7 @@ func (wm *WalletManager) executeTransactionAttempt(ctx context.Context, execCtx 
 		execCtx.Params.Value,
 		execCtx.State.GasLimit,
 		execCtx.Gas.ExtraGasLimit,
+		execCtx.Gas.GasLimitBufferPercent,
 		execCtx.State.GasPrice,
 		execCtx.Gas.ExtraGasPrice,
 		execCtx.State.TipCap,
@@ -1277,7 +1285,7 @@ func (wm *WalletManager) EnsureTx(
 		from,
 		to,
 		value,
-		gasLimit, extraGasLimit,
+		gasLimit, extraGasLimit, 0, // gasLimitBufferPercent
 		gasPrice, extraGasPrice,
 		tipCapGwei, extraTipCapGwei,
 		0, 0, // Default maxGasPrice and maxTipCap (0 means no limit)

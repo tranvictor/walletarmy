@@ -54,11 +54,12 @@ type ManagerDefaults struct {
 	SlowTxTimeout   time.Duration // Time before considering a tx "slow" during monitoring
 
 	// Gas configuration
-	ExtraGasLimit uint64
-	ExtraGasPrice float64
-	ExtraTipCap   float64
-	MaxGasPrice   float64
-	MaxTipCap     float64
+	ExtraGasLimit         uint64
+	GasLimitBufferPercent uint64 // Percentage multiplier for estimated gas limit (e.g., 200 = 2x, 220 = 2.2x, 0 = no buffer)
+	ExtraGasPrice         float64
+	ExtraTipCap           float64
+	MaxGasPrice           float64
+	MaxTipCap             float64
 
 	// Gas bumping configuration (for slow tx retry)
 	GasPriceBumpFactor float64 // Multiplier for gas price when tx is slow (e.g., 1.2 = 20% increase)
