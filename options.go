@@ -52,15 +52,6 @@ func WithDefaultExtraGasLimit(extraGasLimit uint64) WalletManagerOption {
 	}
 }
 
-// WithDefaultGasLimitBufferPercent sets the default percentage multiplier for estimated gas limits.
-// The value represents a percentage where 100 = 1x (no change), 200 = 2x, 220 = 2.2x.
-// A value of 0 means no buffer is applied.
-func WithDefaultGasLimitBufferPercent(percent uint64) WalletManagerOption {
-	return func(wm *WalletManager) {
-		wm.defaults.GasLimitBufferPercent = percent
-	}
-}
-
 // WithDefaultExtraGasPrice sets the default extra gas price added to suggestions
 func WithDefaultExtraGasPrice(extraGasPrice float64) WalletManagerOption {
 	return func(wm *WalletManager) {
