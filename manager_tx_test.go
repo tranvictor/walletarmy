@@ -3039,13 +3039,35 @@ func TestEnsureTx_LostTx_RetriesWithSameNonce(t *testing.T) {
 // ============================================================
 
 // TestHandleBroadcastError_ReplacementUnderpriced_BumpsGas tests that when a
-// replacement tx is rejected as underpriced, we keep the same nonce and bump gas.
+// replacement tx is rejected as underpriced and we have a PREVIOUS tx at the
+// same nonce in OldTxs (meaning the pending mempool tx is ours), we keep the
+// same nonce and bump gas.
+//
+// OldTxs setup mirrors the real flow: signAndBroadcastTransaction always adds
+// the current signed tx to OldTxs BEFORE calling handleBroadcastError. So for
+// the "own tx" scenario, OldTxs must contain both the previous broadcast AND
+// the current rejected attempt (2 txs at the same nonce).
 func TestHandleBroadcastError_ReplacementUnderpriced_BumpsGas(t *testing.T) {
 	setup := newTestSetup(t)
 
-	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+	// Our previously broadcast tx at nonce 5 (actually in the mempool)
+	prevTx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(1000000000),  // 1 gwei tip
+		big.NewInt(10000000000), // 10 gwei fee cap
+		big.NewInt(1),
+	)
+
+	// The current replacement attempt (rejected as underpriced)
+	currentSignedTx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
 		big.NewInt(2000000000),  // 2 gwei tip
 		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(1),
+	)
+
+	// The unsigned version of the tx passed to handleBroadcastError
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),
+		big.NewInt(20000000000),
 		big.NewInt(1),
 	)
 
@@ -3053,6 +3075,10 @@ func TestHandleBroadcastError_ReplacementUnderpriced_BumpsGas(t *testing.T) {
 		Retry:  RetryConfig{MaxAttempts: 5},
 		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
 		Gas:    GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
+		State: TxRetryState{OldTxs: map[string]*types.Transaction{
+			prevTx.Hash().Hex():          prevTx,          // previous broadcast (in mempool)
+			currentSignedTx.Hash().Hex(): currentSignedTx, // current attempt (added by signAndBroadcastTransaction)
+		}},
 	}
 
 	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
@@ -3070,13 +3096,27 @@ func TestHandleBroadcastError_ReplacementUnderpriced_BumpsGas(t *testing.T) {
 }
 
 // TestHandleBroadcastError_ReplacementUnderpriced_HitsGasLimit tests that when a
-// replacement tx is underpriced but gas limits are reached, we stop retrying.
+// replacement tx is underpriced and gas limits are reached, we stop retrying.
 func TestHandleBroadcastError_ReplacementUnderpriced_HitsGasLimit(t *testing.T) {
 	setup := newTestSetup(t)
 
+	// Our previously broadcast tx at nonce 5 (actually in the mempool)
+	prevTx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(1000000000),
+		big.NewInt(10000000000),
+		big.NewInt(1),
+	)
+
+	// The current signed tx (added to OldTxs by signAndBroadcastTransaction)
+	currentSignedTx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),
+		big.NewInt(20000000000),
+		big.NewInt(1),
+	)
+
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
-		big.NewInt(2000000000),  // 2 gwei tip
-		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(2000000000),
+		big.NewInt(20000000000),
 		big.NewInt(1),
 	)
 
@@ -3084,6 +3124,10 @@ func TestHandleBroadcastError_ReplacementUnderpriced_HitsGasLimit(t *testing.T) 
 		Retry:  RetryConfig{MaxAttempts: 5},
 		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
 		Gas:    GasBounds{MaxGasPrice: 22.0, MaxTipCap: 2.5, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
+		State: TxRetryState{OldTxs: map[string]*types.Transaction{
+			prevTx.Hash().Hex():          prevTx,
+			currentSignedTx.Hash().Hex(): currentSignedTx,
+		}},
 	}
 
 	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
@@ -3097,16 +3141,29 @@ func TestHandleBroadcastError_ReplacementUnderpriced_HitsGasLimit(t *testing.T) 
 	assert.Equal(t, uint64(5), execCtx.State.Nonce.Uint64())
 }
 
-// TestHandleBroadcastError_ReplacementUnderpriced_DoesNotOrphanTx tests the specific
-// bug scenario: previously "underpriced" was classified as ErrNonceIsLow, which
-// when no old tx was mined, cleared RetryNonce (= nil) and acquired a new nonce,
-// orphaning the original pending tx. With the fix, underpriced keeps the same nonce.
-func TestHandleBroadcastError_ReplacementUnderpriced_DoesNotOrphanTx(t *testing.T) {
+// TestHandleBroadcastError_ReplacementUnderpriced_DoesNotOrphanOwnTx tests that
+// when we have our own pending tx and get underpriced, we keep the same nonce
+// instead of acquiring a new one which would orphan our pending tx.
+func TestHandleBroadcastError_ReplacementUnderpriced_DoesNotOrphanOwnTx(t *testing.T) {
 	setup := newTestSetup(t)
 
+	// Our previously broadcast tx at nonce 5 (actually in the mempool)
+	prevTx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(1000000000),
+		big.NewInt(10000000000),
+		big.NewInt(1),
+	)
+
+	// Current signed tx (added to OldTxs by signAndBroadcastTransaction)
+	currentSignedTx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),
+		big.NewInt(20000000000),
+		big.NewInt(1),
+	)
+
 	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
-		big.NewInt(2000000000),  // 2 gwei tip
-		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(2000000000),
+		big.NewInt(20000000000),
 		big.NewInt(1),
 	)
 
@@ -3114,16 +3171,129 @@ func TestHandleBroadcastError_ReplacementUnderpriced_DoesNotOrphanTx(t *testing.
 		Retry:  RetryConfig{MaxAttempts: 5},
 		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
 		Gas:    GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
-		State:  TxRetryState{OldTxs: map[string]*types.Transaction{}},
+		State: TxRetryState{OldTxs: map[string]*types.Transaction{
+			prevTx.Hash().Hex():          prevTx,
+			currentSignedTx.Hash().Hex(): currentSignedTx,
+		}},
 	}
 
 	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
 
-	// The original bug: handleNonceIsLowError would set Nonce = nil here,
-	// causing a new nonce to be acquired. The fix ensures Nonce is kept.
+	// When the pending tx is ours (2 txs at nonce 5), keep the same nonce — do not orphan.
 	assert.Equal(t, ActionRetry, result.Action)
 	assert.NotNil(t, execCtx.State.Nonce, "Nonce must NOT be nil — must keep the same nonce")
 	assert.Equal(t, uint64(5), execCtx.State.Nonce.Uint64())
+}
+
+// TestHandleBroadcastError_ReplacementUnderpriced_ForeignTx_AcquiresNewNonce tests
+// that when a replacement tx is rejected as underpriced but the pending tx in the
+// mempool is NOT ours (belongs to another instance), we acquire a fresh nonce.
+//
+// In the real flow, signAndBroadcastTransaction adds the current signed tx to
+// OldTxs before calling handleBroadcastError. So on the FIRST attempt at a nonce,
+// OldTxs contains exactly 1 tx at that nonce — the current rejected attempt.
+// This is how we detect a foreign pending tx: only 1 tx at this nonce in OldTxs.
+//
+// Scenario: two independent WalletManager instances share the same wallet.
+// Instance A broadcasts nonce 5. Instance B also gets nonce 5, broadcasts,
+// and gets "replacement transaction underpriced" because A's tx is already
+// pending. Instance B should NOT try to replace A's tx — it should get a
+// fresh nonce instead.
+func TestHandleBroadcastError_ReplacementUnderpriced_ForeignTx_AcquiresNewNonce(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// The current signed tx — rejected as underpriced.
+	// This is the ONLY tx at nonce 5 in OldTxs (added by signAndBroadcastTransaction).
+	// There is no previous broadcast of ours at this nonce.
+	currentSignedTx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(1),
+	)
+
+	// The unsigned tx passed to handleBroadcastError
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),
+		big.NewInt(20000000000),
+		big.NewInt(1),
+	)
+
+	execCtx := &TxExecutionContext{
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Gas:    GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
+		State: TxRetryState{
+			// Only the current rejected tx at nonce 5 — no previous broadcast of ours.
+			// This means the pending tx in the mempool belongs to another instance.
+			OldTxs: map[string]*types.Transaction{
+				currentSignedTx.Hash().Hex(): currentSignedTx,
+			},
+		},
+	}
+
+	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
+
+	// Should retry, not fail
+	assert.Equal(t, ActionRetry, result.Action, "Should retry")
+	assert.Nil(t, result.Error)
+
+	// Critical: Nonce must be nil so a fresh nonce is acquired on retry.
+	// The pending tx belongs to another instance — we must NOT replace it.
+	assert.Nil(t, execCtx.State.Nonce,
+		"Nonce should be nil to acquire a fresh nonce — the pending tx is not ours")
+}
+
+// TestHandleBroadcastError_ReplacementUnderpriced_OwnTx_BumpsGas tests that when
+// replacement is underpriced AND we have a previous broadcast at this nonce
+// (2+ txs at the same nonce in OldTxs), we keep the same nonce and bump gas.
+func TestHandleBroadcastError_ReplacementUnderpriced_OwnTx_BumpsGas(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// Previous tx at nonce 5 that we successfully broadcast (it's in the mempool)
+	prevTx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(1000000000),  // 1 gwei tip
+		big.NewInt(10000000000), // 10 gwei fee cap
+		big.NewInt(1),
+	)
+
+	// Current signed tx (added to OldTxs by signAndBroadcastTransaction)
+	currentSignedTx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),  // 2 gwei tip
+		big.NewInt(20000000000), // 20 gwei fee cap
+		big.NewInt(1),
+	)
+
+	// The unsigned tx passed to handleBroadcastError
+	tx := newTestDynamicTx(5, testAddr2, oneEth, 21000,
+		big.NewInt(2000000000),
+		big.NewInt(20000000000),
+		big.NewInt(1),
+	)
+
+	execCtx := &TxExecutionContext{
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Gas:    GasBounds{MaxGasPrice: 200.0, MaxTipCap: 100.0, GasPriceBumpFactor: DefaultGasPriceBumpFactor, TipCapBumpFactor: DefaultTipCapBumpFactor},
+		State: TxRetryState{
+			// 2 txs at nonce 5: previous broadcast + current rejected attempt.
+			// This means the pending tx in the mempool is ours.
+			OldTxs: map[string]*types.Transaction{
+				prevTx.Hash().Hex():          prevTx,
+				currentSignedTx.Hash().Hex(): currentSignedTx,
+			},
+		},
+	}
+
+	result := setup.WM.handleBroadcastError(ErrReplacementUnderpriced, tx, execCtx)
+
+	assert.Equal(t, ActionRetry, result.Action, "Should retry after underpriced rejection")
+	assert.Nil(t, result.Error)
+
+	// When the pending tx IS ours, we should keep the same nonce and bump gas
+	assert.NotNil(t, execCtx.State.Nonce, "Nonce should be preserved when replacing our own tx")
+	assert.Equal(t, uint64(5), execCtx.State.Nonce.Uint64())
+	assert.Greater(t, execCtx.State.GasPrice, float64(0), "Gas price should be bumped")
+	assert.Greater(t, execCtx.State.TipCap, float64(0), "Tip cap should be bumped")
 }
 
 // ============================================================
@@ -3693,6 +3863,69 @@ func TestAcquireNonce_GapDetection_ConsecutiveCallsFillGaps(t *testing.T) {
 	nonce3, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(8), nonce3.Uint64(), "Third call should fill gap at nonce 8")
+}
+
+// TestAcquireNonce_GapDetection_ConcurrentCallsNoDuplicates tests that when
+// multiple goroutines call acquireNonce concurrently and all of them would hit
+// the gap detection path, each goroutine gets a UNIQUE nonce. This tests the
+// race condition where two callers both read the same local pending nonce,
+// both find the same gap, and both return the same nonce.
+func TestAcquireNonce_GapDetection_ConcurrentCallsNoDuplicates(t *testing.T) {
+	setup, txStore := newTestSetupWithTxStore(t)
+
+	// Chain state: mined=5, remotePending=5 (no pending on nodes)
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	// Local tracker has advanced to nonce 14 (nonces 5-14 were acquired)
+	setup.WM.nonceTracker.SetPendingNonce(testAddr1, networks.EthereumMainnet.GetChainID(), networks.EthereumMainnet.GetName(), 14)
+
+	// TxStore has tx only for nonce 5. Gaps at 6, 7, 8, 9, 10, 11, 12, 13, 14 (9 gaps).
+	ctx := context.Background()
+	_ = txStore.Save(ctx, &PendingTx{
+		Hash:    common.HexToHash("0xaaa"),
+		Wallet:  testAddr1,
+		ChainID: networks.EthereumMainnet.GetChainID(),
+		Nonce:   5,
+		Status:  PendingTxStatusBroadcasted,
+	})
+
+	numGoroutines := 5
+	results := make(chan uint64, numGoroutines)
+	errs := make(chan error, numGoroutines)
+
+	// Launch concurrent acquireNonce calls — all should hit gap detection
+	var wg sync.WaitGroup
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			nonce, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- nonce.Uint64()
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	// Collect all nonces and check for duplicates
+	seen := make(map[uint64]int)
+	for nonce := range results {
+		seen[nonce]++
+	}
+
+	for nonce, count := range seen {
+		assert.Equal(t, 1, count,
+			"Nonce %d was returned %d times — concurrent gap detection produced duplicates", nonce, count)
+	}
 }
 
 // TestBuildTx_GapDetection_FillsGapBeforeAdvancing tests that BuildTx with

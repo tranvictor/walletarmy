@@ -18,6 +18,13 @@ type Tracker struct {
 
 	// walletLocks provides per-wallet locking
 	walletLocks sync.Map // map[common.Address]*sync.RWMutex
+
+	// claimedGaps tracks gap nonces that have been claimed by AcquireNonce
+	// but not yet confirmed (i.e., not yet in TxStore). This prevents two
+	// sequential callers under the same lock from both claiming the same gap.
+	// Structure: wallet -> (chainID -> set of claimed nonces)
+	// MUST be accessed with wallet lock held.
+	claimedGaps sync.Map // map[common.Address]map[uint64]map[uint64]bool
 }
 
 // NewTracker creates a new nonce tracker
@@ -29,6 +36,23 @@ func NewTracker() *Tracker {
 func (t *Tracker) getWalletLock(wallet common.Address) *sync.RWMutex {
 	lock, _ := t.walletLocks.LoadOrStore(wallet, &sync.RWMutex{})
 	return lock.(*sync.RWMutex)
+}
+
+// getClaimedGaps returns the set of claimed gap nonces for a wallet/chain,
+// creating the inner maps if necessary. MUST be called with wallet lock held.
+func (t *Tracker) getClaimedGaps(wallet common.Address, chainID uint64) map[uint64]bool {
+	raw, _ := t.claimedGaps.LoadOrStore(wallet, make(map[uint64]map[uint64]bool))
+	chainGaps := raw.(map[uint64]map[uint64]bool)
+	if chainGaps[chainID] == nil {
+		chainGaps[chainID] = make(map[uint64]bool)
+	}
+	return chainGaps[chainID]
+}
+
+// claimGap marks a gap nonce as claimed. MUST be called with wallet lock held.
+func (t *Tracker) claimGap(wallet common.Address, chainID uint64, nonce uint64) {
+	gaps := t.getClaimedGaps(wallet, chainID)
+	gaps[nonce] = true
 }
 
 // getOrCreateNonceMap returns the nonce map for a wallet, creating it if necessary.
@@ -108,9 +132,21 @@ type AcquireResult struct {
 	DecisionReason string
 }
 
+// GapFinder is a callback that checks for nonce gaps in a given range [from, to).
+// The claimed set contains gap nonces that were already claimed by previous callers
+// but not yet recorded in the external store — the finder MUST skip these.
+// It returns the gap nonce and true if a gap is found, or 0 and false otherwise.
+// This is called under the wallet's write lock, so implementations should not
+// attempt to acquire the same lock (e.g., by calling GetPendingNonce or AcquireNonce).
+type GapFinder func(wallet common.Address, chainID uint64, from, to uint64, claimed map[uint64]bool) (gapNonce uint64, found bool)
+
 // AcquireNonce atomically determines and reserves the next nonce for a transaction.
 // It takes the remote state (mined and pending nonces from the network) and combines
 // with local tracking to determine the next nonce.
+//
+// If gapFinder is non-nil and local pending > remote pending, the gap finder is
+// called under the wallet lock to check for nonce gaps before advancing. This
+// ensures that two concurrent callers cannot both claim the same gap nonce.
 //
 // Parameters:
 //   - wallet: the wallet address
@@ -118,6 +154,7 @@ type AcquireResult struct {
 //   - networkName: the network name (for logging)
 //   - minedNonce: the mined nonce from the network
 //   - remotePendingNonce: the pending nonce from the network
+//   - gapFinder: optional callback to detect nonce gaps (may be nil)
 //
 // Returns the acquired nonce and decision reason
 func (t *Tracker) AcquireNonce(
@@ -126,10 +163,47 @@ func (t *Tracker) AcquireNonce(
 	networkName string,
 	minedNonce uint64,
 	remotePendingNonce uint64,
+	gapFinder GapFinder,
 ) (*AcquireResult, error) {
 	lock := t.getWalletLock(wallet)
 	lock.Lock()
 	defer lock.Unlock()
+
+	// Check for nonce gaps under the lock before the normal nonce logic.
+	// This prevents two concurrent callers from both finding and returning
+	// the same gap nonce.
+	if gapFinder != nil {
+		localPendingNonceBig := t.GetPendingNonceUnlocked(wallet, chainID)
+		if localPendingNonceBig != nil {
+			localNonce := localPendingNonceBig.Uint64()
+			if localNonce > remotePendingNonce {
+				claimed := t.getClaimedGaps(wallet, chainID)
+				// Clean up claimed entries below remotePendingNonce (already confirmed)
+				for n := range claimed {
+					if n < remotePendingNonce {
+						delete(claimed, n)
+					}
+				}
+
+				gapNonce, found := gapFinder(wallet, chainID, remotePendingNonce, localNonce, claimed)
+				if found {
+					t.claimGap(wallet, chainID, gapNonce)
+					logger.WithFields(logger.Fields{
+						"wallet":         wallet.Hex(),
+						"network":        networkName,
+						"chain_id":       chainID,
+						"gap_nonce":      gapNonce,
+						"remote_pending": remotePendingNonce,
+						"local_pending":  localNonce,
+					}).Debug("acquireNonce: filling nonce gap")
+					return &AcquireResult{
+						Nonce:          gapNonce,
+						DecisionReason: "gap fill",
+					}, nil
+				}
+			}
+		}
+	}
 
 	localPendingNonceBig := t.GetPendingNonceUnlocked(wallet, chainID)
 

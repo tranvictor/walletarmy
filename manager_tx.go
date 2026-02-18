@@ -1053,8 +1053,52 @@ func (wm *WalletManager) handleBroadcastError(broadcastErr BroadcastError, tx *t
 // handleReplacementUnderpricedError handles the case where a replacement transaction
 // was rejected because its gas price wasn't high enough to replace the pending tx.
 // Unlike "nonce too low" (where the nonce is already mined), here the original tx is
-// still pending in the mempool. We keep the same nonce and bump gas further.
+// still pending in the mempool.
+//
+// Two cases:
+//  1. The pending tx at this nonce is OURS (found in OldTxs) — keep the same nonce
+//     and bump gas to replace our own slow tx.
+//  2. The pending tx is NOT ours (e.g., another WalletManager instance using the same
+//     wallet) — acquire a fresh nonce instead of engaging in a gas price bidding war
+//     with the other instance.
 func (wm *WalletManager) handleReplacementUnderpricedError(tx *types.Transaction, execCtx *TxExecutionContext) *TxExecutionResult {
+	// Determine whether the pending tx in the mempool at this nonce is ours.
+	//
+	// signAndBroadcastTransaction always adds the signed tx to OldTxs before
+	// calling handleBroadcastError, even when broadcast fails. So OldTxs will
+	// always contain at least ONE tx at this nonce — the one we just tried.
+	//
+	// If there are 2+ txs at this nonce, at least one is from a PREVIOUS
+	// iteration (a successfully broadcast tx that is now pending in the
+	// mempool). In that case, we should bump gas to replace our own tx.
+	//
+	// If there is exactly 1 tx at this nonce, it's the one that was just
+	// rejected — the pending tx in the mempool belongs to another instance
+	// (or external process). We should acquire a fresh nonce instead.
+	txsAtNonce := 0
+	for _, oldTx := range execCtx.State.OldTxs {
+		if oldTx.Nonce() == tx.Nonce() {
+			txsAtNonce++
+		}
+	}
+	ownTxPending := txsAtNonce > 1
+
+	if !ownTxPending {
+		// The pending tx belongs to another instance/process. Do not try to
+		// replace it — acquire a fresh nonce on the next attempt instead.
+		logger.WithFields(logger.Fields{
+			"tx_hash":   tx.Hash().Hex(),
+			"nonce":     tx.Nonce(),
+			"gas_price": tx.GasPrice().String(),
+			"tip_cap":   tx.GasTipCap().String(),
+		}).Info("Replacement underpriced for foreign pending tx, acquiring new nonce")
+
+		execCtx.State.Nonce = nil
+		return &TxExecutionResult{
+			Action: ActionRetry,
+		}
+	}
+
 	logger.WithFields(logger.Fields{
 		"tx_hash":   tx.Hash().Hex(),
 		"nonce":     tx.Nonce(),

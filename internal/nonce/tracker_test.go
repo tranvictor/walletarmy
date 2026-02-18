@@ -65,7 +65,7 @@ func TestTracker_AcquireNonce_FirstTransaction(t *testing.T) {
 	networkName := "ethereum"
 
 	t.Run("uses mined nonce when higher", func(t *testing.T) {
-		result, err := tracker.AcquireNonce(wallet, chainID, networkName, 10, 5)
+		result, err := tracker.AcquireNonce(wallet, chainID, networkName, 10, 5, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -81,7 +81,7 @@ func TestTracker_AcquireNonce_UsesRemotePending(t *testing.T) {
 	chainID := uint64(1)
 	networkName := "ethereum"
 
-	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 5, 10)
+	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 5, 10, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestTracker_AcquireNonce_AbnormalState(t *testing.T) {
 	tracker.SetPendingNonce(wallet, chainID, networkName, 5)
 
 	// Now try to acquire with mined > remote pending (abnormal)
-	_, err := tracker.AcquireNonce(wallet, chainID, networkName, 10, 5)
+	_, err := tracker.AcquireNonce(wallet, chainID, networkName, 10, 5, nil)
 	if err != ErrAbnormalNonceState {
 		t.Errorf("expected ErrAbnormalNonceState, got %v", err)
 	}
@@ -228,7 +228,7 @@ func TestTracker_Concurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < numOperations; j++ {
-				_, _ = tracker.AcquireNonce(wallet, chainID, networkName, 100, 100)
+				_, _ = tracker.AcquireNonce(wallet, chainID, networkName, 100, 100, nil)
 			}
 		}()
 	}
@@ -247,7 +247,7 @@ func TestTracker_AcquireNonce_FirstTx_RemotePendingHigherThanMined(t *testing.T)
 	networkName := "ethereum"
 
 	// First transaction: remotePending > mined
-	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 5, 10)
+	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 5, 10, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestTracker_AcquireNonce_FirstTx_MinedHigherOrEqual(t *testing.T) {
 	networkName := "ethereum"
 
 	// First transaction: mined >= remotePending
-	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 10, 10)
+	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 10, 10, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestTracker_AcquireNonce_NoPendingOnNodes_LocalHigherThanMined(t *testing.T
 
 	// Acquire with mined == remotePending (no pending txs on nodes)
 	// Local is 16 (15+1), which is > mined (10)
-	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 10, 10)
+	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 10, 10, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestTracker_AcquireNonce_NoPendingOnNodes_MinedHigherOrEqualToLocal(t *test
 
 	// Acquire with mined == remotePending (no pending txs on nodes)
 	// Local is 6 (5+1), which is < mined (10)
-	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 10, 10)
+	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 10, 10, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -335,7 +335,7 @@ func TestTracker_AcquireNonce_PendingOnNodes_LocalHigherThanRemote(t *testing.T)
 
 	// Acquire with remotePending > mined (pending txs on nodes)
 	// Local is 21 (20+1), which is > remotePending (15)
-	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 5, 15)
+	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 5, 15, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -358,7 +358,7 @@ func TestTracker_AcquireNonce_PendingOnNodes_RemoteHigherOrEqualToLocal(t *testi
 
 	// Acquire with remotePending > mined (pending txs on nodes)
 	// Local is 11 (10+1), which is < remotePending (20)
-	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 5, 20)
+	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 5, 20, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestTracker_AcquireNonce_SequentialAcquisitions(t *testing.T) {
 	// Simulate sequential transaction submissions
 	// Each acquire should increment the nonce
 	for i := 0; i < 5; i++ {
-		result, err := tracker.AcquireNonce(wallet, chainID, networkName, 0, 0)
+		result, err := tracker.AcquireNonce(wallet, chainID, networkName, 0, 0, nil)
 		if err != nil {
 			t.Fatalf("unexpected error on acquire %d: %v", i, err)
 		}
@@ -478,7 +478,7 @@ func TestTracker_ConcurrentAcquireRelease(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 50; j++ {
-				result, _ := tracker.AcquireNonce(wallet, chainID, networkName, 0, 0)
+				result, _ := tracker.AcquireNonce(wallet, chainID, networkName, 0, 0, nil)
 				if result != nil && j%2 == 0 {
 					tracker.ReleaseNonce(wallet, chainID, networkName, result.Nonce)
 				}
@@ -500,7 +500,7 @@ func TestTracker_AcquireNonce_EqualNonces(t *testing.T) {
 	tracker.SetPendingNonce(wallet, chainID, networkName, 10)
 
 	// Local is 11, mined is 11, remotePending is 11
-	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 11, 11)
+	result, err := tracker.AcquireNonce(wallet, chainID, networkName, 11, 11, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
