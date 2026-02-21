@@ -664,6 +664,9 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 
 	if errDecoder != nil {
 		abiError, revertParams, _ = errDecoder.Decode(err)
+	}
+
+	if abiError != nil {
 		err = errors.Join(ErrSimulatedTxReverted, fmt.Errorf("revert error: %s. revert params: %+v. Detail: %w", abiError.Name, revertParams, err))
 	} else {
 		err = errors.Join(ErrSimulatedTxReverted, fmt.Errorf("revert data: %s. Detail: %w", common.Bytes2Hex(revertData), err))
