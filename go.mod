@@ -8,7 +8,7 @@ require (
 	github.com/KyberNetwork/logger v0.2.1
 	github.com/ethereum/go-ethereum v1.16.8
 	github.com/stretchr/testify v1.10.0
-	github.com/tranvictor/jarvis v0.0.37-0.20251101033912-bd3c6e73687a
+	github.com/tranvictor/jarvis v0.0.37-0.20260226112729-7971a281e1d9
 )
 
 require (

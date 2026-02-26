@@ -490,6 +490,181 @@ func TestTracker_ConcurrentAcquireRelease(t *testing.T) {
 	// Test passes if no race condition occurs
 }
 
+// TestTracker_AcquireNonce_NormalPathPreventsGapFinderReissue reproduces the nonce
+// collision bug where two concurrent callers could acquire the same nonce:
+//
+//  1. Swap acquires nonce 9859 via normal path (mined=remotePending=9859)
+//  2. Sweep enters AcquireNonce with the same remote nonces (fetched before swap broadcast)
+//  3. Gap finder scans [9859, 9860) — should NOT re-issue 9859
+//
+// Before the fix, the gap finder would see 9859 as a "gap" because:
+//   - It wasn't in claimedGaps (only gap-filled nonces were tracked)
+//   - It wasn't in TxStore yet (swap hadn't broadcast)
+//
+// After the fix, the normal path also calls claimGap, so the gap finder skips 9859.
+func TestTracker_AcquireNonce_NormalPathPreventsGapFinderReissue(t *testing.T) {
+	tracker := NewTracker()
+	wallet := common.HexToAddress("0x108683b62B1C5fFE60D4d0CC9c249FD92e30a403")
+	chainID := uint64(8453)
+	networkName := "base"
+
+	// Initial state: local pending nonce = 9858 (as in the production logs)
+	tracker.SetPendingNonce(wallet, chainID, networkName, 9858)
+
+	// Gap finder that simulates an empty TxStore — reports every unclaimed nonce as a gap.
+	// This is what happens when the first tx hasn't been broadcast/persisted yet.
+	emptyTxStore := func(_ common.Address, _ uint64, from, to uint64, claimed map[uint64]bool) (uint64, bool) {
+		for n := from; n < to; n++ {
+			if !claimed[n] {
+				return n, true
+			}
+		}
+		return 0, false
+	}
+
+	// Both goroutines fetch the same stale remote nonces before entering the lock
+	minedNonce := uint64(9859)
+	remotePending := uint64(9859)
+
+	var wg sync.WaitGroup
+	results := make(chan uint64, 2)
+	start := make(chan struct{}) // ensures both goroutines start simultaneously
+
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // wait for the signal
+			result, err := tracker.AcquireNonce(wallet, chainID, networkName, minedNonce, remotePending, emptyTxStore)
+			if err != nil {
+				t.Errorf("acquire failed: %v", err)
+				return
+			}
+			results <- result.Nonce
+		}()
+	}
+
+	close(start) // release both goroutines at the same time
+	wg.Wait()
+	close(results)
+
+	nonces := make([]uint64, 0, 2)
+	for n := range results {
+		nonces = append(nonces, n)
+	}
+
+	if len(nonces) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(nonces))
+	}
+	if nonces[0] == nonces[1] {
+		t.Fatalf("NONCE COLLISION: both goroutines acquired nonce %d", nonces[0])
+	}
+}
+
+// TestTracker_AcquireNonce_ReleasedNonceCanBeReclaimed verifies that when a nonce
+// is acquired via the normal path but then released (tx failed before broadcast),
+// the gap finder can reclaim it.
+func TestTracker_AcquireNonce_ReleasedNonceCanBeReclaimed(t *testing.T) {
+	tracker := NewTracker()
+	wallet := common.HexToAddress("0x108683b62B1C5fFE60D4d0CC9c249FD92e30a403")
+	chainID := uint64(8453)
+	networkName := "base"
+
+	emptyTxStore := func(_ common.Address, _ uint64, from, to uint64, claimed map[uint64]bool) (uint64, bool) {
+		for n := from; n < to; n++ {
+			if !claimed[n] {
+				return n, true
+			}
+		}
+		return 0, false
+	}
+
+	// Acquire two nonces: 100 and 101
+	r1, _ := tracker.AcquireNonce(wallet, chainID, networkName, 100, 100, emptyTxStore)
+	r2, _ := tracker.AcquireNonce(wallet, chainID, networkName, 100, 100, emptyTxStore)
+	if r1.Nonce != 100 || r2.Nonce != 101 {
+		t.Fatalf("expected nonces 100 and 101, got %d and %d", r1.Nonce, r2.Nonce)
+	}
+
+	// Nonce 100's tx fails before broadcast → release it.
+	// ReleaseNonce can't roll back pendingNonces (100 is not the tip, 101 is),
+	// but it MUST unclaim it from claimedGaps so the gap finder can reclaim it.
+	tracker.ReleaseNonce(wallet, chainID, networkName, 100)
+
+	// Next acquire: gap finder should reclaim nonce 100
+	// localPending=102, remotePending=100, gap finder scans [100, 102)
+	// Nonce 100: not in claimedGaps (released) → gap found
+	// Nonce 101: in claimedGaps (not released) → skipped
+	r3, err := tracker.AcquireNonce(wallet, chainID, networkName, 100, 100, emptyTxStore)
+	if err != nil {
+		t.Fatalf("reclaim acquire failed: %v", err)
+	}
+	if r3.Nonce != 100 {
+		t.Errorf("expected reclaimed nonce 100, got %d", r3.Nonce)
+	}
+	if r3.DecisionReason != "gap fill" {
+		t.Errorf("expected 'gap fill' decision, got %q", r3.DecisionReason)
+	}
+}
+
+// TestTracker_AcquireNonce_ConcurrentNoDuplicateNonces verifies that many concurrent
+// callers for the same wallet never receive the same nonce, even when all see
+// stale remote state (the production race condition with 20 goroutines).
+func TestTracker_AcquireNonce_ConcurrentNoDuplicateNonces(t *testing.T) {
+	tracker := NewTracker()
+	wallet := common.HexToAddress("0x108683b62B1C5fFE60D4d0CC9c249FD92e30a403")
+	chainID := uint64(8453)
+	networkName := "base"
+
+	tracker.SetPendingNonce(wallet, chainID, networkName, 9858)
+
+	emptyTxStore := func(_ common.Address, _ uint64, from, to uint64, claimed map[uint64]bool) (uint64, bool) {
+		for n := from; n < to; n++ {
+			if !claimed[n] {
+				return n, true
+			}
+		}
+		return 0, false
+	}
+
+	numGoroutines := 20
+	results := make(chan uint64, numGoroutines)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// All goroutines use the same stale remote nonces (mined=9859, remotePending=9859),
+	// simulating the case where all fetched remote state before any tx was broadcast.
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			result, err := tracker.AcquireNonce(wallet, chainID, networkName, 9859, 9859, emptyTxStore)
+			if err != nil {
+				t.Errorf("acquire failed: %v", err)
+				return
+			}
+			results <- result.Nonce
+		}()
+	}
+
+	close(start) // release all goroutines at the same time
+	wg.Wait()
+	close(results)
+
+	seen := make(map[uint64]bool)
+	for nonce := range results {
+		if seen[nonce] {
+			t.Fatalf("NONCE COLLISION: nonce %d was acquired by multiple goroutines", nonce)
+		}
+		seen[nonce] = true
+	}
+
+	if len(seen) != numGoroutines {
+		t.Fatalf("expected %d unique nonces, got %d", numGoroutines, len(seen))
+	}
+}
+
 func TestTracker_AcquireNonce_EqualNonces(t *testing.T) {
 	tracker := NewTracker()
 	wallet := common.HexToAddress("0x0234567890123456789012345678901234567890")

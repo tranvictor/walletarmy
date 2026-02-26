@@ -338,8 +338,8 @@ github.com/tklauser/go-sysconf v0.3.12 h1:0QaGUFOdQaIVdPgfITYzaTegZvdCjmYO52cSFA
 github.com/tklauser/go-sysconf v0.3.12/go.mod h1:Ho14jnntGE1fpdOqQEEaiKRpvIavV0hSfmBq8nJbHYI=
 github.com/tklauser/numcpus v0.6.1 h1:ng9scYS7az0Bk4OZLvrNXNSAO2Pxr1XXRAPyjhIx+Fk=
 github.com/tklauser/numcpus v0.6.1/go.mod h1:1XfjsgE2zo8GVw7POkMbHENHzVg3GzmoZ9fESEdAacY=
-github.com/tranvictor/jarvis v0.0.37-0.20251101033912-bd3c6e73687a h1:xd3FBWwkIOKsrSG3PJzmtEy3o/VkDokfD56NMk6vDXI=
-github.com/tranvictor/jarvis v0.0.37-0.20251101033912-bd3c6e73687a/go.mod h1:WqkYMHG59ENXa6RciEHFzAmCOfjl6XBln0thA6Xm/kg=
+github.com/tranvictor/jarvis v0.0.37-0.20260226112729-7971a281e1d9 h1:caMMIF82JPgKTcpdkYM+LOT/yHpDTHNk76Ly4zcEkug=
+github.com/tranvictor/jarvis v0.0.37-0.20260226112729-7971a281e1d9/go.mod h1:WqkYMHG59ENXa6RciEHFzAmCOfjl6XBln0thA6Xm/kg=
 github.com/ugorji/go/codec v0.0.0-20181204163529-d75b2dcb6bc8/go.mod h1:VFNgLljTbGfSG7qAOspJ7OScBnGdDN/yBr0sguwnwf0=
 github.com/urfave/cli/v2 v2.27.5 h1:WoHEJLdsXr6dDWoJgMq/CboDmyY/8HMMH1fTECbih+w=
 github.com/urfave/cli/v2 v2.27.5/go.mod h1:3Sevf16NykTbInEnD0yKkjDAeZDS0A6bzhBH5hrMvTQ=

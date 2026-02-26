@@ -19,9 +19,10 @@ type Tracker struct {
 	// walletLocks provides per-wallet locking
 	walletLocks sync.Map // map[common.Address]*sync.RWMutex
 
-	// claimedGaps tracks gap nonces that have been claimed by AcquireNonce
-	// but not yet confirmed (i.e., not yet in TxStore). This prevents two
-	// sequential callers under the same lock from both claiming the same gap.
+	// claimedGaps tracks nonces that have been acquired by AcquireNonce but
+	// not yet broadcast (i.e., not yet in TxStore). This prevents the gap
+	// finder from re-issuing a nonce that is currently being processed.
+	// Entries are added in AcquireNonce and removed in ReleaseNonce.
 	// Structure: wallet -> (chainID -> set of claimed nonces)
 	// MUST be accessed with wallet lock held.
 	claimedGaps sync.Map // map[common.Address]map[uint64]map[uint64]bool
@@ -49,10 +50,17 @@ func (t *Tracker) getClaimedGaps(wallet common.Address, chainID uint64) map[uint
 	return chainGaps[chainID]
 }
 
-// claimGap marks a gap nonce as claimed. MUST be called with wallet lock held.
+// claimGap marks a nonce as claimed. MUST be called with wallet lock held.
 func (t *Tracker) claimGap(wallet common.Address, chainID uint64, nonce uint64) {
 	gaps := t.getClaimedGaps(wallet, chainID)
 	gaps[nonce] = true
+}
+
+// unclaimGap removes a nonce from the claimed set, allowing the gap finder to
+// reclaim it. MUST be called with wallet lock held.
+func (t *Tracker) unclaimGap(wallet common.Address, chainID uint64, nonce uint64) {
+	gaps := t.getClaimedGaps(wallet, chainID)
+	delete(gaps, nonce)
 }
 
 // getOrCreateNonceMap returns the nonce map for a wallet, creating it if necessary.
@@ -262,6 +270,10 @@ func (t *Tracker) AcquireNonce(
 	// This ensures the next call to AcquireNonce will get nextNonce+1
 	t.SetPendingNonceUnlocked(wallet, chainID, networkName, nextNonce)
 
+	// Also mark this nonce as claimed so the gap finder won't re-issue it
+	// before the transaction is broadcast and recorded in TxStore.
+	t.claimGap(wallet, chainID, nextNonce)
+
 	var localNonceStr string
 	if localPendingNonceBig != nil {
 		localNonceStr = localPendingNonceBig.String()
@@ -294,6 +306,10 @@ func (t *Tracker) ReleaseNonce(wallet common.Address, chainID uint64, networkNam
 	lock := t.getWalletLock(wallet)
 	lock.Lock()
 	defer lock.Unlock()
+
+	// Always unclaim the nonce so the gap finder can reclaim it.
+	// This is safe even if the nonce was never in claimedGaps.
+	t.unclaimGap(wallet, chainID, nonce)
 
 	noncesRaw, ok := t.pendingNonces.Load(wallet)
 	if !ok {
