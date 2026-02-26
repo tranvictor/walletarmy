@@ -1209,6 +1209,21 @@ func (wm *WalletManager) handleTransactionStatus(status TxInfo, signedTx *types.
 		return wm.handleMinedTx(signedTx, status, execCtx)
 
 	case TxStatusLost:
+		// If the nonce is already consumed, no point retrying — another tx with
+		// this nonce has been mined.
+		if wm.getNonceStatus(signedTx.Nonce(), execCtx.Params.From, execCtx.Params.Network) == nonceStatusConsumed {
+			logger.WithFields(logger.Fields{
+				"tx_hash": signedTx.Hash().Hex(),
+				"nonce":   signedTx.Nonce(),
+			}).Warn("Transaction lost and nonce already consumed by another transaction, giving up")
+
+			return &TxExecutionResult{
+				Transaction: signedTx,
+				Action:      ActionReturn,
+				Error:       fmt.Errorf("nonce %d already consumed by another transaction", signedTx.Nonce()),
+			}
+		}
+
 		// Transaction was dropped from the mempool. Re-broadcast with the same nonce
 		// and higher gas, similar to the "slow" handler. Acquiring a new nonce would
 		// create a gap that can never be filled.
@@ -1238,10 +1253,28 @@ func (wm *WalletManager) handleTransactionStatus(status TxInfo, signedTx *types.
 		}
 
 	case TxStatusSlow:
+		// Check the nonce state to decide how to handle the slow tx.
+		nStatus := wm.getNonceStatus(signedTx.Nonce(), execCtx.Params.From, execCtx.Params.Network)
+
+		if nStatus == nonceStatusConsumed {
+			// Another transaction with this nonce has already been mined.
+			// This tx can never be included — stop waiting immediately.
+			logger.WithFields(logger.Fields{
+				"tx_hash": signedTx.Hash().Hex(),
+				"nonce":   signedTx.Nonce(),
+			}).Warn("Transaction's nonce has been consumed by another transaction, giving up")
+
+			return &TxExecutionResult{
+				Transaction: signedTx,
+				Action:      ActionReturn,
+				Error:       fmt.Errorf("nonce %d already consumed by another transaction", signedTx.Nonce()),
+			}
+		}
+
 		// Only bump gas if this nonce is blocking higher-nonce transactions.
 		// Non-blocking slow txs just keep waiting — they'll get mined once
 		// the blocking nonce ahead of them is resolved.
-		if !wm.isBlockingNonce(signedTx.Nonce(), execCtx.Params.From, execCtx.Params.Network) {
+		if nStatus != nonceStatusBlocking {
 			logger.WithFields(logger.Fields{
 				"tx_hash": signedTx.Hash().Hex(),
 				"nonce":   signedTx.Nonce(),

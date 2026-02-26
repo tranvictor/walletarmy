@@ -128,28 +128,48 @@ func (wm *WalletManager) persistNonceAcquisition(wallet common.Address, chainID 
 	_ = wm.nonceStore.SavePendingNonce(ctx, wallet, chainID, nonce)
 }
 
-// isBlockingNonce checks whether the given nonce is the next nonce the chain
-// expects to process. A blocking nonce is one that equals the current mined nonce —
-// it must be confirmed before any higher-nonce transactions can proceed.
-//
-// Since gas bumping is only applied to this single transaction (not all queued txs),
-// users should set gas protection limits aggressively enough for the blocking nonce.
-//
-// If we can't determine the chain state (reader error), we assume it's not blocking
-// to avoid being overly aggressive with gas.
-func (wm *WalletManager) isBlockingNonce(nonce uint64, wallet common.Address, network networks.Network) bool {
+// nonceStatus describes the state of a nonce relative to the chain's mined nonce.
+type nonceStatus int
+
+const (
+	// nonceStatusUnknown means we couldn't determine the chain state (RPC error).
+	nonceStatusUnknown nonceStatus = iota
+	// nonceStatusBlocking means the nonce equals the mined nonce — it must be confirmed
+	// before any higher-nonce transactions can proceed.
+	nonceStatusBlocking
+	// nonceStatusPending means the nonce is higher than the mined nonce — there are
+	// earlier nonces that must be confirmed first.
+	nonceStatusPending
+	// nonceStatusConsumed means the nonce is lower than the mined nonce — another
+	// transaction with this nonce has already been mined. This transaction can never
+	// be included.
+	nonceStatusConsumed
+)
+
+// getNonceStatus determines the state of a nonce relative to the chain.
+func (wm *WalletManager) getNonceStatus(nonce uint64, wallet common.Address, network networks.Network) nonceStatus {
+	if network == nil {
+		return nonceStatusUnknown
+	}
 	r, err := wm.Reader(network)
 	if err != nil {
-		return false
+		return nonceStatusUnknown
 	}
 
 	minedNonce, err := r.GetMinedNonce(wallet.Hex())
 	if err != nil {
-		return false
+		return nonceStatusUnknown
 	}
 
-	return nonce == minedNonce
+	if nonce < minedNonce {
+		return nonceStatusConsumed
+	}
+	if nonce == minedNonce {
+		return nonceStatusBlocking
+	}
+	return nonceStatusPending
 }
+
 
 // persistNonceRelease persists a nonce release to the nonce store
 func (wm *WalletManager) persistNonceRelease(wallet common.Address, chainID uint64, nonce uint64) {
