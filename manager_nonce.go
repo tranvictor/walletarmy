@@ -50,6 +50,30 @@ func (wm *WalletManager) acquireNonce(wallet common.Address, network networks.Ne
 		return nil, fmt.Errorf("couldn't get remote pending nonce in context manager: %s", err)
 	}
 
+	// If a NonceStore is configured (shared across pods via Redis), atomically
+	// acquire the next nonce from the shared store. This guarantees no two pods
+	// can get the same nonce, even if they read the same remote state.
+	//
+	// The floor is max(minedNonce, remotePendingNonce) — the nonce must be at
+	// least this high. AcquirePendingNonce atomically computes max(stored, floor),
+	// persists it, and adds it to the reserved set.
+	if wm.nonceStore != nil {
+		floor := remotePendingNonce
+		if minedNonce > floor {
+			floor = minedNonce
+		}
+
+		ctx := context.Background()
+		acquiredNonce, storeErr := wm.nonceStore.AcquirePendingNonce(ctx, wallet, network.GetChainID(), floor)
+		if storeErr == nil {
+			// Use the atomically acquired nonce as the remote pending nonce floor.
+			// This ensures the in-process tracker picks at least this value.
+			remotePendingNonce = acquiredNonce
+		}
+		// On error, fall through to the in-process tracker with the original
+		// remote nonces — same behavior as without persistence.
+	}
+
 	// Build a gap finder callback if we have a TxStore.
 	// This will be called under the tracker's wallet lock to prevent two
 	// concurrent callers from both claiming the same gap nonce.
@@ -71,7 +95,8 @@ func (wm *WalletManager) acquireNonce(wallet common.Address, network networks.Ne
 		return nil, err
 	}
 
-	// Persist nonce acquisition for crash recovery
+	// Persist nonce acquisition for crash recovery (also covers the case
+	// where the tracker picked a different nonce than the store, e.g. gap fill)
 	wm.persistNonceAcquisition(wallet, network.GetChainID(), result.Nonce)
 
 	return big.NewInt(int64(result.Nonce)), nil
@@ -83,10 +108,31 @@ func (wm *WalletManager) acquireNonce(wallet common.Address, network networks.Ne
 //
 // The claimed set contains gap nonces already reserved by concurrent callers
 // within the same lock scope — these must be skipped.
+//
+// If a NonceStore is configured, reserved nonces (persisted by other pods/processes)
+// are also skipped to prevent cross-pod nonce collisions.
 func (wm *WalletManager) findNonceGap(wallet common.Address, chainID uint64, from, to uint64, claimed map[uint64]bool) (uint64, bool) {
 	ctx := context.Background()
+
+	// Load reserved nonces from NonceStore (shared across pods via Redis).
+	// This prevents re-issuing a nonce that another pod has acquired but
+	// not yet broadcast to TxStore.
+	var reserved map[uint64]bool
+	if wm.nonceStore != nil {
+		state, err := wm.nonceStore.Get(ctx, wallet, chainID)
+		if err == nil && state != nil && len(state.ReservedNonces) > 0 {
+			reserved = make(map[uint64]bool, len(state.ReservedNonces))
+			for _, n := range state.ReservedNonces {
+				reserved[n] = true
+			}
+		}
+	}
+
 	for n := from; n < to; n++ {
 		if claimed[n] {
+			continue
+		}
+		if reserved[n] {
 			continue
 		}
 		txs, err := wm.txStore.GetByNonce(ctx, wallet, chainID, n)

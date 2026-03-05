@@ -183,6 +183,28 @@ func (m *mockNonceStore) RemoveReservedNonce(ctx context.Context, wallet common.
 	return nil
 }
 
+func (m *mockNonceStore) AcquirePendingNonce(ctx context.Context, wallet common.Address, chainID uint64, floor uint64) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := m.makeKey(wallet, chainID)
+	state := m.states[key]
+	if state == nil {
+		state = &NonceState{Wallet: wallet, ChainID: chainID}
+		m.states[key] = state
+	}
+
+	// Atomic: max(current, floor), then store
+	current := floor
+	if state.LocalPendingNonce != nil && *state.LocalPendingNonce >= floor {
+		current = *state.LocalPendingNonce + 1
+	}
+	state.LocalPendingNonce = &current
+	state.ReservedNonces = append(state.ReservedNonces, current)
+	state.UpdatedAt = time.Now()
+	return current, nil
+}
+
 func (m *mockNonceStore) ListAll(ctx context.Context) ([]*NonceState, error) {
 	m.mu.Lock()
 	m.ListAllCalls++

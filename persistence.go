@@ -93,6 +93,19 @@ type NonceStore interface {
 	// This should be called when a transaction is confirmed or abandoned.
 	RemoveReservedNonce(ctx context.Context, wallet common.Address, chainID uint64, nonce uint64) error
 
+	// AcquirePendingNonce atomically reserves the next pending nonce for a wallet.
+	// It ensures the returned nonce is at least `floor` and is unique across all
+	// callers (including other processes/pods sharing the same store).
+	//
+	// The operation MUST be atomic: read the current value, compute max(current, floor),
+	// store the result, and return it — all in a single atomic step.
+	//
+	// In Redis, this can be implemented with a Lua script or WATCH/MULTI/EXEC.
+	//
+	// The nonce is also added to the reserved set so that gap finders on other
+	// pods can see it.
+	AcquirePendingNonce(ctx context.Context, wallet common.Address, chainID uint64, floor uint64) (uint64, error)
+
 	// ListAll returns all stored nonce states.
 	// Used during recovery to reconcile state.
 	ListAll(ctx context.Context) ([]*NonceState, error)
