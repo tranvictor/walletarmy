@@ -43,20 +43,20 @@ walletarmy/                  # Root package — all public API lives here
 
 ## Where New Code Goes
 
-| What you're adding | Where it goes |
-|---|---|
-| New builder method on `TxRequest` | `request.go` |
-| New `WithXxx` option | `options.go` |
-| New hook type | `hook.go` |
-| New sentinel error | `errors.go` (execution) or `broadcast_error.go` (broadcast) |
-| New persistence interface | `persistence.go` |
-| New dependency interface | `deps.go` |
-| New field on `ManagerDefaults` | `types.go` |
+| What you're adding                | Where it goes                                               |
+| --------------------------------- | ----------------------------------------------------------- |
+| New builder method on `TxRequest` | `request.go`                                                |
+| New `WithXxx` option              | `options.go`                                                |
+| New hook type                     | `hook.go`                                                   |
+| New sentinel error                | `errors.go` (execution) or `broadcast_error.go` (broadcast) |
+| New persistence interface         | `persistence.go`                                            |
+| New dependency interface          | `deps.go`                                                   |
+| New field on `ManagerDefaults`    | `types.go`                                                  |
 | New method on `Manager` interface | `interface.go` (interface) + `manager*.go` (implementation) |
-| New internal implementation | `internal/<package>/` |
-| New public subpackage | Top-level directory (e.g., `idempotency/`) |
-| New test utilities | `testutil/` |
-| New mock for tests | `testing_mocks_test.go` (to avoid import cycles) |
+| New internal implementation       | `internal/<package>/`                                       |
+| New public subpackage             | Top-level directory (e.g., `idempotency/`)                  |
+| New test utilities                | `testutil/`                                                 |
+| New mock for tests                | `testing_mocks_test.go` (to avoid import cycles)            |
 
 ## Coding Conventions
 
@@ -75,7 +75,7 @@ walletarmy/                  # Root package — all public API lives here
 - **Sentinel errors** in `errors.go` — use `fmt.Errorf("descriptive message")`
 - **Wrap errors** with `fmt.Errorf("context: %w", err)` to preserve the chain
 - **Broadcast errors** are a separate type (`BroadcastError`) with classifier functions (`IsNonceIsLow`, `IsInsufficientFund`, etc.)
-- **Decoded errors** — when ABIs are available, revert reasons are wrapped as `*DecodedError` in the error chain (extractable via `errors.As`). This applies to simulation reverts and gas estimation failures. Hooks receive the same decoded info for control flow decisions, but callers should NOT need closures to capture error details.
+- **Structured errors** — when ABIs are available, revert reasons are returned as typed errors: `*SimulationRevertError` (for `eth_call` reverts, carries the built tx and raw revert data) and `*GasEstimationError` (for gas estimation failures). Both are extractable via `errors.As`. Hooks receive the same decoded info for control flow decisions, but callers should NOT need closures to capture error details.
 - **Mined reverts** — `handleMinedTx` returns `ErrTxReverted` when the receipt shows a revert. The tx and receipt are still returned alongside the error.
 - Never return bare `nil` error from a function that clearly failed — always wrap
 

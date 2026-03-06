@@ -1018,11 +1018,11 @@ if err != nil {
 }
 ```
 
-### Decoded Contract Errors
+### Structured Error Types
 
 When you provide ABIs via `SetAbis()`, WalletArmy automatically decodes Solidity revert
-reasons and wraps them in the returned `err`. You can extract the decoded error using
-`errors.As` — no hooks or closure variables needed:
+reasons and returns them in typed errors. Use `errors.As` to extract the structured error —
+no hooks or closure variables needed:
 
 ```go
 tx, receipt, err := wm.R().
@@ -1032,25 +1032,31 @@ tx, receipt, err := wm.R().
     SetAbis(contractABI). // Enable error decoding
     Execute()
 
-// Extract decoded revert information from the error chain
-var decoded *walletarmy.DecodedError
-if errors.As(err, &decoded) {
-    if decoded.AbiError != nil {
-        fmt.Printf("Contract error: %s\n", decoded.AbiError.Name)
-        fmt.Printf("Revert params: %v\n", decoded.RevertParams)
-    } else {
-        fmt.Printf("Raw revert data: 0x%x\n", decoded.RevertData)
+// Simulation revert — eth_call showed the tx would revert
+var simErr *walletarmy.SimulationRevertError
+if errors.As(err, &simErr) {
+    fmt.Printf("Tx: %s\n", simErr.Tx.Hash().Hex())
+    fmt.Printf("Revert data: 0x%x\n", simErr.RevertData)
+    if simErr.AbiError != nil {
+        fmt.Printf("Contract error: %s(%v)\n", simErr.AbiError.Name, simErr.RevertParams)
+    }
+}
+
+// Gas estimation failure — gas estimation failed (possibly due to a revert)
+var gasErr *walletarmy.GasEstimationError
+if errors.As(err, &gasErr) {
+    if gasErr.AbiError != nil {
+        fmt.Printf("Contract error: %s(%v)\n", gasErr.AbiError.Name, gasErr.RevertParams)
     }
 }
 ```
 
-`DecodedError` is returned in the error chain for:
-- **Simulation reverts** (`ErrSimulatedTxReverted`) — when `eth_call` shows the tx would revert
-- **Gas estimation failures** (`ErrEstimateGasFailed`) — when gas estimation fails due to a revert
+These structured errors are returned consistently on every error exit path:
+- **`SimulationRevertError`** — when `eth_call` shows the tx would revert (`ErrSimulatedTxReverted`)
+- **`GasEstimationError`** — when gas estimation fails due to a revert (`ErrEstimateGasFailed`)
 
 For **mined-but-reverted transactions**, `ErrTxReverted` is returned along with the `tx` and
-`receipt`. Note that the on-chain revert data is not available from the receipt alone, so
-`DecodedError` is not included in this case.
+`receipt`. The on-chain revert data is not available from the receipt alone.
 
 ### Hooks Are for Control Flow Only
 

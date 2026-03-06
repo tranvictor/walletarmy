@@ -666,12 +666,7 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 		abiError, revertParams, _ = errDecoder.Decode(err)
 	}
 
-	err = &DecodedError{
-		AbiError:     abiError,
-		RevertParams: revertParams,
-		RevertData:   revertData,
-		Err:          errors.Join(ErrSimulatedTxReverted, err),
-	}
+	err = errors.Join(ErrSimulatedTxReverted, err)
 
 	logger.WithFields(logger.Fields{
 		"tx_hash":         builtTx.Hash().Hex(),
@@ -692,7 +687,7 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 			wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, builtTx.Nonce())
 			return &TxExecutionResult{
 				Action: ActionReturn,
-				Error:  fmt.Errorf("simulation failed hook error: %w", hookErr),
+				Error:  &SimulationRevertError{Tx: builtTx, RevertData: revertData, AbiError: abiError, RevertParams: revertParams, Err: fmt.Errorf("simulation failed hook error: %w", hookErr)},
 			}
 		}
 		if !shouldRetry {
@@ -700,7 +695,7 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 			wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, builtTx.Nonce())
 			return &TxExecutionResult{
 				Action: ActionReturn,
-				Error:  err,
+				Error:  &SimulationRevertError{Tx: builtTx, RevertData: revertData, AbiError: abiError, RevertParams: revertParams, Err: err},
 			}
 		}
 	}
@@ -708,6 +703,7 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 	// Increment retry count — without this, simulation reverts would retry forever
 	if result := execCtx.IncrementRetryAndCheck("simulation reverted"); result != nil {
 		wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, builtTx.Nonce())
+		result.Error = &SimulationRevertError{Tx: builtTx, RevertData: revertData, AbiError: abiError, RevertParams: revertParams, Err: result.Error}
 		return result
 	}
 
@@ -783,20 +779,12 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 		abiError, revertParams, revertMsgErr = errDecoder.Decode(err)
 	}
 
-	// Wrap the gas estimation error with decoded info so callers
-	// can extract it via errors.As(err, &DecodedError{}).
-	decodedErr := &DecodedError{
-		AbiError:     abiError,
-		RevertParams: revertParams,
-		Err:          err,
-	}
-
 	if execCtx.Hooks.GasEstimationFailed != nil {
 		hookGasLimit, hookErr := execCtx.Hooks.GasEstimationFailed(nil, abiError, revertParams, revertMsgErr, err)
 		if hookErr != nil {
 			return &TxExecutionResult{
 				Action: ActionReturn,
-				Error:  hookErr,
+				Error:  &GasEstimationError{AbiError: abiError, RevertParams: revertParams, Err: hookErr},
 			}
 		}
 		if hookGasLimit != nil {
@@ -809,7 +797,7 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 	if execCtx.State.AttemptCount > execCtx.Retry.MaxAttempts {
 		return &TxExecutionResult{
 			Action: ActionReturn,
-			Error:  errors.Join(ErrEnsureTxOutOfRetries, decodedErr),
+			Error:  &GasEstimationError{AbiError: abiError, RevertParams: revertParams, Err: errors.Join(ErrEnsureTxOutOfRetries, err)},
 		}
 	}
 
