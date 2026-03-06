@@ -684,6 +684,16 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 		"revert_data":     revertData,
 	}).Debug("Tx simulation showed a revert error")
 
+	newSimRevertErr := func(cause error) *SimulationRevertError {
+		return &SimulationRevertError{
+			Tx:           builtTx,
+			RevertData:   revertData,
+			AbiError:     abiError,
+			RevertParams: revertParams,
+			Err:          cause,
+		}
+	}
+
 	// Call simulation failed hook if set
 	if execCtx.Hooks.SimulationFailed != nil {
 		shouldRetry, hookErr := execCtx.Hooks.SimulationFailed(builtTx, revertData, abiError, revertParams, err)
@@ -692,7 +702,7 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 			wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, builtTx.Nonce())
 			return &TxExecutionResult{
 				Action: ActionReturn,
-				Error:  fmt.Errorf("simulation failed hook error: %w", hookErr),
+				Error:  newSimRevertErr(fmt.Errorf("simulation failed hook error: %w", hookErr)),
 			}
 		}
 		if !shouldRetry {
@@ -700,7 +710,7 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 			wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, builtTx.Nonce())
 			return &TxExecutionResult{
 				Action: ActionReturn,
-				Error:  err,
+				Error:  newSimRevertErr(err),
 			}
 		}
 	}
@@ -708,6 +718,7 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 	// Increment retry count — without this, simulation reverts would retry forever
 	if result := execCtx.IncrementRetryAndCheck("simulation reverted"); result != nil {
 		wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, builtTx.Nonce())
+		result.Error = newSimRevertErr(result.Error)
 		return result
 	}
 
@@ -796,7 +807,7 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 		if hookErr != nil {
 			return &TxExecutionResult{
 				Action: ActionReturn,
-				Error:  hookErr,
+				Error:  &GasEstimationError{AbiError: abiError, RevertParams: revertParams, Err: hookErr},
 			}
 		}
 		if hookGasLimit != nil {
@@ -809,7 +820,7 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 	if execCtx.State.AttemptCount > execCtx.Retry.MaxAttempts {
 		return &TxExecutionResult{
 			Action: ActionReturn,
-			Error:  errors.Join(ErrEnsureTxOutOfRetries, decodedErr),
+			Error:  &GasEstimationError{AbiError: abiError, RevertParams: revertParams, Err: errors.Join(ErrEnsureTxOutOfRetries, err)},
 		}
 	}
 

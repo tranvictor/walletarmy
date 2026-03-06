@@ -1649,6 +1649,141 @@ func TestSimulation_NonRevertError_ReturnsErrorWithoutHook(t *testing.T) {
 }
 
 // ============================================================
+// Structured Error Types — errors.As Tests
+// ============================================================
+
+func TestGasEstimationError_ExceedsRetries_ExtractableWithErrorsAs(t *testing.T) {
+	setup := newTestSetup(t)
+
+	execCtx := &TxExecutionContext{
+		Retry:  RetryConfig{MaxAttempts: 2},
+		State:  TxRetryState{AttemptCount: 2, OldTxs: make(map[string]*types.Transaction)},
+		Params: TxParams{Network: networks.EthereumMainnet},
+	}
+
+	err := errors.Join(ErrEstimateGasFailed, errors.New("execution reverted"))
+	result := setup.WM.handleGasEstimationFailure(execCtx, nil, err)
+
+	assert.Equal(t, ActionReturn, result.Action)
+
+	var gasErr *GasEstimationError
+	require.True(t, errors.As(result.Error, &gasErr), "result.Error should be extractable as *GasEstimationError")
+	assert.True(t, errors.Is(gasErr, ErrEnsureTxOutOfRetries), "should preserve ErrEnsureTxOutOfRetries in chain")
+	assert.True(t, errors.Is(gasErr, ErrEstimateGasFailed), "should preserve ErrEstimateGasFailed in chain")
+	assert.Nil(t, gasErr.AbiError, "AbiError should be nil when no ABIs provided")
+	assert.Nil(t, gasErr.RevertParams, "RevertParams should be nil when no ABIs provided")
+}
+
+func TestGasEstimationError_HookReturnsError_ExtractableWithErrorsAs(t *testing.T) {
+	setup := newTestSetup(t)
+
+	hookError := errors.New("caller decided to abort")
+	execCtx := &TxExecutionContext{
+		Retry:  RetryConfig{MaxAttempts: 5},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
+		Params: TxParams{Network: networks.EthereumMainnet},
+		Hooks: TxHooks{GasEstimationFailed: func(tx *types.Transaction, abiError *abi.Error, revertParams any, revertMsgError, gasEstimationError error) (*big.Int, error) {
+			return nil, hookError
+		}},
+	}
+
+	err := errors.Join(ErrEstimateGasFailed, errors.New("execution reverted"))
+	result := setup.WM.handleGasEstimationFailure(execCtx, nil, err)
+
+	assert.Equal(t, ActionReturn, result.Action)
+
+	var gasErr *GasEstimationError
+	require.True(t, errors.As(result.Error, &gasErr), "result.Error should be extractable as *GasEstimationError")
+	assert.True(t, errors.Is(gasErr, hookError), "should wrap the hook's error")
+}
+
+func TestSimulationRevertError_RetriesExhausted_ExtractableWithErrorsAs(t *testing.T) {
+	setup := newTestSetup(t)
+
+	builtTx := newTestTx(5, testAddr2, oneEth)
+	revertData := []byte{0x08, 0xc3, 0x79, 0xa0}
+
+	execCtx := &TxExecutionContext{
+		Retry:  RetryConfig{MaxAttempts: 0},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+	}
+
+	origErr := errors.Join(ErrSimulatedTxReverted, fmt.Errorf("revert data: %x", revertData))
+	result := setup.WM.handleEthCallRevertFailure(execCtx, nil, builtTx, revertData, origErr)
+
+	assert.Equal(t, ActionReturn, result.Action)
+
+	var simErr *SimulationRevertError
+	require.True(t, errors.As(result.Error, &simErr), "result.Error should be extractable as *SimulationRevertError")
+	assert.True(t, errors.Is(simErr, ErrEnsureTxOutOfRetries), "should preserve ErrEnsureTxOutOfRetries in chain")
+	assert.Equal(t, builtTx, simErr.Tx)
+	assert.Equal(t, revertData, simErr.RevertData)
+	assert.Nil(t, simErr.AbiError, "AbiError should be nil when no ABIs provided")
+}
+
+func TestSimulationRevertError_HookSaysNoRetry_ExtractableWithErrorsAs(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	builtTx := newTestTx(5, testAddr2, oneEth)
+	revertData := []byte{0x08, 0xc3, 0x79, 0xa0}
+
+	execCtx := &TxExecutionContext{
+		Retry:  RetryConfig{MaxAttempts: 5},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Hooks: TxHooks{SimulationFailed: func(tx *types.Transaction, rd []byte, abiError *abi.Error, revertParams any, err error) (bool, error) {
+			return false, nil
+		}},
+	}
+
+	origErr := errors.Join(ErrSimulatedTxReverted, fmt.Errorf("revert data: %x", revertData))
+	result := setup.WM.handleEthCallRevertFailure(execCtx, nil, builtTx, revertData, origErr)
+
+	assert.Equal(t, ActionReturn, result.Action)
+
+	var simErr *SimulationRevertError
+	require.True(t, errors.As(result.Error, &simErr), "result.Error should be extractable as *SimulationRevertError")
+	assert.True(t, errors.Is(simErr, ErrSimulatedTxReverted), "should preserve ErrSimulatedTxReverted in chain")
+	assert.Equal(t, builtTx, simErr.Tx)
+	assert.Equal(t, revertData, simErr.RevertData)
+}
+
+func TestSimulationRevertError_HookReturnsError_ExtractableWithErrorsAs(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	builtTx := newTestTx(5, testAddr2, oneEth)
+	revertData := []byte{0x08, 0xc3, 0x79, 0xa0}
+	hookError := errors.New("hook wants to abort")
+
+	execCtx := &TxExecutionContext{
+		Retry:  RetryConfig{MaxAttempts: 5},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
+		Params: TxParams{From: testAddr1, Network: networks.EthereumMainnet},
+		Hooks: TxHooks{SimulationFailed: func(tx *types.Transaction, rd []byte, abiError *abi.Error, revertParams any, err error) (bool, error) {
+			return false, hookError
+		}},
+	}
+
+	origErr := errors.Join(ErrSimulatedTxReverted, fmt.Errorf("revert data: %x", revertData))
+	result := setup.WM.handleEthCallRevertFailure(execCtx, nil, builtTx, revertData, origErr)
+
+	assert.Equal(t, ActionReturn, result.Action)
+
+	var simErr *SimulationRevertError
+	require.True(t, errors.As(result.Error, &simErr), "result.Error should be extractable as *SimulationRevertError")
+	assert.True(t, errors.Is(simErr, hookError), "should wrap the hook's error")
+	assert.Equal(t, builtTx, simErr.Tx)
+	assert.Equal(t, revertData, simErr.RevertData)
+}
+
+// ============================================================
 // EnsureTxWithHooksContext Integration Tests
 // ============================================================
 
