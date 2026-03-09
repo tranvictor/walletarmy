@@ -141,10 +141,10 @@ tx, receipt, err := wm.R().
     SetAbis(contractABI).
     Execute()
 
-// Decoded revert info is in the err chain — no hooks needed
-var decoded *walletarmy.DecodedError
-if errors.As(err, &decoded) && decoded.AbiError != nil {
-    fmt.Printf("Revert: %s, params: %v\n", decoded.AbiError.Name, decoded.RevertParams)
+// Simulation revert info is in the err chain — no hooks needed
+var simErr *walletarmy.SimulationRevertError
+if errors.As(err, &simErr) && simErr.AbiError != nil {
+    fmt.Printf("Revert: %s, params: %v\n", simErr.AbiError.Name, simErr.RevertParams)
 }
 ```
 
@@ -343,9 +343,9 @@ wm := walletarmy.NewWalletManager(
 7. **Idempotency requires a store** — `SetIdempotencyKey` is a no-op without `WithDefaultIdempotencyStore` or `WithIdempotencyStore`.
 8. **Slow tx handling** — "slow" is a walletarmy-internal concept (not from the node/monitor): the slow timer starts after the monitor confirms the tx is still pending (not from broadcast time), then fires after `SlowTxTimeout`. Gas is only bumped if the tx's nonce is the blocking nonce (next nonce the chain expects). Non-blocking slow txs just keep waiting.
 9. **Thread safety** — `WalletManager` is safe for concurrent use from multiple goroutines. Each `R()` call creates an independent request.
-10. **`GasEstimationFailedHook` requires ABIs** — the hook's `abiError`/`revertParams` args are nil unless you set `SetAbis(...)` on the request. However, the `DecodedError` in the returned `err` is always populated when ABIs are provided, regardless of whether the hook is set.
+10. **`GasEstimationFailedHook` requires ABIs** — the hook's `abiError`/`revertParams` args are nil unless you set `SetAbis(...)` on the request. However, the structured error (`GasEstimationError` or `SimulationRevertError`) in the returned `err` is always populated when ABIs are provided, regardless of whether the hook is set.
 11. **Mined reverts return `ErrTxReverted`** — When a transaction is mined but reverted on-chain, `Execute` returns `ErrTxReverted` alongside the `tx` and `receipt`. Check `receipt.Status` or use `errors.Is(err, walletarmy.ErrTxReverted)`.
-12. **Hooks are for control flow** — Use hooks to decide retry/abort behavior. Use `errors.As(err, &DecodedError{})` on the returned error to inspect decoded revert reasons.
+12. **Hooks are for control flow** — Use hooks to decide retry/abort behavior. Use `errors.As` with `*SimulationRevertError` or `*GasEstimationError` on the returned error to inspect decoded revert reasons.
 
 ## Key Error Sentinels
 
@@ -366,10 +366,10 @@ walletarmy.ErrSyncBroadcastTimeout  // sync broadcast timed out
 idempotency.ErrDuplicateKey         // duplicate idempotency key
 ```
 
-## Decoded Contract Errors
+## Structured Error Types
 
 When ABIs are provided via `SetAbis()`, revert reasons are automatically decoded and
-wrapped in the returned `err` as `*walletarmy.DecodedError`. Extract with `errors.As`:
+returned as typed errors. Extract with `errors.As`:
 
 ```go
 tx, receipt, err := wm.R().
@@ -377,15 +377,24 @@ tx, receipt, err := wm.R().
     SetAbis(contractABI).
     Execute()
 
-var decoded *walletarmy.DecodedError
-if errors.As(err, &decoded) && decoded.AbiError != nil {
-    fmt.Printf("Revert: %s(%v)\n", decoded.AbiError.Name, decoded.RevertParams)
+// Simulation revert
+var simErr *walletarmy.SimulationRevertError
+if errors.As(err, &simErr) && simErr.AbiError != nil {
+    fmt.Printf("Revert: %s(%v)\n", simErr.AbiError.Name, simErr.RevertParams)
+    fmt.Printf("Tx: %s, RevertData: 0x%x\n", simErr.Tx.Hash().Hex(), simErr.RevertData)
+}
+
+// Gas estimation failure
+var gasErr *walletarmy.GasEstimationError
+if errors.As(err, &gasErr) && gasErr.AbiError != nil {
+    fmt.Printf("Revert: %s(%v)\n", gasErr.AbiError.Name, gasErr.RevertParams)
 }
 ```
 
-`DecodedError` appears in the error chain for simulation reverts (`ErrSimulatedTxReverted`)
-and gas estimation failures (`ErrEstimateGasFailed`). Hooks are for control flow only —
-error details are always available through the returned `err`.
+`SimulationRevertError` wraps simulation reverts (`ErrSimulatedTxReverted`) and carries
+the built transaction and raw revert bytes. `GasEstimationError` wraps gas estimation
+failures (`ErrEstimateGasFailed`). Hooks are for control flow only — error details are
+always available through the returned `err`.
 
 ## Hook Signatures
 
