@@ -991,6 +991,8 @@ tx, receipt, err := wm.R()./* ... */.Execute()
 
 if err != nil {
     switch {
+    case errors.Is(err, walletarmy.ErrTxReverted):
+        // Transaction was mined but reverted (tx and receipt are still returned)
     case errors.Is(err, walletarmy.ErrEstimateGasFailed):
         // Gas estimation failed - tx would likely revert
     case errors.Is(err, walletarmy.ErrAcquireNonceFailed):
@@ -1012,6 +1014,46 @@ if err != nil {
     }
 }
 ```
+
+### Decoded Contract Errors
+
+When you provide ABIs via `SetAbis()`, WalletArmy automatically decodes Solidity revert
+reasons and wraps them in the returned `err`. You can extract the decoded error using
+`errors.As` — no hooks or closure variables needed:
+
+```go
+tx, receipt, err := wm.R().
+    SetFrom(wallet).
+    SetTo(contractAddress).
+    SetData(calldata).
+    SetAbis(contractABI). // Enable error decoding
+    Execute()
+
+// Extract decoded revert information from the error chain
+var decoded *walletarmy.DecodedError
+if errors.As(err, &decoded) {
+    if decoded.AbiError != nil {
+        fmt.Printf("Contract error: %s\n", decoded.AbiError.Name)
+        fmt.Printf("Revert params: %v\n", decoded.RevertParams)
+    } else {
+        fmt.Printf("Raw revert data: 0x%x\n", decoded.RevertData)
+    }
+}
+```
+
+`DecodedError` is returned in the error chain for:
+- **Simulation reverts** (`ErrSimulatedTxReverted`) — when `eth_call` shows the tx would revert
+- **Gas estimation failures** (`ErrEstimateGasFailed`) — when gas estimation fails due to a revert
+
+For **mined-but-reverted transactions**, `ErrTxReverted` is returned along with the `tx` and
+`receipt`. Note that the on-chain revert data is not available from the receipt alone, so
+`DecodedError` is not included in this case.
+
+### Hooks Are for Control Flow Only
+
+Hooks (`SimulationFailedHook`, `GasEstimationFailedHook`, `TxMinedHook`) are intended for
+**control flow decisions** — whether to retry, abort, override gas limits, etc. You do NOT need
+hooks to inspect error details. All error information is available through the returned `err`.
 
 ## Architecture
 

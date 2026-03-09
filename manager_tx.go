@@ -666,10 +666,11 @@ func (wm *WalletManager) handleEthCallRevertFailure(execCtx *TxExecutionContext,
 		abiError, revertParams, _ = errDecoder.Decode(err)
 	}
 
-	if abiError != nil {
-		err = errors.Join(ErrSimulatedTxReverted, fmt.Errorf("revert error: %s. revert params: %+v. Detail: %w", abiError.Name, revertParams, err))
-	} else {
-		err = errors.Join(ErrSimulatedTxReverted, fmt.Errorf("revert data: %s. Detail: %w", common.Bytes2Hex(revertData), err))
+	err = &DecodedError{
+		AbiError:     abiError,
+		RevertParams: revertParams,
+		RevertData:   revertData,
+		Err:          errors.Join(ErrSimulatedTxReverted, err),
 	}
 
 	logger.WithFields(logger.Fields{
@@ -772,14 +773,25 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 		}
 	}
 
-	// Handle gas estimation failed hook
+	// Always attempt to decode the error when ABIs are available,
+	// regardless of whether a hook is set. This ensures the decoded
+	// error is available in the returned err via errors.As.
+	var abiError *abi.Error
+	var revertParams any
+	var revertMsgErr error
+	if errDecoder != nil {
+		abiError, revertParams, revertMsgErr = errDecoder.Decode(err)
+	}
+
+	// Wrap the gas estimation error with decoded info so callers
+	// can extract it via errors.As(err, &DecodedError{}).
+	decodedErr := &DecodedError{
+		AbiError:     abiError,
+		RevertParams: revertParams,
+		Err:          err,
+	}
+
 	if execCtx.Hooks.GasEstimationFailed != nil {
-		var abiError *abi.Error
-		var revertParams any
-		var revertMsgErr error
-		if errDecoder != nil {
-			abiError, revertParams, revertMsgErr = errDecoder.Decode(err)
-		}
 		hookGasLimit, hookErr := execCtx.Hooks.GasEstimationFailed(nil, abiError, revertParams, revertMsgErr, err)
 		if hookErr != nil {
 			return &TxExecutionResult{
@@ -797,7 +809,7 @@ func (wm *WalletManager) handleGasEstimationFailure(execCtx *TxExecutionContext,
 	if execCtx.State.AttemptCount > execCtx.Retry.MaxAttempts {
 		return &TxExecutionResult{
 			Action: ActionReturn,
-			Error:  errors.Join(ErrEnsureTxOutOfRetries, fmt.Errorf("gas estimation failed after %d retries", execCtx.Retry.MaxAttempts)),
+			Error:  errors.Join(ErrEnsureTxOutOfRetries, decodedErr),
 		}
 	}
 
@@ -1195,10 +1207,17 @@ func (wm *WalletManager) handleMinedTx(tx *types.Transaction, txInfo TxInfo, exe
 			}
 		}
 	}
+
+	var revertErr error
+	if txInfo.Receipt.Status == types.ReceiptStatusFailed {
+		revertErr = ErrTxReverted
+	}
+
 	return &TxExecutionResult{
 		Transaction: tx,
 		Receipt:     txInfo.Receipt,
 		Action:      ActionReturn,
+		Error:       revertErr,
 	}
 }
 

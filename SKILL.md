@@ -133,16 +133,13 @@ tx, receipt, err := wm.R().
     SetTo(contractAddr).
     SetData(calldata).
     SetAbis(contractABI).
-    SetGasEstimationFailedHook(func(
-        tx *types.Transaction,
-        abiError *abi.Error,
-        revertParams any,
-        revertMsgErr, gasEstErr error,
-    ) (*big.Int, error) {
-        fmt.Printf("Revert reason: %v, params: %v\n", abiError, revertParams)
-        return nil, gasEstErr // stop on revert
-    }).
     Execute()
+
+// Decoded revert info is in the err chain — no hooks needed
+var decoded *walletarmy.DecodedError
+if errors.As(err, &decoded) && decoded.AbiError != nil {
+    fmt.Printf("Revert: %s, params: %v\n", decoded.AbiError.Name, decoded.RevertParams)
+}
 ```
 
 ### Idempotent Transaction (Prevent Duplicates)
@@ -340,12 +337,15 @@ wm := walletarmy.NewWalletManager(
 7. **Idempotency requires a store** — `SetIdempotencyKey` is a no-op without `WithDefaultIdempotencyStore` or `WithIdempotencyStore`.
 8. **Slow tx handling** — "slow" is a walletarmy-internal concept (not from the node/monitor): the slow timer starts after the monitor confirms the tx is still pending (not from broadcast time), then fires after `SlowTxTimeout`. Gas is only bumped if the tx's nonce is the blocking nonce (next nonce the chain expects). Non-blocking slow txs just keep waiting.
 9. **Thread safety** — `WalletManager` is safe for concurrent use from multiple goroutines. Each `R()` call creates an independent request.
-10. **`GasEstimationFailedHook` requires ABIs** — it won't fire unless you set `SetAbis(...)` on the request.
+10. **`GasEstimationFailedHook` requires ABIs** — the hook's `abiError`/`revertParams` args are nil unless you set `SetAbis(...)` on the request. However, the `DecodedError` in the returned `err` is always populated when ABIs are provided, regardless of whether the hook is set.
+11. **Mined reverts return `ErrTxReverted`** — When a transaction is mined but reverted on-chain, `Execute` returns `ErrTxReverted` alongside the `tx` and `receipt`. Check `receipt.Status` or use `errors.Is(err, walletarmy.ErrTxReverted)`.
+12. **Hooks are for control flow** — Use hooks to decide retry/abort behavior. Use `errors.As(err, &DecodedError{})` on the returned error to inspect decoded revert reasons.
 
 ## Key Error Sentinels
 
 ```go
 // Check errors with errors.Is():
+walletarmy.ErrTxReverted            // tx mined but reverted (tx + receipt still returned)
 walletarmy.ErrFromAddressZero       // from address not set
 walletarmy.ErrNetworkNil            // network not set
 walletarmy.ErrEstimateGasFailed     // gas estimation failed
@@ -359,6 +359,27 @@ walletarmy.ErrCircuitBreakerOpen    // RPC circuit breaker open
 walletarmy.ErrSyncBroadcastTimeout  // sync broadcast timed out
 idempotency.ErrDuplicateKey         // duplicate idempotency key
 ```
+
+## Decoded Contract Errors
+
+When ABIs are provided via `SetAbis()`, revert reasons are automatically decoded and
+wrapped in the returned `err` as `*walletarmy.DecodedError`. Extract with `errors.As`:
+
+```go
+tx, receipt, err := wm.R().
+    SetFrom(wallet).SetTo(contract).SetData(data).
+    SetAbis(contractABI).
+    Execute()
+
+var decoded *walletarmy.DecodedError
+if errors.As(err, &decoded) && decoded.AbiError != nil {
+    fmt.Printf("Revert: %s(%v)\n", decoded.AbiError.Name, decoded.RevertParams)
+}
+```
+
+`DecodedError` appears in the error chain for simulation reverts (`ErrSimulatedTxReverted`)
+and gas estimation failures (`ErrEstimateGasFailed`). Hooks are for control flow only —
+error details are always available through the returned `err`.
 
 ## Hook Signatures
 

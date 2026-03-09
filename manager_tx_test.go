@@ -729,7 +729,7 @@ func TestHandleTransactionStatus_Reverted(t *testing.T) {
 	result := setup.WM.handleTransactionStatus(TxInfo{Status: "reverted", Receipt: receipt}, tx, execCtx)
 
 	assert.Equal(t, ActionReturn, result.Action)
-	assert.Nil(t, result.Error)
+	assert.ErrorIs(t, result.Error, ErrTxReverted)
 	assert.Equal(t, tx, result.Transaction)
 	assert.Equal(t, receipt, result.Receipt)
 }
@@ -1085,7 +1085,7 @@ func TestHandleMinedTx_TxMinedHook_Called_StatusReverted(t *testing.T) {
 
 	assert.True(t, hookCalled, "TxMinedHook should be called")
 	assert.Equal(t, ActionReturn, result.Action)
-	assert.Nil(t, result.Error)
+	assert.ErrorIs(t, result.Error, ErrTxReverted)
 }
 
 func TestHandleMinedTx_TxMinedHook_Called_EmptyStatus_SuccessfulReceipt(t *testing.T) {
@@ -1129,7 +1129,7 @@ func TestHandleMinedTx_TxMinedHook_Called_EmptyStatus_RevertedReceipt(t *testing
 
 	assert.True(t, hookCalled, "TxMinedHook should be called")
 	assert.Equal(t, ActionReturn, result.Action)
-	assert.Nil(t, result.Error)
+	assert.ErrorIs(t, result.Error, ErrTxReverted)
 }
 
 func TestHandleMinedTx_TxMinedHook_ReturnsError(t *testing.T) {
@@ -1963,8 +1963,7 @@ func TestEnsureTx_TxReverted_ReturnsWithReceipt(t *testing.T) {
 		nil, nil, nil, nil, nil, nil,
 	)
 
-	// Reverted tx is still "successful" from EnsureTx perspective - it was mined
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrTxReverted)
 	require.NotNil(t, tx)
 	require.NotNil(t, receipt)
 	assert.Equal(t, types.ReceiptStatusFailed, receipt.Status)
@@ -2684,11 +2683,10 @@ func TestSyncBroadcast_ReturnsRevertedReceipt_HandledCorrectly(t *testing.T) {
 
 	result := setup.WM.signAndBroadcastTransaction(context.Background(), tx, execCtx)
 
-	// Should return with the reverted receipt (not an error - tx was mined)
 	require.NotNil(t, result.Receipt)
 	assert.Equal(t, types.ReceiptStatusFailed, result.Receipt.Status, "Should return the reverted receipt")
 	assert.Equal(t, ActionReturn, result.Action, "Should return with reverted receipt")
-	assert.Nil(t, result.Error, "Reverted tx is not an error - it's a valid outcome")
+	assert.ErrorIs(t, result.Error, ErrTxReverted)
 }
 
 func TestSyncBroadcast_Timeout_TriggersMonitorFlow(t *testing.T) {

@@ -75,6 +75,8 @@ walletarmy/                  # Root package — all public API lives here
 - **Sentinel errors** in `errors.go` — use `fmt.Errorf("descriptive message")`
 - **Wrap errors** with `fmt.Errorf("context: %w", err)` to preserve the chain
 - **Broadcast errors** are a separate type (`BroadcastError`) with classifier functions (`IsNonceIsLow`, `IsInsufficientFund`, etc.)
+- **Decoded errors** — when ABIs are available, revert reasons are wrapped as `*DecodedError` in the error chain (extractable via `errors.As`). This applies to simulation reverts and gas estimation failures. Hooks receive the same decoded info for control flow decisions, but callers should NOT need closures to capture error details.
+- **Mined reverts** — `handleMinedTx` returns `ErrTxReverted` when the receipt shows a revert. The tx and receipt are still returned alongside the error.
 - Never return bare `nil` error from a function that clearly failed — always wrap
 
 ### Interface-First Design
