@@ -68,7 +68,10 @@ func main() {
         SetNetwork(networks.EthereumMainnet).
         Execute()
 
-    if err != nil {
+    // Note: err can be non-nil even when the tx was mined. A mined-but-reverted
+    // tx returns ErrTxReverted alongside valid tx and receipt. Always check
+    // errors.Is before assuming the tx wasn't mined.
+    if err != nil && !errors.Is(err, walletarmy.ErrTxReverted) {
         panic(err)
     }
 

@@ -62,8 +62,14 @@ func main() {
         SetValue(big.NewInt(1e18)). // 1 ETH in wei
         Execute()
 
-    if err != nil {
+    // err can be non-nil even when mined: ErrTxReverted means the tx was
+    // mined but reverted on-chain. tx and receipt are still valid.
+    if err != nil && !errors.Is(err, walletarmy.ErrTxReverted) {
         fmt.Printf("Transaction failed: %v\n", err)
+        return
+    }
+    if errors.Is(err, walletarmy.ErrTxReverted) {
+        fmt.Printf("Tx mined but reverted: %s\n", tx.Hash().Hex())
         return
     }
     fmt.Printf("Mined in block %d, tx hash: %s\n", receipt.BlockNumber, tx.Hash().Hex())
