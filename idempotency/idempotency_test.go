@@ -59,6 +59,7 @@ func TestInMemoryStore_Create(t *testing.T) {
 		}
 		if record == nil {
 			t.Fatal("expected non-nil record")
+			return
 		}
 		if record.Key != "key1" {
 			t.Errorf("expected key 'key1', got %q", record.Key)
