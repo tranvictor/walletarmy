@@ -1,0 +1,114 @@
+// deps.go defines minimal interfaces for external dependencies.
+// This allows for easy mocking in tests and decouples the library from specific implementations.
+package walletarmy
+
+import (
+	"math/big"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethclient/gethclient"
+)
+
+// EthReader defines the minimal interface for reading blockchain state.
+// This abstracts away the concrete jarvis reader implementation.
+type EthReader interface {
+	// GetMinedNonce returns the nonce of the last mined transaction for the address
+	GetMinedNonce(addr string) (uint64, error)
+
+	// GetPendingNonce returns the nonce of the next pending transaction for the address
+	GetPendingNonce(addr string) (uint64, error)
+
+	// EstimateExactGas estimates the gas required for a transaction
+	EstimateExactGas(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error)
+
+	// SuggestedGasSettings returns suggested gas price and tip cap in gwei
+	SuggestedGasSettings() (gasPrice float64, tipCapGwei float64, err error)
+
+	// EthCall simulates a transaction execution without sending it
+	// The overrides parameter allows for state overrides during the call simulation
+	EthCall(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error)
+
+	// TxInfoFromHash returns transaction info for a given hash
+	TxInfoFromHash(hash string) (TxInfo, error)
+}
+
+// TxInfoStatus represents the status of a transaction in the monitoring/execution flow.
+//
+// Statuses are categorized by origin:
+//
+// From the external TxMonitor (node/mempool state):
+//   - TxStatusMined, TxStatusReverted, TxStatusLost, TxStatusPending, TxStatusDone
+//
+// Generated internally by walletarmy (NOT from the monitor):
+//   - TxStatusSlow: fired when a broadcasted tx is not mined within SlowTxTimeout.
+//     This is a walletarmy-level timeout, not a status reported by any node or monitor.
+//   - TxStatusCancelled: fired when the caller's context is cancelled.
+type TxInfoStatus string
+
+const (
+	// TxStatusMined indicates the transaction was mined successfully.
+	// Origin: mapped from TxMonitor "done" status.
+	TxStatusMined TxInfoStatus = "mined"
+	// TxStatusReverted indicates the transaction was mined but execution reverted.
+	// Origin: mapped from TxMonitor "reverted" status.
+	TxStatusReverted TxInfoStatus = "reverted"
+	// TxStatusLost indicates the transaction was dropped from the mempool.
+	// Origin: mapped from TxMonitor "lost" status.
+	TxStatusLost TxInfoStatus = "lost"
+	// TxStatusSlow indicates the transaction has not been mined within SlowTxTimeout
+	// after the monitor has checked the node at least once.
+	// Origin: generated internally by MonitorTxContext. The slow timer is deferred
+	// until the first non-terminal monitor event, then fires after SlowTxTimeout.
+	// This is NOT a status from the TxMonitor — it is a walletarmy-level timeout signal.
+	TxStatusSlow TxInfoStatus = "slow"
+	// TxStatusCancelled indicates the monitoring was cancelled via context.
+	// Origin: generated internally by MonitorTxContext when ctx.Done() fires.
+	TxStatusCancelled TxInfoStatus = "cancelled"
+	// TxStatusPending indicates the transaction is still pending
+	TxStatusPending TxInfoStatus = "pending"
+	// TxStatusDone is the raw status from jarvis monitor indicating success
+	TxStatusDone TxInfoStatus = "done"
+)
+
+// TxInfo represents transaction information returned by the reader.
+// This mirrors the essential fields from jarviscommon.TxInfo.
+type TxInfo struct {
+	Status  TxInfoStatus
+	Receipt *types.Receipt
+}
+
+// EthBroadcaster defines the minimal interface for broadcasting transactions.
+type EthBroadcaster interface {
+	// BroadcastTx broadcasts a signed transaction to the network
+	// Returns the tx hash, whether it was broadcast successfully, and any errors
+	BroadcastTx(tx *types.Transaction) (hash string, broadcasted bool, err error)
+
+	// BroadcastTxSync broadcasts and waits for the transaction to be mined (for L2s that support it)
+	BroadcastTxSync(tx *types.Transaction) (receipt *types.Receipt, err error)
+}
+
+// TxMonitorStatus represents the status of a monitored transaction.
+type TxMonitorStatus struct {
+	Status  string
+	Receipt *types.Receipt
+}
+
+// TxMonitor defines the minimal interface for monitoring transaction status.
+type TxMonitor interface {
+	// MakeWaitChannelWithInterval creates a channel that receives status updates
+	MakeWaitChannelWithInterval(txHash string, interval time.Duration) <-chan TxMonitorStatus
+}
+
+// ReaderFactory creates an EthReader for a given network.
+// This allows injecting mock readers for testing.
+type ReaderFactory func(chainID uint64, networkName string) (EthReader, error)
+
+// BroadcasterFactory creates an EthBroadcaster for a given network.
+// This allows injecting mock broadcasters for testing.
+type BroadcasterFactory func(chainID uint64, networkName string) (EthBroadcaster, error)
+
+// TxMonitorFactory creates a TxMonitor for a given network.
+// This allows injecting mock monitors for testing.
+type TxMonitorFactory func(reader EthReader) TxMonitor

@@ -37,6 +37,21 @@ func TestBroadcastError_Detection(t *testing.T) {
 			expected: ErrNonceIsLow,
 		},
 		{
+			name:     "nonce already exist",
+			err:      errors.New("nonce already exist"),
+			expected: ErrNonceIsLow,
+		},
+		{
+			name:     "replacement transaction underpriced",
+			err:      errors.New("replacement transaction underpriced"),
+			expected: ErrReplacementUnderpriced,
+		},
+		{
+			name:     "transaction underpriced",
+			err:      errors.New("transaction underpriced"),
+			expected: ErrReplacementUnderpriced,
+		},
+		{
 			name:     "gas limit too low",
 			err:      errors.New("gas limit too low"),
 			expected: ErrGasLimitIsTooLow,
@@ -58,6 +73,52 @@ func TestBroadcastError_Detection(t *testing.T) {
 			result := NewBroadcastError(tt.err)
 			if result != tt.expected {
 				t.Errorf("Expected %v, got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestBroadcastError_IsReplacementUnderpriced(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{"replacement transaction underpriced", errors.New("replacement transaction underpriced"), true},
+		{"transaction underpriced", errors.New("transaction underpriced"), true},
+		{"nonce too low", errors.New("nonce too low"), false},
+		{"other error", errors.New("some other error"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsReplacementUnderpriced(tt.err)
+			if result != tt.expected {
+				t.Errorf("Expected %v, got %v for error: %v", tt.expected, result, tt.err)
+			}
+		})
+	}
+}
+
+func TestBroadcastError_IsNonceIsLow_DoesNotMatchUnderpriced(t *testing.T) {
+	// "underpriced" should NOT be classified as nonce-is-low anymore
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{"nonce too low", errors.New("nonce too low"), true},
+		{"nonce already exist", errors.New("nonce already exist"), true},
+		{"replacement transaction underpriced", errors.New("replacement transaction underpriced"), false},
+		{"transaction underpriced", errors.New("transaction underpriced"), false},
+		{"other error", errors.New("some other error"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsNonceIsLow(tt.err)
+			if result != tt.expected {
+				t.Errorf("Expected %v, got %v for error: %v", tt.expected, result, tt.err)
 			}
 		})
 	}

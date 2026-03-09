@@ -1,6 +1,8 @@
 package walletarmy
 
 import (
+	"errors"
+	"fmt"
 	"math/big"
 	"time"
 
@@ -11,160 +13,197 @@ import (
 	"github.com/tranvictor/jarvis/networks"
 )
 
-// TxExecutionContext holds the state and parameters for transaction execution
-type TxExecutionContext struct {
-	// Retry tracking
-	actualRetryCount int
-
-	// Configuration
-	numRetries      int
-	sleepDuration   time.Duration
-	txCheckInterval time.Duration
-
-	// Transaction parameters
-	txType        uint8
-	from, to      common.Address
-	value         *big.Int
-	gasLimit      uint64
-	extraGasLimit uint64
-	data          []byte
-	network       networks.Network
-
-	// Gas pricing (mutable during retries)
-	retryGasPrice   float64
-	extraGasPrice   float64
-	retryTipCap     float64
-	extraTipCapGwei float64
-
-	// Gas price protection limits (caller-defined)
-	maxGasPrice float64
-	maxTipCap   float64
-
-	// Transaction state
-	oldTxs     map[string]*types.Transaction
-	retryNonce *big.Int
-
-	// Hooks
-	beforeSignAndBroadcastHook Hook
-	afterSignAndBroadcastHook  Hook
-	gasEstimationFailedHook    GasEstimationFailedHook
-	abis                       []abi.ABI
+// TxParams holds immutable transaction parameters (set once, never mutated).
+type TxParams struct {
+	TxType         uint8
+	From           common.Address
+	To             common.Address
+	Value          *big.Int
+	Data           []byte
+	Network        networks.Network
+	// SkipSimulation, when true, skips the eth_call simulation that normally runs
+	// after BuildTx succeeds but before signing and broadcasting. This allows
+	// forcing a transaction through even when the simulation indicates it would
+	// revert. The caller should typically also provide a manual gas limit
+	// (via TxRequest.SetGasLimit or the GasLimit field in TxRetryState), since
+	// gas estimation may fail for the same reason the simulation would revert.
+	SkipSimulation bool
 }
 
-// NewTxExecutionContext creates a new transaction execution context
-func NewTxExecutionContext(
-	numRetries int,
-	sleepDuration time.Duration,
-	txCheckInterval time.Duration,
-	txType uint8,
-	from, to common.Address,
-	value *big.Int,
-	gasLimit uint64, extraGasLimit uint64,
-	gasPrice float64, extraGasPrice float64,
-	tipCapGwei float64, extraTipCapGwei float64,
-	maxGasPrice float64, maxTipCap float64,
-	data []byte,
-	network networks.Network,
-	beforeSignAndBroadcastHook Hook,
-	afterSignAndBroadcastHook Hook,
-	abis []abi.ABI,
-	gasEstimationFailedHook GasEstimationFailedHook,
-) (*TxExecutionContext, error) {
-	// Validate inputs
-	if numRetries < 0 {
-		numRetries = 0
-	}
-	if sleepDuration <= 0 {
-		sleepDuration = DefaultSleepDuration
-	}
-	if txCheckInterval <= 0 {
-		txCheckInterval = DefaultTxCheckInterval
-	}
+// RetryConfig holds immutable retry/timing configuration.
+type RetryConfig struct {
+	MaxAttempts     int           // Maximum number of retry attempts (renamed from NumRetries)
+	SleepDuration   time.Duration // Sleep between retry attempts
+	TxCheckInterval time.Duration // Interval for checking tx status
+	SlowTxTimeout   time.Duration // Time before considering a tx "slow" during monitoring
+}
 
-	// Validate addresses
-	if from == (common.Address{}) {
+// GasBounds holds immutable gas configuration and protection limits.
+type GasBounds struct {
+	ExtraGasLimit      uint64  // Extra gas limit added to estimates
+	ExtraGasPrice      float64 // Extra gas price added to suggestions (gwei)
+	ExtraTipCap        float64 // Extra tip cap added to suggestions (gwei)
+	MaxGasPrice        float64 // Maximum gas price protection limit (gwei)
+	MaxTipCap          float64 // Maximum tip cap protection limit (gwei)
+	GasPriceBumpFactor float64 // Multiplier for gas price when tx is slow (e.g., 1.2 = 20% increase)
+	TipCapBumpFactor   float64 // Multiplier for tip cap when tx is slow (e.g., 1.1 = 10% increase)
+}
+
+// TxHooks holds all callback hooks (set once at construction).
+type TxHooks struct {
+	BeforeSignAndBroadcast Hook
+	AfterSignAndBroadcast  Hook
+	GasEstimationFailed    GasEstimationFailedHook
+	SimulationFailed       SimulationFailedHook
+	TxMined                TxMinedHook
+	ABIs                   []abi.ABI
+}
+
+// TxRetryState holds all mutable state that changes during the retry loop.
+// This is the ONLY part of TxExecutionContext that should be mutated during execution.
+type TxRetryState struct {
+	AttemptCount int              // Number of retry attempts so far
+	GasPrice     float64          // Current gas price for next attempt (gwei)
+	TipCap       float64          // Current tip cap for next attempt (gwei)
+	GasLimit     uint64           // May be overridden by hooks
+	Nonce        *big.Int         // nil = acquire new, non-nil = reuse this nonce
+	OldTxs       map[string]*types.Transaction
+	ResumeWith   *types.Transaction // If non-nil, skip build/broadcast and go straight to monitoring
+}
+
+// TxExecutionContext holds the state and parameters for transaction execution.
+// It composes immutable configuration (Params, Retry, Gas, Hooks) with mutable
+// retry state (State). Only State fields should be mutated during execution.
+type TxExecutionContext struct {
+	Params TxParams
+	Retry  RetryConfig
+	Gas    GasBounds
+	Hooks  TxHooks
+	State  TxRetryState // The only mutable part
+}
+
+// NewTxExecutionContext creates a new transaction execution context from structured sub-types.
+// initialGasPrice and initialTipCap are the starting gas prices (gwei) for the first attempt.
+func NewTxExecutionContext(
+	params TxParams,
+	retry RetryConfig,
+	gas GasBounds,
+	hooks TxHooks,
+	initialGasPrice float64,
+	initialTipCap float64,
+) (*TxExecutionContext, error) {
+	// Validate required fields
+	if params.From == (common.Address{}) {
 		return nil, ErrFromAddressZero
 	}
-
-	// Validate network
-	if network == nil {
+	if params.Network == nil {
 		return nil, ErrNetworkNil
 	}
 
-	// Initialize value if nil
-	if value == nil {
-		value = big.NewInt(0)
+	// Sanitize optional fields.
+	// When called via WalletManager entry points (EnsureTxWithHooksContext,
+	// TxRequest.executeInternal, ResumePendingTransaction), these are already
+	// resolved from ManagerDefaults. The fallbacks here are a safety net for
+	// direct callers of NewTxExecutionContext.
+	if retry.MaxAttempts < 0 {
+		retry.MaxAttempts = 0
 	}
-
-	// Set default maxGasPrice and maxTipCap if they are 0 (to avoid infinite loop)
-	if maxGasPrice == 0 {
-		maxGasPrice = gasPrice * MaxCapMultiplier
+	if retry.SleepDuration <= 0 {
+		retry.SleepDuration = DefaultSleepDuration
 	}
-	if maxTipCap == 0 {
-		maxTipCap = tipCapGwei * MaxCapMultiplier
+	if retry.TxCheckInterval <= 0 {
+		retry.TxCheckInterval = DefaultTxCheckInterval
+	}
+	if retry.SlowTxTimeout <= 0 {
+		retry.SlowTxTimeout = DefaultSlowTxTimeout
+	}
+	if params.Value == nil {
+		params.Value = big.NewInt(0)
+	}
+	if gas.MaxGasPrice == 0 {
+		gas.MaxGasPrice = initialGasPrice * MaxCapMultiplier
+	}
+	if gas.MaxTipCap == 0 {
+		gas.MaxTipCap = initialTipCap * MaxCapMultiplier
+	}
+	if gas.GasPriceBumpFactor == 0 {
+		gas.GasPriceBumpFactor = DefaultGasPriceBumpFactor
+	}
+	if gas.TipCapBumpFactor == 0 {
+		gas.TipCapBumpFactor = DefaultTipCapBumpFactor
 	}
 
 	return &TxExecutionContext{
-		actualRetryCount:           0,
-		numRetries:                 numRetries,
-		sleepDuration:              sleepDuration,
-		txCheckInterval:            txCheckInterval,
-		txType:                     txType,
-		from:                       from,
-		to:                         to,
-		value:                      value,
-		gasLimit:                   gasLimit,
-		extraGasLimit:              extraGasLimit,
-		retryGasPrice:              gasPrice,
-		extraGasPrice:              extraGasPrice,
-		retryTipCap:                tipCapGwei,
-		extraTipCapGwei:            extraTipCapGwei,
-		maxGasPrice:                maxGasPrice,
-		maxTipCap:                  maxTipCap,
-		data:                       data,
-		network:                    network,
-		oldTxs:                     make(map[string]*types.Transaction),
-		retryNonce:                 nil,
-		beforeSignAndBroadcastHook: beforeSignAndBroadcastHook,
-		afterSignAndBroadcastHook:  afterSignAndBroadcastHook,
-		abis:                       abis,
-		gasEstimationFailedHook:    gasEstimationFailedHook,
+		Params: params,
+		Retry:  retry,
+		Gas:    gas,
+		Hooks:  hooks,
+		State: TxRetryState{
+			GasPrice: initialGasPrice,
+			TipCap:   initialTipCap,
+			OldTxs:   make(map[string]*types.Transaction),
+		},
 	}, nil
 }
 
-// adjustGasPricesForSlowTx adjusts gas prices when a transaction is slow
-// Returns true if adjustment was applied, false if limits were reached
-func (ctx *TxExecutionContext) adjustGasPricesForSlowTx(tx *types.Transaction) bool {
+// BumpGasForSlowTx adjusts gas prices when a transaction is slow.
+// It reads from Gas (immutable bounds) and writes to State (mutable).
+// Returns true if adjustment was applied, false if limits were reached.
+func (ctx *TxExecutionContext) BumpGasForSlowTx(tx *types.Transaction) bool {
 	if tx == nil {
 		return false
 	}
 
-	// Increase gas price by configured percentage
+	// Gas.GasPriceBumpFactor and Gas.TipCapBumpFactor are guaranteed non-zero
+	// by NewTxExecutionContext (which fills package defaults for direct callers)
+	// and by applyDefaultsResolution (for WalletManager entry points).
+
+	// Compute new values first, validate both, then commit atomically.
+	// This avoids partial State mutation if only one limit is exceeded.
 	currentGasPrice := jarviscommon.BigToFloat(tx.GasPrice(), 9)
-	newGasPrice := currentGasPrice * GasPriceIncreasePercent
+	newGasPrice := currentGasPrice * ctx.Gas.GasPriceBumpFactor
 
-	// Check if new gas price would exceed the caller-defined maximum
-	if ctx.maxGasPrice > 0 && newGasPrice > ctx.maxGasPrice {
-		// Gas price would exceed limit - stop trying
-		return false
-	}
-
-	ctx.retryGasPrice = newGasPrice
-
-	// Increase tip cap by configured percentage
 	currentTipCap := jarviscommon.BigToFloat(tx.GasTipCap(), 9)
-	newTipCap := currentTipCap * TipCapIncreasePercent
+	newTipCap := currentTipCap * ctx.Gas.TipCapBumpFactor
 
-	// Check if new tip cap would exceed the caller-defined maximum
-	if ctx.maxTipCap > 0 && newTipCap > ctx.maxTipCap {
-		// Tip cap would exceed limit - stop trying
+	// Check both limits before committing any state changes
+	if ctx.Gas.MaxGasPrice > 0 && newGasPrice > ctx.Gas.MaxGasPrice {
+		return false
+	}
+	if ctx.Gas.MaxTipCap > 0 && newTipCap > ctx.Gas.MaxTipCap {
 		return false
 	}
 
-	ctx.retryTipCap = newTipCap
-
-	// Keep the same nonce
-	ctx.retryNonce = big.NewInt(int64(tx.Nonce()))
+	// Both within limits — commit all state changes together
+	ctx.State.GasPrice = newGasPrice
+	ctx.State.TipCap = newTipCap
+	ctx.State.Nonce = big.NewInt(int64(tx.Nonce()))
 
 	return true
+}
+
+// IncrementRetryAndCheck increments retry count and checks if we've exceeded max attempts.
+// Returns a TxExecutionResult with ActionReturn if retries are exhausted, nil otherwise.
+func (ctx *TxExecutionContext) IncrementRetryAndCheck(errorMsg string) *TxExecutionResult {
+	ctx.State.AttemptCount++
+	if ctx.State.AttemptCount > ctx.Retry.MaxAttempts {
+		return &TxExecutionResult{
+			Transaction: nil,
+			Action:      ActionReturn,
+			Error:       errors.Join(ErrEnsureTxOutOfRetries, fmt.Errorf("%s after %d retries", errorMsg, ctx.Retry.MaxAttempts)),
+		}
+	}
+	return nil
+}
+
+// Deprecated aliases for backward compatibility.
+
+// AdjustGasPricesForSlowTx is a deprecated alias for BumpGasForSlowTx.
+func (ctx *TxExecutionContext) AdjustGasPricesForSlowTx(tx *types.Transaction) bool {
+	return ctx.BumpGasForSlowTx(tx)
+}
+
+// IncrementRetryCountAndCheck is a deprecated alias for IncrementRetryAndCheck.
+func (ctx *TxExecutionContext) IncrementRetryCountAndCheck(errorMsg string) *TxExecutionResult {
+	return ctx.IncrementRetryAndCheck(errorMsg)
 }

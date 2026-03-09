@@ -8,10 +8,11 @@ import (
 type BroadcastError error
 
 var (
-	ErrInsufficientFund = BroadcastError(fmt.Errorf("insufficient fund"))
-	ErrNonceIsLow       = BroadcastError(fmt.Errorf("nonce is low"))
-	ErrGasLimitIsTooLow = BroadcastError(fmt.Errorf("gas limit is too low"))
-	ErrTxIsKnown        = BroadcastError(fmt.Errorf("tx is known"))
+	ErrInsufficientFund        = BroadcastError(fmt.Errorf("insufficient fund"))
+	ErrNonceIsLow              = BroadcastError(fmt.Errorf("nonce is low"))
+	ErrReplacementUnderpriced  = BroadcastError(fmt.Errorf("replacement transaction underpriced"))
+	ErrGasLimitIsTooLow        = BroadcastError(fmt.Errorf("gas limit is too low"))
+	ErrTxIsKnown               = BroadcastError(fmt.Errorf("tx is known"))
 )
 
 func NewBroadcastError(err error) BroadcastError {
@@ -19,9 +20,15 @@ func NewBroadcastError(err error) BroadcastError {
 		return nil
 	}
 
-	// Check error conditions in priority order
+	// Check error conditions in priority order.
+	// IsReplacementUnderpriced must be checked before IsNonceIsLow because
+	// "underpriced" is a more specific condition (nonce is still pending but
+	// replacement gas is too low) vs "nonce too low" (nonce already mined).
 	if IsInsufficientFund(err) {
 		return ErrInsufficientFund
+	}
+	if IsReplacementUnderpriced(err) {
+		return ErrReplacementUnderpriced
 	}
 	if IsNonceIsLow(err) {
 		return ErrNonceIsLow
@@ -47,11 +54,14 @@ func IsGasLimitIsTooLow(err error) bool {
 	return hasGasTooLow || hasIntrinsicGasTooLow || hasGasLimitReach
 }
 
+func IsReplacementUnderpriced(err error) bool {
+	return strings.Contains(err.Error(), "underprice")
+}
+
 func IsNonceIsLow(err error) bool {
 	hasNonceAndLow := strings.Contains(err.Error(), "nonce") && strings.Contains(err.Error(), "low")
-	hasUnderprice := strings.Contains(err.Error(), "underprice")
 	hasNonceAlreadyExist := strings.Contains(err.Error(), "nonce") && strings.Contains(err.Error(), "already exist")
-	return hasNonceAndLow || hasUnderprice || hasNonceAlreadyExist
+	return hasNonceAndLow || hasNonceAlreadyExist
 }
 
 func IsInsufficientFund(err error) bool {
