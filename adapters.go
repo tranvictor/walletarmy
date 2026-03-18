@@ -37,8 +37,8 @@ func (r *readerAdapter) SuggestedGasSettings() (float64, float64, error) {
 	return r.reader.SuggestedGasSettings()
 }
 
-func (r *readerAdapter) EthCall(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
-	return r.reader.EthCall(from, to, data, overrides)
+func (r *readerAdapter) EthCall(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	return r.reader.EthCall(from, to, value, data, overrides)
 }
 
 func (r *readerAdapter) TxInfoFromHash(hash string) (TxInfo, error) {

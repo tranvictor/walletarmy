@@ -26,9 +26,10 @@ type EthReader interface {
 	// SuggestedGasSettings returns suggested gas price and tip cap in gwei
 	SuggestedGasSettings() (gasPrice float64, tipCapGwei float64, err error)
 
-	// EthCall simulates a transaction execution without sending it
-	// The overrides parameter allows for state overrides during the call simulation
-	EthCall(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error)
+	// EthCall simulates a transaction execution without sending it.
+	// The value parameter sets msg.value for the simulated call.
+	// The overrides parameter allows for state overrides during the call simulation.
+	EthCall(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error)
 
 	// TxInfoFromHash returns transaction info for a given hash
 	TxInfoFromHash(hash string) (TxInfo, error)

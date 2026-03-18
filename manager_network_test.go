@@ -25,7 +25,7 @@ func createDefaultMockReader() *mockEthReader {
 		GetMinedNonceFn:        func(addr string) (uint64, error) { return 0, nil },
 		GetPendingNonceFn:      func(addr string) (uint64, error) { return 0, nil },
 		SuggestedGasSettingsFn: func() (float64, float64, error) { return 20.0, 2.0, nil },
-		EthCallFn: func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		EthCallFn: func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 			return nil, nil
 		},
 		TxInfoFromHashFn: func(hash string) (TxInfo, error) {

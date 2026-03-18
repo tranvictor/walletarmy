@@ -918,7 +918,7 @@ func TestExecuteTransactionAttempt_SimulationFails_ReturnsError(t *testing.T) {
 	setup := newTestSetup(t)
 
 	// EthCall returns a non-revert error (network error)
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, fmt.Errorf("network connection failed")
 	}
 
@@ -939,7 +939,7 @@ func TestExecuteTransactionAttempt_SimulationSucceeds_ContinuesToBroadcast(t *te
 	setup := newTestSetup(t)
 
 	// EthCall succeeds (no error)
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil
 	}
 
@@ -1494,7 +1494,7 @@ func TestSignAndBroadcast_ReleasesNonce_WhenBeforeHookFails(t *testing.T) {
 
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil // Simulation passes
 	}
 
@@ -1600,7 +1600,7 @@ func TestSimulation_DoesNotReleaseNonce_WhenRetrying(t *testing.T) {
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
 
 	// Simulation succeeds, tx should proceed
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil // Success
 	}
 
@@ -1624,7 +1624,7 @@ func TestSimulation_NonRevertError_ReturnsErrorWithoutHook(t *testing.T) {
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
 
 	// Make EthCall return a network error (not a revert)
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, errors.New("network timeout")
 	}
 
@@ -1811,7 +1811,7 @@ func TestEnsureTx_FullSuccessPath(t *testing.T) {
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
 	setup.Reader.SuggestedGasSettingsFn = func() (float64, float64, error) { return 20.0, 2.0, nil }
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil // Simulation passes
 	}
 
@@ -1873,7 +1873,7 @@ func TestEnsureTx_TxMinedHook_Called(t *testing.T) {
 
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil
 	}
 
@@ -1920,7 +1920,7 @@ func TestEnsureTx_BeforeSignAndBroadcastHook_StopsExecution(t *testing.T) {
 
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil
 	}
 
@@ -1954,7 +1954,7 @@ func TestEnsureTx_ContextCancellation_DuringExecution(t *testing.T) {
 
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil
 	}
 
@@ -2018,7 +2018,7 @@ func TestEnsureTx_MaxRetriesExceeded(t *testing.T) {
 
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil
 	}
 
@@ -2074,7 +2074,7 @@ func TestEnsureTx_TxReverted_ReturnsWithReceipt(t *testing.T) {
 
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil
 	}
 
@@ -2111,7 +2111,7 @@ func TestEnsureTx_SyncTx_ReturnsImmediately(t *testing.T) {
 
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil
 	}
 
@@ -2150,7 +2150,7 @@ func TestEnsureTx_LostTx_RetriesWithSameNonceAndBumpedGas(t *testing.T) {
 
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil
 	}
 
@@ -2196,7 +2196,7 @@ func TestEnsureTx_AfterSignAndBroadcastHook_CalledOnSuccess(t *testing.T) {
 
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil
 	}
 
@@ -2237,7 +2237,7 @@ func TestEnsureTx_GasEstimationFails_RetriesUntilSuccess(t *testing.T) {
 
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil
 	}
 
@@ -2922,7 +2922,7 @@ func TestNonceLeak_NonRevertSimulationFailure_ShouldReleaseNonce(t *testing.T) {
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
 
 	// Simulation fails with a non-revert error (e.g., network timeout)
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, fmt.Errorf("network connection timeout")
 	}
 
@@ -2962,7 +2962,7 @@ func TestNonceLeak_NonRevertSimulationFailure_CompoundsOverMultipleCalls(t *test
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
 
 	// Simulation always fails with a non-revert error
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, fmt.Errorf("network connection timeout")
 	}
 
@@ -3002,7 +3002,7 @@ func TestNonceLeak_NonRevertSimulationFailure_FullLoop_ShouldReleaseNonce(t *tes
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
 
 	// Simulation fails with a non-revert error
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, fmt.Errorf("network connection timeout")
 	}
 
@@ -3120,7 +3120,7 @@ func TestEnsureTx_LostTx_RetriesWithSameNonce(t *testing.T) {
 
 	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
 	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
-	setup.Reader.EthCallFn = func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 		return nil, nil
 	}
 
@@ -3570,7 +3570,7 @@ func TestEnsureTx_SlowTx_NonBlocking_WaitsThenBumpsWhenBlocking(t *testing.T) {
 			return minedNonce, nil
 		},
 		SuggestedGasSettingsFn: func() (float64, float64, error) { return 20.0, 2.0, nil },
-		EthCallFn: func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		EthCallFn: func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 			return nil, nil
 		},
 	}
@@ -3749,7 +3749,7 @@ func newTestSetupWithTxStore(t *testing.T) (*testSetup, *mockTxStore) {
 		GetMinedNonceFn:        func(addr string) (uint64, error) { return 0, nil },
 		GetPendingNonceFn:      func(addr string) (uint64, error) { return 0, nil },
 		SuggestedGasSettingsFn: func() (float64, float64, error) { return 20.0, 2.0, nil },
-		EthCallFn: func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		EthCallFn: func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 			return nil, nil
 		},
 		TxInfoFromHashFn: func(hash string) (TxInfo, error) {

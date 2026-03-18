@@ -27,7 +27,7 @@ type mockEthReader struct {
 	GetPendingNonceFn      func(addr string) (uint64, error)
 	EstimateExactGasFn     func(from, to string, gasPrice float64, value *big.Int, data []byte) (uint64, error)
 	SuggestedGasSettingsFn func() (float64, float64, error)
-	EthCallFn              func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error)
+	EthCallFn              func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error)
 	TxInfoFromHashFn       func(hash string) (TxInfo, error)
 
 	// Call tracking for assertions
@@ -88,7 +88,7 @@ func (m *mockEthReader) SuggestedGasSettings() (float64, float64, error) {
 	return 20.0, 2.0, nil
 }
 
-func (m *mockEthReader) EthCall(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+func (m *mockEthReader) EthCall(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 	m.mu.Lock()
 	m.EthCallCalls = append(m.EthCallCalls, struct {
 		From, To string
@@ -96,7 +96,7 @@ func (m *mockEthReader) EthCall(from, to string, data []byte, overrides *map[com
 	}{from, to, data})
 	m.mu.Unlock()
 	if m.EthCallFn != nil {
-		return m.EthCallFn(from, to, data, overrides)
+		return m.EthCallFn(from, to, value, data, overrides)
 	}
 	return nil, nil
 }
@@ -272,7 +272,7 @@ func newTestSetup(t *testing.T) *testSetup {
 		GetMinedNonceFn:        func(addr string) (uint64, error) { return 0, nil },
 		GetPendingNonceFn:      func(addr string) (uint64, error) { return 0, nil },
 		SuggestedGasSettingsFn: func() (float64, float64, error) { return 20.0, 2.0, nil },
-		EthCallFn: func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		EthCallFn: func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 			return nil, nil
 		},
 		TxInfoFromHashFn: func(hash string) (TxInfo, error) {
@@ -388,7 +388,7 @@ func newTestSetupWithSyncNetwork(t *testing.T) (*syncTxTestSetup, *mockNetwork) 
 		GetMinedNonceFn:        func(addr string) (uint64, error) { return 0, nil },
 		GetPendingNonceFn:      func(addr string) (uint64, error) { return 0, nil },
 		SuggestedGasSettingsFn: func() (float64, float64, error) { return 0.1, 0.01, nil },
-		EthCallFn: func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		EthCallFn: func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 			return nil, nil
 		},
 		TxInfoFromHashFn: func(hash string) (TxInfo, error) {

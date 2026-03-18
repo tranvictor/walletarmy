@@ -621,7 +621,7 @@ func (wm *WalletManager) executeTransactionAttempt(ctx context.Context, execCtx 
 				Error:  errors.Join(ErrSimulatedTxFailed, fmt.Errorf("couldn't get reader for simulation: %w", readerErr)),
 			}
 		}
-		_, err = r.EthCall(execCtx.Params.From.Hex(), execCtx.Params.To.Hex(), execCtx.Params.Data, nil) // nil overrides = use current state
+		_, err = r.EthCall(execCtx.Params.From.Hex(), execCtx.Params.To.Hex(), execCtx.Params.Value, execCtx.Params.Data, nil)
 		if err != nil {
 			revertData, isRevert := ethclient.RevertErrorData(err)
 			if isRevert {

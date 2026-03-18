@@ -1383,7 +1383,7 @@ func TestRecoveryFlow_FullIntegration_SlowTx_GasBump_Replacement(t *testing.T) {
 			}
 			return TxInfo{Status: "pending"}, nil
 		},
-		EthCallFn: func(from, to string, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		EthCallFn: func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
 			t.Logf("EthCall (simulation) called: from=%s, to=%s", from, to)
 			return nil, nil // Simulation passes
 		},
