@@ -298,6 +298,46 @@ func (t *Tracker) AcquireNonce(
 	}, nil
 }
 
+// ResyncFromRemote resets local nonce tracking to match the chain's remote state.
+// Unlike SetPendingNonce, this can move the local nonce backward when local tracking
+// has drifted ahead of the chain (e.g., after a failed broadcast or optimistic sync timeout).
+//
+// remotePendingNonce is the next nonce the chain expects (from eth_getTransactionCount pending).
+func (t *Tracker) ResyncFromRemote(wallet common.Address, chainID uint64, networkName string, minedNonce, remotePendingNonce uint64) {
+	lock := t.getWalletLock(wallet)
+	lock.Lock()
+	defer lock.Unlock()
+
+	nextNonce := remotePendingNonce
+	if minedNonce > remotePendingNonce {
+		nextNonce = minedNonce
+	}
+
+	// Clear claimed gaps at or above the chain's next nonce — they were never broadcast.
+	claimed := t.getClaimedGaps(wallet, chainID)
+	for n := range claimed {
+		if n >= nextNonce {
+			delete(claimed, n)
+		}
+	}
+
+	walletNonces := t.getOrCreateNonceMap(wallet)
+	if nextNonce == 0 {
+		delete(walletNonces, chainID)
+	} else {
+		walletNonces[chainID] = big.NewInt(int64(nextNonce - 1))
+	}
+
+	logger.WithFields(logger.Fields{
+		"wallet":         wallet.Hex(),
+		"network":        networkName,
+		"chain_id":       chainID,
+		"mined_nonce":    minedNonce,
+		"remote_pending": remotePendingNonce,
+		"resynced_next":  nextNonce,
+	}).Debug("ResyncFromRemote: local nonce reset to chain state")
+}
+
 // ReleaseNonce releases a previously acquired nonce that was not used.
 // This allows the nonce to be reused by subsequent transactions.
 // Note: This only affects local tracking. If the transaction was already broadcast

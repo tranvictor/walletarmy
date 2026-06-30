@@ -37,6 +37,11 @@ func TestBroadcastError_Detection(t *testing.T) {
 			expected: ErrNonceIsLow,
 		},
 		{
+			name:     "nonce gap",
+			err:      errors.New("The transaction was rejected due to a nonce gap. Please resubmit with the next on-chain nonce."),
+			expected: ErrNonceGap,
+		},
+		{
 			name:     "nonce already exist",
 			err:      errors.New("nonce already exist"),
 			expected: ErrNonceIsLow,
@@ -117,6 +122,27 @@ func TestBroadcastError_IsNonceIsLow_DoesNotMatchUnderpriced(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := IsNonceIsLow(tt.err)
+			if result != tt.expected {
+				t.Errorf("Expected %v, got %v for error: %v", tt.expected, result, tt.err)
+			}
+		})
+	}
+}
+
+func TestBroadcastError_IsNonceGap(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{"rise nonce gap", errors.New("The transaction was rejected due to a nonce gap. Please resubmit with the next on-chain nonce."), true},
+		{"nonce too low", errors.New("nonce too low"), false},
+		{"other error", errors.New("some other error"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsNonceGap(tt.err)
 			if result != tt.expected {
 				t.Errorf("Expected %v, got %v for error: %v", tt.expected, result, tt.err)
 			}

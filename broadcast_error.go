@@ -8,11 +8,12 @@ import (
 type BroadcastError error
 
 var (
-	ErrInsufficientFund        = BroadcastError(fmt.Errorf("insufficient fund"))
-	ErrNonceIsLow              = BroadcastError(fmt.Errorf("nonce is low"))
-	ErrReplacementUnderpriced  = BroadcastError(fmt.Errorf("replacement transaction underpriced"))
-	ErrGasLimitIsTooLow        = BroadcastError(fmt.Errorf("gas limit is too low"))
-	ErrTxIsKnown               = BroadcastError(fmt.Errorf("tx is known"))
+	ErrInsufficientFund       = BroadcastError(fmt.Errorf("insufficient fund"))
+	ErrNonceGap               = BroadcastError(fmt.Errorf("nonce gap"))
+	ErrNonceIsLow             = BroadcastError(fmt.Errorf("nonce is low"))
+	ErrReplacementUnderpriced = BroadcastError(fmt.Errorf("replacement transaction underpriced"))
+	ErrGasLimitIsTooLow       = BroadcastError(fmt.Errorf("gas limit is too low"))
+	ErrTxIsKnown              = BroadcastError(fmt.Errorf("tx is known"))
 )
 
 func NewBroadcastError(err error) BroadcastError {
@@ -29,6 +30,9 @@ func NewBroadcastError(err error) BroadcastError {
 	}
 	if IsReplacementUnderpriced(err) {
 		return ErrReplacementUnderpriced
+	}
+	if IsNonceGap(err) {
+		return ErrNonceGap
 	}
 	if IsNonceIsLow(err) {
 		return ErrNonceIsLow
@@ -56,6 +60,13 @@ func IsGasLimitIsTooLow(err error) bool {
 
 func IsReplacementUnderpriced(err error) bool {
 	return strings.Contains(err.Error(), "underprice")
+}
+
+func IsNonceGap(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "nonce gap")
 }
 
 func IsNonceIsLow(err error) bool {

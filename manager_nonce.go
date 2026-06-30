@@ -101,6 +101,28 @@ func (wm *WalletManager) findNonceGap(wallet common.Address, chainID uint64, fro
 	return 0, false
 }
 
+// resyncNonceFromChain resets local nonce tracking to match the chain's remote state.
+// Use after broadcast failures that indicate local tracking has drifted ahead of the chain.
+func (wm *WalletManager) resyncNonceFromChain(wallet common.Address, network networks.Network) error {
+	r, err := wm.Reader(network)
+	if err != nil {
+		return fmt.Errorf("couldn't get reader for nonce resync: %w", err)
+	}
+
+	minedNonce, err := r.GetMinedNonce(wallet.Hex())
+	if err != nil {
+		return fmt.Errorf("couldn't get mined nonce for resync: %w", err)
+	}
+
+	remotePendingNonce, err := r.GetPendingNonce(wallet.Hex())
+	if err != nil {
+		return fmt.Errorf("couldn't get pending nonce for resync: %w", err)
+	}
+
+	wm.nonceTracker.ResyncFromRemote(wallet, network.GetChainID(), network.GetName(), minedNonce, remotePendingNonce)
+	return nil
+}
+
 // ReleaseNonce releases a previously acquired nonce that was not used.
 // This allows the nonce to be reused by subsequent transactions.
 // Note: This only affects local tracking. If the transaction was already broadcast

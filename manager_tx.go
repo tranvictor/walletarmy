@@ -327,6 +327,24 @@ func (wm *WalletManager) getTxStatuses(oldTxs map[string]*types.Transaction, net
 	return result, nil
 }
 
+// isTxAcceptedOnChain checks whether a transaction is known to the chain (pending or mined).
+func (wm *WalletManager) isTxAcceptedOnChain(tx *types.Transaction, network networks.Network) bool {
+	r, err := wm.Reader(network)
+	if err != nil {
+		return false
+	}
+	info, err := r.TxInfoFromHash(tx.Hash().Hex())
+	if err != nil {
+		return false
+	}
+	switch info.Status {
+	case TxStatusMined, TxStatusDone, TxStatusReverted, TxStatusPending:
+		return true
+	default:
+		return false
+	}
+}
+
 // EnsureTxWithHooks ensures the tx is broadcasted and mined, it will retry until the tx is mined.
 // This is a convenience wrapper that uses context.Background().
 // For production use, prefer EnsureTxWithHooksContext to allow cancellation.
@@ -491,8 +509,19 @@ func (wm *WalletManager) executeTransactionLoop(
 	// release the nonce explicitly on their own exit paths. This defer is a last-resort
 	// guard for any path that might set State.Nonce but forget to release it.
 	defer func() {
-		if err != nil && len(execCtx.State.OldTxs) == 0 && execCtx.State.Nonce != nil {
+		if err == nil {
+			return
+		}
+		if len(execCtx.State.OldTxs) == 0 && execCtx.State.Nonce != nil {
 			wm.ReleaseNonce(execCtx.Params.From, execCtx.Params.Network, execCtx.State.Nonce.Uint64())
+		} else if len(execCtx.State.OldTxs) > 0 {
+			// Signed/broadcast attempted but EnsureTx failed — local tracker may be ahead of chain.
+			if resyncErr := wm.resyncNonceFromChain(execCtx.Params.From, execCtx.Params.Network); resyncErr != nil {
+				logger.WithFields(logger.Fields{
+					"wallet": execCtx.Params.From.Hex(),
+					"error":  resyncErr,
+				}).Debug("executeTransactionLoop: nonce resync on exit failed")
+			}
 		}
 	}()
 
@@ -907,18 +936,24 @@ func (wm *WalletManager) signAndBroadcastTransaction(ctx context.Context, tx *ty
 				_ = wm.registerBroadcastedTx(signedTx, execCtx.Params.Network)
 			}
 		case <-time.After(SyncBroadcastTimeout):
-			// Timeout: treat as slow tx, fall back to async monitoring.
-			// The tx was already sent to the network, so we mark it as successful
-			// but with no receipt, which triggers the monitor flow.
-			// Register eagerly since the tx is in-flight on the network.
+			// Timeout: verify the tx was accepted before treating it as in-flight.
 			syncBroadcastTimedOut = true
-			successful = true
-			_ = wm.registerBroadcastedTx(signedTx, execCtx.Params.Network)
-			logger.WithFields(logger.Fields{
-				"tx_hash":         signedTx.Hash().Hex(),
-				"nonce":           signedTx.Nonce(),
-				"timeout_seconds": SyncBroadcastTimeout.Seconds(),
-			}).Warn("Sync broadcast timed out, falling back to async monitoring with gas bump support")
+			if wm.isTxAcceptedOnChain(signedTx, execCtx.Params.Network) {
+				successful = true
+				_ = wm.registerBroadcastedTx(signedTx, execCtx.Params.Network)
+				logger.WithFields(logger.Fields{
+					"tx_hash":         signedTx.Hash().Hex(),
+					"nonce":           signedTx.Nonce(),
+					"timeout_seconds": SyncBroadcastTimeout.Seconds(),
+				}).Warn("Sync broadcast timed out, falling back to async monitoring with gas bump support")
+			} else {
+				broadcastErr = ErrSyncBroadcastTimeout
+				logger.WithFields(logger.Fields{
+					"tx_hash":         signedTx.Hash().Hex(),
+					"nonce":           signedTx.Nonce(),
+					"timeout_seconds": SyncBroadcastTimeout.Seconds(),
+				}).Warn("Sync broadcast timed out and tx not found on chain, will retry")
+			}
 		case <-ctx.Done():
 			// Context cancelled - return immediately
 			return &TxExecutionResult{
@@ -1015,9 +1050,31 @@ func (wm *WalletManager) handleBroadcastError(broadcastErr BroadcastError, tx *t
 		return wm.handleReplacementUnderpricedError(tx, execCtx)
 	}
 
+	// Special case: nonce gap means local tracking is ahead of chain — re-sync and retry
+	if broadcastErr == ErrNonceGap {
+		return wm.handleNonceGapError(tx, execCtx)
+	}
+
 	// Special case: nonce is low requires checking if transaction is already mined
 	if broadcastErr == ErrNonceIsLow {
 		return wm.handleNonceIsLowError(tx, execCtx)
+	}
+
+	// Special case: sync broadcast timed out without evidence the tx was accepted — retry same nonce
+	if broadcastErr == ErrSyncBroadcastTimeout {
+		execCtx.State.Nonce = big.NewInt(int64(tx.Nonce()))
+		if result := execCtx.IncrementRetryAndCheck("sync broadcast timed out, tx not found on chain"); result != nil {
+			if resyncErr := wm.resyncNonceFromChain(execCtx.Params.From, execCtx.Params.Network); resyncErr != nil {
+				logger.WithFields(logger.Fields{
+					"wallet": execCtx.Params.From.Hex(),
+					"error":  resyncErr,
+				}).Debug("handleBroadcastError: nonce resync after sync timeout retries failed")
+			}
+			return result
+		}
+		return &TxExecutionResult{
+			Action: ActionRetry,
+		}
 	}
 
 	// Special case: tx is known doesn't count as retry (we're just waiting for it to be mined)
@@ -1043,6 +1100,12 @@ func (wm *WalletManager) handleBroadcastError(broadcastErr BroadcastError, tx *t
 	}
 
 	if result := execCtx.IncrementRetryAndCheck(errorMsg); result != nil {
+		if resyncErr := wm.resyncNonceFromChain(execCtx.Params.From, execCtx.Params.Network); resyncErr != nil {
+			logger.WithFields(logger.Fields{
+				"wallet": execCtx.Params.From.Hex(),
+				"error":  resyncErr,
+			}).Debug("handleBroadcastError: nonce resync after exhausted retries failed")
+		}
 		return result
 	}
 
@@ -1126,6 +1189,28 @@ func (wm *WalletManager) handleReplacementUnderpricedError(tx *types.Transaction
 	}
 }
 
+// handleNonceGapError handles broadcast rejection due to a nonce gap (local nonce ahead of chain).
+// Re-syncs local tracking from RPC and retries with the correct on-chain nonce.
+func (wm *WalletManager) handleNonceGapError(tx *types.Transaction, execCtx *TxExecutionContext) *TxExecutionResult {
+	logger.WithFields(logger.Fields{
+		"tx_hash": tx.Hash().Hex(),
+		"nonce":   tx.Nonce(),
+	}).Info("Nonce gap detected, re-syncing local nonce from chain")
+
+	if resyncErr := wm.resyncNonceFromChain(execCtx.Params.From, execCtx.Params.Network); resyncErr != nil {
+		logger.WithFields(logger.Fields{
+			"wallet": execCtx.Params.From.Hex(),
+			"error":  resyncErr,
+		}).Debug("handleNonceGapError: nonce resync failed")
+	}
+
+	// Clear State.Nonce so the next attempt acquires from re-synced chain state.
+	execCtx.State.Nonce = nil
+	return &TxExecutionResult{
+		Action: ActionRetry,
+	}
+}
+
 // handleNonceIsLowError specifically handles the nonce is low error case
 func (wm *WalletManager) handleNonceIsLowError(tx *types.Transaction, execCtx *TxExecutionContext) *TxExecutionResult {
 
@@ -1154,9 +1239,22 @@ func (wm *WalletManager) handleNonceIsLowError(tx *types.Transaction, execCtx *T
 		}
 	}
 
-	// No completed transactions found, retry with new nonce
+	// No completed transactions found, re-sync from chain and retry with correct nonce
 	if result := execCtx.IncrementRetryAndCheck("nonce is low and no pending transactions"); result != nil {
+		if resyncErr := wm.resyncNonceFromChain(execCtx.Params.From, execCtx.Params.Network); resyncErr != nil {
+			logger.WithFields(logger.Fields{
+				"wallet": execCtx.Params.From.Hex(),
+				"error":  resyncErr,
+			}).Debug("handleNonceIsLowError: nonce resync after exhausted retries failed")
+		}
 		return result
+	}
+
+	if resyncErr := wm.resyncNonceFromChain(execCtx.Params.From, execCtx.Params.Network); resyncErr != nil {
+		logger.WithFields(logger.Fields{
+			"wallet": execCtx.Params.From.Hex(),
+			"error":  resyncErr,
+		}).Debug("handleNonceIsLowError: nonce resync before retry failed")
 	}
 
 	execCtx.State.Nonce = nil

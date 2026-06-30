@@ -4109,3 +4109,169 @@ func TestBuildTx_GapDetection_FillsGapBeforeAdvancing(t *testing.T) {
 	assert.Equal(t, uint64(6), tx.Nonce(),
 		"BuildTx should fill nonce gap at 6 instead of advancing to 8")
 }
+
+// ============================================================
+// Nonce Gap & Sync Timeout Recovery Tests
+// ============================================================
+
+func TestHandleNonceGapError_ResyncsAndRetries(t *testing.T) {
+	setup := newTestSetup(t)
+
+	// Local tracker thinks next nonce is 8 (stored 7), but chain expects 5
+	setup.WM.setPendingNonce(testAddr1, networks.EthereumMainnet, 7)
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	tx := newTestTx(7, testAddr2, oneEth)
+	execCtx := &TxExecutionContext{
+		Retry:  RetryConfig{MaxAttempts: 3},
+		Params: TxParams{From: testAddr1, To: testAddr2, Network: networks.EthereumMainnet},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction), Nonce: big.NewInt(7)},
+	}
+
+	result := setup.WM.handleNonceGapError(tx, execCtx)
+
+	assert.Equal(t, ActionRetry, result.Action)
+	assert.Nil(t, execCtx.State.Nonce, "State.Nonce should be cleared for fresh acquire")
+
+	// Next acquire should use chain nonce 5, not stale local 8
+	nextNonce, err := setup.WM.acquireNonce(testAddr1, networks.EthereumMainnet)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(5), nextNonce.Uint64())
+}
+
+func TestHandleBroadcastError_NonceGap_DoesNotRetrySameNonce(t *testing.T) {
+	setup := newTestSetup(t)
+
+	setup.WM.setPendingNonce(testAddr1, networks.EthereumMainnet, 7)
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+
+	tx := newTestTx(7, testAddr2, oneEth)
+	execCtx := &TxExecutionContext{
+		Retry:  RetryConfig{MaxAttempts: 15},
+		Params: TxParams{From: testAddr1, To: testAddr2, Network: networks.EthereumMainnet},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction), Nonce: big.NewInt(7)},
+	}
+
+	gapErr := NewBroadcastError(errors.New("The transaction was rejected due to a nonce gap. Please resubmit with the next on-chain nonce."))
+	result := setup.WM.handleBroadcastError(gapErr, tx, execCtx)
+
+	assert.Equal(t, ActionRetry, result.Action)
+	assert.Nil(t, execCtx.State.Nonce)
+	assert.Equal(t, 0, execCtx.State.AttemptCount, "nonce gap should not consume retry attempts")
+}
+
+func TestSyncBroadcast_Timeout_TxNotFound_RetriesWithoutRegistering(t *testing.T) {
+	originalTimeout := SyncBroadcastTimeout
+	SyncBroadcastTimeout = 50 * time.Millisecond
+	defer func() { SyncBroadcastTimeout = originalTimeout }()
+
+	setup, mockNetwork := newTestSetupWithSyncNetwork(t)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 0, nil }
+	setup.Reader.TxInfoFromHashFn = func(hash string) (TxInfo, error) {
+		return TxInfo{Status: TxStatusLost}, nil
+	}
+
+	setup.Broadcaster.BroadcastTxSyncFn = func(tx *types.Transaction) (*types.Receipt, error) {
+		time.Sleep(5 * time.Second)
+		return nil, nil
+	}
+
+	tx := newTestTxWithChainID(0, testAddr2, oneEth, chainIDArbitrum)
+	execCtx := &TxExecutionContext{
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{From: setup.FromAddr, To: testAddr2, Network: mockNetwork},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
+	}
+
+	result := setup.WM.signAndBroadcastTransaction(context.Background(), tx, execCtx)
+
+	assert.Equal(t, ActionRetry, result.Action, "Should retry when tx not found after sync timeout")
+	assert.Nil(t, result.Receipt)
+
+	// Local nonce should not have been registered — next acquire still gets 0
+	nextNonce, err := setup.WM.acquireNonce(setup.FromAddr, mockNetwork)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), nextNonce.Uint64())
+}
+
+func TestSyncBroadcast_Timeout_TxPending_StillFallsBackToMonitor(t *testing.T) {
+	originalTimeout := SyncBroadcastTimeout
+	SyncBroadcastTimeout = 50 * time.Millisecond
+	defer func() { SyncBroadcastTimeout = originalTimeout }()
+
+	setup, mockNetwork := newTestSetupWithSyncNetwork(t)
+
+	setup.Broadcaster.BroadcastTxSyncFn = func(tx *types.Transaction) (*types.Receipt, error) {
+		time.Sleep(5 * time.Second)
+		return nil, nil
+	}
+	// Default mock returns pending — tx is considered accepted on timeout
+
+	tx := newTestTxWithChainID(0, testAddr2, oneEth, chainIDArbitrum)
+	execCtx := &TxExecutionContext{
+		Retry:  RetryConfig{MaxAttempts: 5},
+		Params: TxParams{From: setup.FromAddr, To: testAddr2, Network: mockNetwork},
+		State:  TxRetryState{OldTxs: make(map[string]*types.Transaction)},
+	}
+
+	result := setup.WM.signAndBroadcastTransaction(context.Background(), tx, execCtx)
+
+	assert.Equal(t, ActionContinueToMonitor, result.Action)
+	assert.NotNil(t, result.Transaction)
+	assert.Nil(t, result.Receipt)
+}
+
+func TestEnsureTx_FailedBroadcast_ResyncsNonce(t *testing.T) {
+	setup, mockNetwork := newTestSetupWithSyncNetwork(t)
+
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 5, nil }
+	setup.Reader.EthCallFn = func(from, to string, value *big.Int, data []byte, overrides *map[common.Address]gethclient.OverrideAccount) ([]byte, error) {
+		return nil, nil
+	}
+
+	// Advance local tracker ahead of chain (simulates drift from optimistic timeout)
+	setup.WM.setPendingNonce(setup.FromAddr, mockNetwork, 7)
+
+	attempts := 0
+	var attemptNonces []uint64
+	setup.Broadcaster.BroadcastTxSyncFn = func(tx *types.Transaction) (*types.Receipt, error) {
+		attempts++
+		attemptNonces = append(attemptNonces, tx.Nonce())
+		if tx.Nonce() > 5 {
+			return nil, errors.New("The transaction was rejected due to a nonce gap. Please resubmit with the next on-chain nonce.")
+		}
+		return &types.Receipt{
+			Status: types.ReceiptStatusSuccessful,
+			TxHash: tx.Hash(),
+		}, nil
+	}
+
+	_, _, err := setup.WM.EnsureTxWithHooksContext(
+		context.Background(),
+		5, 10*time.Millisecond, 10*time.Millisecond,
+		2, setup.FromAddr, testAddr2,
+		oneEth,
+		21000, 0,
+		0.1, 0, 0.01, 0,
+		100, 100,
+		nil, mockNetwork,
+		nil, nil, nil, nil, nil, nil,
+	)
+	require.NoError(t, err)
+
+	assert.Equal(t, uint64(8), attemptNonces[0], "first attempt should use drifted local nonce")
+	assert.Contains(t, attemptNonces, uint64(5), "should retry with resynced chain nonce after gap error")
+	assert.Greater(t, attempts, 1)
+
+	// After success, next acquire should continue from chain state
+	setup.Reader.GetMinedNonceFn = func(addr string) (uint64, error) { return 6, nil }
+	setup.Reader.GetPendingNonceFn = func(addr string) (uint64, error) { return 6, nil }
+	nextNonce, acquireErr := setup.WM.acquireNonce(setup.FromAddr, mockNetwork)
+	require.NoError(t, acquireErr)
+	assert.Equal(t, uint64(6), nextNonce.Uint64())
+}

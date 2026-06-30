@@ -190,6 +190,28 @@ func TestTracker_MultipleNetworks(t *testing.T) {
 	}
 }
 
+func TestTracker_ResyncFromRemote(t *testing.T) {
+	tracker := NewTracker()
+	wallet := common.HexToAddress("0x1234567890123456789012345678901234567890")
+	chainID := uint64(1)
+	networkName := "ethereum"
+
+	// Local is ahead: stored 7 (next would be 8), chain expects 5
+	tracker.SetPendingNonce(wallet, chainID, networkName, 7)
+	tracker.claimGap(wallet, chainID, 6)
+	tracker.claimGap(wallet, chainID, 7)
+
+	tracker.ResyncFromRemote(wallet, chainID, networkName, 5, 5)
+
+	next := tracker.GetPendingNonce(wallet, chainID)
+	if next == nil {
+		t.Fatal("expected non-nil next nonce after resync")
+	}
+	if next.Uint64() != 5 {
+		t.Errorf("expected next nonce 5, got %d", next.Uint64())
+	}
+}
+
 func TestTracker_Concurrent(t *testing.T) {
 	tracker := NewTracker()
 	wallet := common.HexToAddress("0x1234567890123456789012345678901234567890")
